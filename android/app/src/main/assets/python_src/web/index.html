@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>洞鉴虚明</title>
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- 左：设置栏(可折叠) -->
+  <aside id="rail" title="">
+    <button id="railToggle" title="展开/收起设置">⚙<span>设置</span></button>
+    <button id="railHide" title="隐藏全部设置文字(点击空白处恢复)">👁</button>
+    <div id="railBody">
+      <button id="btnDisclaimer" class="rail-open">📄 查看免责声明</button>
+      <div class="credit">该项目由 <b>西伯利亚玉米淀粉</b> 制作，<b>严禁商用</b>，如有疑问请联系 <b>QQ：2925672490</b></div>
+      <button id="btnMachine" class="rail-open">🔧 其他设置 · 机器筛选</button>
+      <details open>
+        <summary>主题设置</summary>
+        <div class="sec">
+          <label>界面模式</label>
+          <div class="row" id="themeRow">
+            <button data-theme="dark" class="seg on">🌙 黑夜</button>
+            <button data-theme="light" class="seg">☀ 白天</button>
+          </div>
+          <label>强调色（按钮/徽标/高亮的特殊颜色）</label>
+          <div id="accentRow" class="swatches"></div>
+          <div id="customAccentRow" class="swatches custom-accent-row">
+            <label class="custom-accent-picker" title="自定义强调色">
+              <input id="customAccentInput" type="color" value="#fb7299" aria-label="选择自定义强调色">
+              <span class="custom-accent-plus" aria-hidden="true">+</span>
+            </label>
+            <span class="custom-accent-hint">自定义</span>
+          </div>
+          <label>信息流显示</label>
+          <div class="row" id="layoutRow">
+            <button data-layout="single" class="seg on">单栏（默认）</button>
+            <button data-layout="dual" class="seg">双栏</button>
+          </div>
+          <label>封面大小</label>
+          <div class="row" id="coverRow">
+            <button data-cov="s" class="seg">小</button>
+            <button data-cov="m" class="seg on">中（默认）</button>
+            <button data-cov="l" class="seg">大</button>
+            <button data-cov="xl" class="seg">特大</button>
+          </div>
+          <label>预览放大（悬停封面播放时的画面倍率）</label>
+          <div class="row" id="pvRow">
+            <button data-v="1.5" class="seg">×1.5</button>
+            <button data-v="2" class="seg on">×2（默认）</button>
+            <button data-v="3" class="seg">×3</button>
+            <button data-v="4" class="seg">×4</button>
+          </div>
+          <p class="tip">选择即生效，自动记住</p>
+        </div>
+      </details>
+      <details open>
+        <summary>AI 配置</summary>
+        <div class="sec">
+          <div class="ai-mode-box">
+            <div class="ai-mode-head"><b>AI 功能总开关</b>
+              <span class="tip-inline">（关闭后评分筛查/推荐理由/AI 聊天/自动加词全部停用，不消耗 token）</span></div>
+            <button id="aiMainToggle" class="ai-mode-btn off">开启 AI 功能</button>
+            <p class="tip" id="aiMainState">状态：已关闭（不消耗 token）</p>
+          </div>
+          <label>API 地址 <span class="tip-inline">（自动，随模型切换）</span></label>
+          <input id="cfgBase" readonly placeholder="https://api.deepseek.com/v1">
+          <button id="baseToggle" class="alt small-op">自定义地址</button>
+          <label>API Key</label>
+          <input id="cfgKey" type="password" placeholder="sk-...">
+          <label>模型 <span class="tip-inline">（点箭头选预置，也可直接输入）</span></label>
+          <div id="modelPick" class="m-pick">
+            <input id="cfgModel" placeholder="deepseek-v4-flash" autocomplete="off">
+            <button id="modelDropBtn" title="选择模型">▾</button>
+            <div id="modelDrop" class="m-drop">
+              <div class="m-group-title">DeepSeek</div>
+              <button data-m="deepseek-v4-flash">deepseek-v4-flash <em>V4 Flash</em></button>
+              <button data-m="deepseek-v4-pro">deepseek-v4-pro <em>V4 Pro</em></button>
+              <button data-m="deepseek-v4-flash-vision-exp">deepseek-v4-flash-vision-exp <em>V4 视觉</em></button>
+              <button data-m="deepseek-chat">deepseek-chat <em>通用</em></button>
+              <button data-m="deepseek-reasoner">deepseek-reasoner <em>推理</em></button>
+              <div class="m-group-title">智谱 GLM</div>
+              <button data-m="glm-4-plus">glm-4-plus</button>
+              <button data-m="glm-4-flash">glm-4-flash <em>免费</em></button>
+              <div class="m-group-title">通义千问</div>
+              <button data-m="qwen-turbo">qwen-turbo <em>便宜</em></button>
+              <button data-m="qwen-plus">qwen-plus</button>
+              <button data-m="qwen-max">qwen-max</button>
+              <div class="m-group-title">OpenAI 兼容</div>
+              <button data-m="gpt-4o-mini">gpt-4o-mini</button>
+              <button data-m="gpt-4o">gpt-4o</button>
+              <div class="m-group-title">本地 Ollama</div>
+              <button data-m="qwen3:8b">qwen3:8b <em>本地</em></button>
+              <button data-m="qwen3:4b">qwen3:4b <em>本地</em></button>
+            </div>
+          </div>
+          <div class="ai-mode-box">
+            <div class="ai-mode-head"><b>AI 推荐模式</b>
+              <span class="tip-inline">（所有视频都经过 AI 筛选并给出推荐理由后再推送；消耗 token 较大，但信息更优质）</span></div>
+            <button id="aiModeToggle" class="ai-mode-btn off">开启 AI 推荐模式</button>
+            <button id="aiModeDetail" class="alt small-op">🔧 详细设置</button>
+            <p class="tip" id="aiModeState">状态：关闭 · 按热度与机器规则推送（不消耗 AI）</p>
+          </div>
+          <div class="row">
+            <button id="cfgSave">保存</button>
+            <span id="cfgStatus" class="hint"></span>
+          </div>
+          <p class="tip">未配置时按热度排序，功能完整可用；配置后开启 AI 过滤与推荐理由。</p>
+        </div>
+      </details>
+
+      <details open>
+        <summary>偏好备注（告诉AI你爱看什么）</summary>
+        <div class="sec">
+          <textarea id="prefsNote" rows="4" placeholder="例：喜欢独立游戏和数码评测，讨厌流量明星八卦，多推技术向内容…"></textarea>
+          <button id="prefsSave">保存备注</button>
+          <hr style="border:none;border-top:1px solid var(--line);margin:4px 0">
+          <label>厌恶备注（告诉AI你烦什么，机器也会同步屏蔽）</label>
+          <textarea id="dislikeNote" rows="3" placeholder="例：流量明星八卦、引战言论、氪金抽卡、营销广告（用逗号分隔，生效最快）"></textarea>
+          <button id="dislikeSave">保存厌恶</button>
+        </div>
+      </details>
+
+      <details>
+        <summary>平台出现权重</summary>
+        <div class="sec">
+          <label>平台出现权重 <span class="tip-inline">（互比：占比 = 该平台权重 ÷ 所有平台权重之和；0 = 该平台不出；点击即保存生效）</span></label>
+          <div id="platWeightRows"></div>
+          <p class="tip">各平台独立控制混排占比；贴吧的吧名列表/求助帖开关在「🔧 其他设置 · 机器筛选 → 贴吧」里，小黑盒的社区/话题筛选在「…机器筛选 → 小黑盒」里。</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>黑白名单</summary>
+        <div class="sec">
+          <label>关键词（命中即过滤）</label>
+          <div class="row">
+            <input id="kwInput" placeholder="如：引战、广告词…">
+            <button id="kwAdd">+</button>
+          </div>
+          <div id="kwList" class="chips"></div>
+          <label>作者（屏蔽其全部内容）</label>
+          <div class="row">
+            <input id="auInput" placeholder="作者名">
+            <button id="auAdd">+</button>
+          </div>
+          <div id="auList" class="chips"></div>
+        </div>
+      </details>
+
+      <details>
+        <summary>数据管理</summary>
+        <div class="sec">
+          <button id="btnIoOpen" class="rail-open">📤 设置导入 / 导出</button>
+          <button id="btnClearLog">清空历史/收藏/聊天</button>
+          <p class="tip">设置导出含 AI 配置/筛选规则/黑白名单等，可在电脑与手机之间互相迁移。数据保存在本机 data.db，卸载不影响。</p>
+        </div>
+      </details>
+
+      <footer>洞鉴虚明 v0.2.6.3a<br>数据只存本机</footer>
+    </div>
+  </aside>
+
+  <div class="splitter" id="sp0" title="拖动调整设置栏宽度"></div>
+
+  <div id="main">
+    <!-- 顶栏 -->
+    <header id="topbar">
+      <span class="logo" title="洞鉴虚明 · 采集 / 分拣 / 推送">
+        <svg class="logo-mark" viewBox="0 0 32 32" width="22" height="22" aria-hidden="true">
+          <g fill="currentColor">
+            <circle cx="7" cy="6.5" r="2.3"/>
+            <circle cx="16" cy="4.5" r="2.3"/>
+            <circle cx="25" cy="6.5" r="2.3"/>
+          </g>
+          <path d="M5 13h22l-8 8v7l-6 2.5v-9.5L5 13z" fill="currentColor"/>
+        </svg>
+        <span class="logo-wm">Mirror·Sorter</span>
+        <small class="logo-sub">corn starch</small>
+      </span>
+      <select id="modeSelect" title="过滤档位(严肃=只推硬核教程与知识)">
+        <option>严格</option><option>标准</option><option>宽松</option><option>严肃</option>
+      </select>
+      <input id="searchInput" placeholder="搜索 标题 / 作者 / 简介…">
+      <button id="btnHistory" class="tb">历史</button>
+      <button id="btnSaved" class="tb">收藏</button>
+      <span id="avatarGroup">
+        <span class="avatar-box hidden" id="biliAvatarBox" title="B站账号">
+          <img id="userAvatar" class="avatar hidden" alt="B站账号" onerror="this.classList.add('hidden')">
+          <em class="plat-tag plat-bili">B站</em>
+          <button class="avatar-message hidden" id="biliMessage" type="button">消息<span class="message-badge"></span></button>
+        </span>
+        <span class="avatar-box hidden" id="tbAvatarBox" title="贴吧账号">
+          <img id="tbAvatar" class="avatar hidden" alt="贴吧账号" onerror="this.classList.add('hidden')">
+          <em class="avatar-ph" id="tbAvatarPh">贴</em>
+          <em class="plat-tag plat-tb">贴吧</em>
+          <button class="avatar-message hidden" id="tbMessage" type="button">消息<span class="message-badge"></span></button>
+        </span>
+        <span class="avatar-box hidden" id="xhhAvatarBox" title="小黑盒账号">
+          <img id="xhhAvatar" class="avatar hidden" alt="小黑盒账号" onerror="this.classList.add('hidden')">
+          <em class="avatar-ph" id="xhhAvatarPh">盒</em>
+          <em class="plat-tag plat-xhh">小黑盒</em>
+          <button class="avatar-message hidden" id="xhhMessage" type="button">消息<span class="message-badge"></span></button>
+        </span>
+      </span>
+      <div id="userMenu">
+        <button id="btnUser" class="tb">个人 ▾</button>
+        <div id="userDrop" class="menu hidden">
+          <button data-act="account">账号（B站 / 贴吧 / 小黑盒）</button>
+          <button data-act="prefs">编辑偏好备注</button>
+          <button data-act="reset">清空全部数据</button>
+          <button data-act="about">关于</button>
+        </div>
+      </div>
+    </header>
+
+    <div id="content">
+      <!-- 信息流 -->
+      <section id="feed">
+        <div class="feed-toolbar">
+          <div id="feedMeta" class="meta-line">加载中…</div>
+          <button id="feedMetaToggle" class="tool-btn" title="收起/展开来源信息">▲</button>
+          <button id="feedClear" class="tool-btn" title="清空信息池并重新收录：丢弃当前已收录内容，按当前设置重新抓取">清空信息池</button>
+        </div>
+        <div id="feedList"><div id="feedMore">正在获取更多…</div></div>
+        <button id="feedRefresh" title="刷新数据">↻</button>
+      </section>
+
+      <div class="splitter" id="sp1" title="拖动调整宽度"></div>
+
+      <!-- 大面板：数据源状态 / 历史 / 收藏 -->
+      <section id="panel">
+        <nav id="panelTabs">
+          <button data-tab="status" class="on">数据源</button>
+          <button data-tab="history">历史</button>
+          <button data-tab="saved">收藏</button>
+        </nav>
+        <div id="panelBody"></div>
+      </section>
+
+      <div class="splitter" id="sp2" title="拖动调整宽度"></div>
+
+      <!-- AI 聊天 -->
+      <aside id="chat">
+        <header class="chat-head">
+          <button id="chatBack" class="chat-back" title="返回">‹</button>
+          <button id="convBtn" title="对话列表">💬</button>
+          <span id="convTitle" title="点击重命名" class="conv-title">AI 聊天</span>
+          <button id="convNew" title="新对话">＋</button>
+          <button id="chatClear" title="清空当前对话">🗑</button>
+          <button id="chatCollapse" title="折叠/展开聊天框">⮞</button>
+          <div id="convList" class="hidden">
+            <div id="convItems"></div>
+            <div class="conv-foot"><button id="convNew2">＋ 新对话</button></div>
+          </div>
+        </header>
+        <div id="chatMsgs"><div class="chat-empty">告诉 AI 你想看什么样的信息</div></div>
+        <div id="chatRow">
+          <input id="chatInput" placeholder="如：多推点独立游戏">
+          <button id="chatStop" class="hidden" title="停止生成">⏹</button>
+          <button id="chatSend">发送</button>
+        </div>
+      </aside>
+    </div>
+  </div>
+</div>
+
+<!-- 移动端底部导航(桌面端由 CSS 隐藏): 同一套 DOM, 手机上切换全屏视图 -->
+<nav id="tabbar">
+  <button data-view="feed" class="on"><span class="tbi">🏠</span>首页</button>
+  <button data-view="panel"><span class="tbi">🗂️</span>记录</button>
+  <button data-view="settings"><span class="tbi">⚙️</span>设置</button>
+</nav>
+
+<!-- 免责声明弹窗 -->
+<div id="disclaimerModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="disclaimerTitle">
+  <div class="modal-card disclaimer-card">
+    <header>
+      <span id="disclaimerTitle">免责声明 <small>请在使用前阅读</small></span>
+      <button id="disclaimerClose" class="x" type="button" aria-label="关闭免责声明">✕</button>
+    </header>
+    <div class="modal-body">
+      <div class="policy-content">
+        <p class="policy-lead">感谢你使用“洞鉴虚明”。本软件仅用于个人学习、研究与技术交流，请在使用前阅读并理解以下条款。</p>
+        <section>
+          <h3>一、用途与授权</h3>
+          <p>本软件严禁用于任何商业目的。未经授权的商业使用、复制、分发、修改或再许可均可能构成侵权，开发者保留依法追究相关责任的权利。</p>
+        </section>
+        <section>
+          <h3>二、第三方数据与版权</h3>
+          <p>本软件通过公开接口或用户授权方式，聚合来自 Bilibili、百度贴吧、小黑盒等第三方平台的信息。展示的文字、图片、视频、链接及其他内容，其知识产权归原平台及相应权利人所有。</p>
+          <p>本软件仅对数据进行本地聚合、筛选与排序，不主张相关内容的权利，不存储、缓存或主动传播受版权保护的内容，也不保证第三方数据的真实性、合法性、完整性或及时性。</p>
+        </section>
+        <section>
+          <h3>三、用户责任</h3>
+          <p>用户应自行遵守第三方平台的服务条款、使用协议、授权范围及适用的法律法规。因账号登录、Cookie 或其他凭证使用、数据访问、内容交互等行为引起的纠纷、侵权争议、账号限制或其他损失，由用户自行承担。</p>
+        </section>
+        <section>
+          <h3>四、AI 功能声明</h3>
+          <p>AI 评分、推荐、筛选与聊天仅作为辅助工具，输出不代表开发者立场，也不构成任何投资、消费、法律或其他专业建议。用户应独立核验内容的可靠性、准确性与适用性，因依赖 AI 输出作出的决定及其后果由用户自行承担。</p>
+        </section>
+        <section>
+          <h3>五、软件现状与责任限制</h3>
+          <p>本软件按“现状”提供，不提供任何明示或暗示的担保，包括但不限于持续可用、无错误、无中断、安全性、适销性或特定用途适用性。在法律允许的最大范围内，开发者不对因使用或无法使用本软件导致的直接、间接、偶然、特殊或惩罚性损失负责。</p>
+        </section>
+        <section>
+          <h3>六、隐私与本地安全</h3>
+          <p>本软件默认运行于用户本地环境。开发者不会主动收集、上传或泄露用户隐私信息，但登录凭证、本地数据库及其他本地数据仍由用户自行保管。本地存储存在固有安全风险，请用户采取必要的设备、账号和数据防护措施。</p>
+        </section>
+        <section>
+          <h3>七、修改与生效</h3>
+          <p>开发者可根据需要更新本免责声明及软件功能，更新后的版本将在项目页面公示并替代旧版本。继续使用本软件即表示你已阅读、理解并同意当前版本；如不同意任何条款，请立即停止使用并删除本软件。</p>
+        </section>
+        <p class="policy-version">免责声明版本：2026-09-03</p>
+      </div>
+      <div class="row disclaimer-actions">
+        <button id="disclaimerAgree" type="button">我已阅读并同意，开始使用</button>
+        <button id="disclaimerCancel" class="alt" type="button">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- AI 推荐模式 · 详细设置弹窗 -->
+<div id="aiDetailModal" class="modal hidden">
+  <div class="modal-card">
+    <header><span>AI 推荐模式 · 详细设置</span><button id="aiDetailClose" class="x">✕</button></header>
+    <div class="modal-body">
+      <div class="m-group">
+        <label><b>推荐标准</b> <span class="tip-inline">（兴趣分门槛：AI 认为不匹配的低于门槛的视频不推送）</span></label>
+        <div class="row" id="aiminRow">
+          <button data-v="0" class="seg">不限</button>
+          <button data-v="5" class="seg">一般 ≥5</button>
+          <button data-v="7" class="seg">严格 ≥7</button>
+        </div>
+      </div>
+      <div class="m-group">
+        <label><b>省钱（token）方式</b></label>
+        <div class="m-row"><span class="sub">评分范围</span>
+          <div class="row" id="aifullRow">
+            <button data-v="0" class="seg">仅热度前 120 条（省）</button>
+            <button data-v="1" class="seg">全部候选（费）</button>
+          </div>
+        </div>
+        <div class="m-row"><span class="sub">每批评分条数</span>
+          <div class="row" id="aibatchRow">
+            <button data-v="15" class="seg">15 条（稳）</button>
+            <button data-v="30" class="seg">30 条（省一半请求）</button>
+          </div>
+        </div>
+        <div class="m-row"><span class="sub">评分缓存时长</span>
+          <div class="row" id="aicacheRow">
+            <button data-v="24" class="seg">24 小时</button>
+            <button data-v="48" class="seg">48 小时（省）</button>
+          </div>
+        </div>
+      </div>
+      <div class="m-group">
+        <label><b>其他</b></label>
+        <p class="tip">引战剔除档位在顶栏「档位」下拉控制（严格/标准/宽松）。改动任何一项都会自动重建内容并按新标准重新筛查；评分失败（网络等）的条目不会推送。</p>
+        <div class="row"><button id="aiDetailReset" class="alt">恢复默认设置</button></div>
+      </div>
+      <div class="row">
+        <button id="aiDetailSave">保存设置</button>
+        <button id="aiDetailCancel" class="alt">取消</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 机器筛选弹窗（B站 / 贴吧 标签页） -->
+<div id="machineModal" class="modal hidden">
+  <div class="modal-card">
+    <header>
+      <span>其他设置 · 机器筛选 <small>纯程序规则，先于 AI 执行，不消耗 AI 成本</small></span>
+      <button id="mClose" class="x">✕</button>
+    </header>
+    <div class="acct-tabs">
+      <button id="mTabGeneral" class="tab on">通用</button>
+      <button id="mTabBili" class="tab">B站</button>
+      <button id="mTabTieba" class="tab">贴吧</button>
+      <button id="mTabXhh" class="tab">小黑盒</button>
+    </div>
+    <div class="modal-body">
+      <!-- 通用页 -->
+      <div id="mGeneral">
+        <div class="m-group">
+          <div class="m-row"><span>剔除播放量低于</span><input type="number" id="mMinViews" class="small" min="0" step="1000"><span>的内容（0=关闭；仅有真实播放量的信息生效）</span></div>
+          <div class="m-row"><span>剔除播放量高于</span><input type="number" id="mMaxViews" class="small" min="0" step="1000"><span>的内容（0=无限）</span></div>
+          <div class="m-row"><span>剔除时长超过</span><input type="number" id="mMaxDur" class="small" min="0" step="1"><span>分钟的内容（0=关闭；仅有真实时长的信息生效）</span></div>
+          <div class="m-row"><span>剔除时长低于</span><input type="number" id="mMinDur" class="small" min="0" step="1"><span>分钟的内容（默认1）</span></div>
+          <div class="m-row"><span>只显示最近</span><input type="number" id="mMaxAge" class="small" min="0" step="1"><span>个月内发布的信息（默认5，0=不限）</span></div>
+          <div class="m-row"><span>严肃模式只显示最近</span><input type="number" id="mSerMaxAge" class="small" min="0" step="1"><span>个月内发布的信息（默认30，0=不限）</span></div>
+          <div class="m-row"><span>已看信息</span><input type="number" id="mSeenHours" class="small" min="0" step="1"><span>小时内不重复出现（默认6，0=不限）</span></div>
+          <div class="m-row"><span>启动预缓存</span>
+            <div class="row" id="mColdRow">
+              <button data-v="0" class="seg">关闭</button>
+              <button data-v="5" class="seg">5条</button>
+              <button data-v="10" class="seg">10条</button>
+              <button data-v="15" class="seg">15条</button>
+              <button data-v="20" class="seg">20条</button>
+            </div>
+          </div>
+          <p class="tip">退出时把池里未展示的内容缓存下来，下次打开软件直接显示，免去启动等待（默认10条，按当前平台比例取）。</p>
+        </div>
+        <div class="m-group">
+          <div class="m-row"><span>同一信息累计展示</span><input type="number" id="mRepeatLimit" class="small" min="1" step="1"><span>次后进入冷却（默认4）</span></div>
+          <div class="m-row"><span>冷却</span><input type="number" id="mRepeatCooldown" class="small" min="0" step="1"><span>小时后再显示（默认72，0=关闭）</span></div>
+          <button id="mGeneralSave" class="row-btn">保存通用筛选设置</button>
+        </div>
+      </div>
+      <!-- B站页 -->
+      <div id="mBili" class="hidden">
+        <div class="m-group">
+          <label>允许刷到的来源（分区开关，点击即保存生效，默认全部）</label>
+          <div id="srcChips" class="chips"></div>
+        </div>
+        <div class="m-group">
+          <label class="m-row"><input type="checkbox" id="mBlockSync"><span>同步 B站账号的拉黑名单并屏蔽</span></label>
+          <p class="tip" id="mBlStatus"></p>
+          <div class="row"><button id="mBlSync" class="alt">立即同步拉黑名单</button></div>
+          <div id="mBlList" class="chips"></div>
+        </div>
+        <div class="m-group">
+          <label>关注的人 <span class="tip-inline">（强调 B站关注的人发布的信息，专门入池并视觉高亮）</span></label>
+          <label class="m-row"><input type="checkbox" id="mFollowEmph"><span>强调关注的人发布的信息</span></label>
+          <div class="m-row">
+            <span>只强调最近</span>
+            <input type="range" id="mFollowMonths" min="0" max="12" step="1" value="1">
+            <span id="mFollowMonthsVal">1</span><span>个月内发布的信息</span>
+            <span class="tip-inline">（0=不限时间）</span>
+          </div>
+          <p class="tip">开启后，视频池会专门抓取你关注的 UP 主近期投稿；正常刷到的关注视频也会标注——作者名用强调色，标题栏【B站】旁标注「关注的人」。需要已登录 B站账号（个人 → B站账号）。</p>
+        </div>
+        <div class="m-group">
+          <label class="m-row"><input type="checkbox" id="mDedup"><span>相似标题去重（同一事件只保留播放最高的一条）</span></label>
+          <label class="m-row"><input type="checkbox" id="mEmotion" checked><span>情绪过滤器：拦截感叹号轰炸 / 引战黑话 / 标题党句式（不耗 AI）</span></label>
+          <label class="m-row"><input type="checkbox" id="mNewsFresh" checked><span>资讯保鲜：热点/资讯类只推送 24 小时内（教程/干货不受影响）</span></label>
+          <button id="mSave" class="row-btn">保存 B站筛选设置</button>
+        </div>
+        <p class="tip">执行顺序：机器筛选（规则剔除）→ AI 评分（引战/低质/兴趣）→ 展示。规则先剔除能让 AI 少花钱。</p>
+      </div>
+      <!-- 贴吧页 -->
+      <div id="mTieba" class="hidden">
+        <div class="m-group">
+          <label>吧名列表 <span class="tip-inline">（每行一个，或逗号分隔；在「个人 → 贴吧账号」可一键导入关注吧；平台权重在左侧设置栏「平台出现权重」）</span></label>
+          <textarea id="tbBars" rows="4" placeholder="例：绝地潜兵&#10;blender&#10;军事"></textarea>
+          <label class="m-row"><input type="checkbox" id="tbAllowHelp" checked><span>允许求助帖（关闭后过滤"求助/求教/请问"类提问帖）</span></label>
+          <div class="row">
+            <button id="tbSave">保存</button>
+            <span class="hint" id="tbStatus"></span>
+          </div>
+        </div>
+        <p class="tip">吧列表控制贴吧采集范围；未登录时贴吧也能匿名采集。</p>
+        <div class="m-group">
+          <label>风控应急通道</label>
+          <p class="tip">贴吧偶尔封锁服务器端请求（403）。此通道用浏览器加载贴吧页（浏览器不受封锁），再抓取页面内容入库。</p>
+          <div class="row">
+            <select id="tbBrowseKw" class="tb-kw-pick"></select>
+            <button id="tbBrowseOpen" class="alt">在窗口中打开贴吧页</button>
+            <button id="tbBrowseGrab">🔄 抓取此页</button>
+          </div>
+          <span class="hint" id="tbBrowseHint"></span>
+        </div>
+      </div>
+      <!-- 小黑盒页 -->
+      <div id="mXhh" class="hidden">
+        <div class="m-group">
+          <label>社区/板块筛选 <span class="tip-inline">（只显示这些板块；逗号/换行分隔，留空=全部。来源为帖子 topics）</span></label>
+          <textarea id="xhhComm" rows="3" placeholder="例：Steam，PC游戏，盒友杂谈"></textarea>
+        </div>
+        <div class="m-group">
+          <label>话题筛选 <span class="tip-inline">（只显示带这些话题/标签的帖子；逗号/换行分隔，留空=全部。来源为帖子 hashtags）</span></label>
+          <textarea id="xhhTopic" rows="3" placeholder="例：源初之结，新作试玩"></textarea>
+        </div>
+        <div class="m-group">
+          <div class="row"><button id="xhhSave">保存小黑盒筛选</button><span class="hint" id="xhhStatus"></span></div>
+          <p class="tip">小黑盒内容采集自社区帖流：社区=帖子归属板块（topics），话题=帖子附带话题标签（hashtags）。两者都留空=不筛选（全部保留）；任一填写即按 allow-list 过滤。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 设置导入导出弹窗 -->
+<div id="settingsIoModal" class="modal hidden">
+  <div class="modal-card">
+    <header>
+      <span>设置导入 / 导出 <small>在电脑与手机之间迁移配置</small></span>
+      <button id="ioClose" class="x">✕</button>
+    </header>
+    <div class="modal-body">
+      <div class="m-group">
+        <label><b>导出</b> <span class="tip-inline">（生成配置文本，复制或下载保存）</span></label>
+        <label class="m-row"><input type="checkbox" id="ioExpCred"><span>包含平台登录凭证（B站/贴吧/小黑盒 Cookie 等，导入方可免扫码直接登录；<b>请勿外传</b>）</span></label>
+        <button id="ioExportGen">生成导出内容</button>
+        <textarea id="ioExpText" rows="5" readonly placeholder="点击上方按钮生成…"></textarea>
+        <div class="row">
+          <button id="ioExpCopy" class="alt">复制</button>
+          <button id="ioExpDownload" class="alt">下载 .json 文件</button>
+          <button id="ioExpShare" class="alt hidden">分享 / 保存到…</button>
+          <span class="hint" id="ioExpHint"></span>
+        </div>
+      </div>
+      <div class="m-group">
+        <label><b>导入</b> <span class="tip-inline">（推荐从 .json 文件读取；粘贴整段 JSON 也行，夹杂其他文字也能识别）</span></label>
+        <div class="row">
+          <button id="ioImpFile">📂 从文件导入</button>
+          <button id="ioImpClip" class="alt">📋 读取剪贴板</button>
+          <button id="ioImpParse" class="alt">🔍 解析文本</button>
+        </div>
+        <input type="file" id="ioImpFileInput" accept=".json,.txt,application/json,text/plain" class="hidden">
+        <textarea id="ioImpText" rows="5" placeholder="从文件读取后自动填入；也可以直接粘贴设置文本"></textarea>
+        <div id="ioImpPreview" class="hidden"></div>
+        <div class="row">
+          <button id="ioImpConfirm" disabled>确认导入</button>
+          <span class="hint" id="ioImpHint"></span>
+        </div>
+        <p class="tip">界面偏好（主题/双栏/封面大小）随导出迁移；历史、收藏、聊天记录不属于设置，不在迁移范围内。电脑端也支持把 .json 文件直接拖进本窗口。</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 账号弹窗（B站 / 贴吧 标签页） -->
+<div id="accountModal" class="modal hidden">
+  <div class="modal-card">
+    <header>
+      <span>账号 <small>分别登录各平台，登录仅用于本机优化与稳定采集</small></span>
+      <button id="acctClose" class="x">✕</button>
+    </header>
+    <div class="acct-tabs">
+      <button id="tabBili" class="tab on">B站账号</button>
+      <button id="tabTieba" class="tab">贴吧账号</button>
+      <button id="tabXhh" class="tab">小黑盒账号</button>
+    </div>
+    <div class="modal-body">
+      <!-- B站页 -->
+      <div id="acctBili">
+        <div id="acctStatus" class="acct-status"></div>
+        <div id="qrZone">
+          <div id="qrBox"></div>
+          <div id="qrState">正在生成二维码…</div>
+          <button id="qrRefresh" class="alt">刷新二维码</button>
+        </div>
+        <details class="backup">
+          <summary>手动粘贴 Cookie（备用方案）</summary>
+          <p class="tip">打开 bilibili.com 并登录 → F12 → 网络(Network) → 刷新页面 → 点任意请求 → 请求头(Headers) 里的 Cookie 整段复制到下面</p>
+          <textarea id="acctCookie" rows="3" placeholder="SESSDATA=...; bili_jct=..."></textarea>
+          <div class="row">
+            <button id="acctLogin">保存并登录</button>
+            <button id="acctOpen" class="alt">打开B站登录页 ↗</button>
+          </div>
+        </details>
+        <div id="acctProfile"></div>
+        <div class="acct-foot">
+          <span>登录凭证只保存在本机 data.db，不会上传</span>
+          <span class="row-inline">
+            <button id="acctSync" class="alt">同步账号数据</button>
+            <button id="acctLogout" class="danger">退出账号</button>
+          </span>
+        </div>
+      </div>
+      <!-- 贴吧页 -->
+      <div id="acctTieba" class="hidden">
+        <div id="tbAcctStatus" class="acct-status"></div>
+        <div id="tbLoginZone">
+          <p class="tip">点击后会优先弹出支持自动保存凭证的 Chromium 浏览器窗口（Edge、Chrome、Brave、Chromium 等，不影响日常浏览器）。如果没有兼容浏览器，会改用你的默认浏览器打开登录页；登录后在下方粘贴 Cookie 保存即可。</p>
+          <div id="tbLoginState" class="tb-login-state">未启动</div>
+          <div class="row">
+            <button id="tbLoginStart">🔓 一键登录贴吧</button>
+            <button id="tbLoginStop" class="alt hidden">关闭窗口</button>
+            </div>
+            <div class="row">
+              <button id="tbLoginNative" class="hidden">📱 在本机登录（短信/验证码）</button>
+          </div>
+        </div>
+        <div class="row-inline tb-import-row">
+          <button id="tbImport" class="alt">📥 导入我关注的吧 → 吧列表</button>
+          <span class="hint" id="tbImportHint"></span>
+        </div>
+        <details class="backup">
+          <summary>🆘 服务端被贴吧风控时的手动采集（浏览器通道，绕开封锁）</summary>
+          <p class="tip">贴吧偶尔会封锁服务器端请求（403）。此通道用浏览器加载贴吧页（浏览器不受封锁），再抓取页面内容入库。</p>
+          <div class="row">
+            <select id="tbBrowseKw" class="tb-kw-pick"></select>
+            <button id="tbBrowseOpen" class="alt">在窗口中打开贴吧页</button>
+            <button id="tbBrowseGrab">🔄 抓取此页</button>
+          </div>
+          <span class="hint" id="tbBrowseHint"></span>
+        </details>
+        <div class="acct-foot">
+          <span>登录后：采集更稳（403 更少）+ 可一键导入关注吧。粘贴 Cookie 备用：</span>
+          <details class="backup">
+            <summary>手动粘贴 Cookie（备用方案）</summary>
+            <p class="tip">登录 tieba.baidu.com → F12 → Application → Cookies → 复制 BDUSS/STOKEN 等（或从请求头整段复制 Cookie）</p>
+            <textarea id="tbCookie" rows="3" placeholder="BDUSS=...; STOKEN=..."></textarea>
+            <div class="row">
+              <button id="tbLoginManual">保存并登录</button>
+            </div>
+          </details>
+        </div>
+        <div class="acct-foot">
+          <span class="row-inline">
+            <button id="tbLogout" class="danger">退出贴吧账号</button>
+          </span>
+        </div>
+      </div>
+      <!-- 小黑盒页 -->
+      <div id="acctXhh" class="hidden">
+        <div id="xhhAcctStatus" class="acct-status"></div>
+        <div id="xhhLoginZone">
+          <p class="tip">用手机「小黑盒 App」扫码登录。扫码后本机保存登录凭证，采集更稳（可获取个人向推荐）。不登录也可游客采集。</p>
+          <div id="xhhQrBox"></div>
+          <div id="xhhQrState">点击下方按钮生成二维码…</div>
+          <div class="row">
+            <button id="xhhQrGen">🔓 生成登录二维码</button>
+            <button id="xhhQrStop" class="alt hidden">停止轮询</button>
+          </div>
+        </div>
+        <div class="acct-foot">
+          <span class="row-inline">
+            <button id="xhhLogout" class="danger">退出小黑盒账号</button>
+          </span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toastWrap"></div>
+<script src="/qrcode.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,33 @@
+# ===== 用户数据 / 登录凭证 (绝不提交) =====
+desktop/data.db*
+desktop/_tb_login_profile/
+desktop/smoke-tmp/
+desktop/test-tmp/
+
+# ===== 构建产物 =====
+desktop/build/
+desktop/dist/
+releases/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/capture/
+
+# ===== 本机环境 / 私有内容 (不发布) =====
+android-sdk/
+.zcode/
+_local/
+
+# ===== 常见垃圾 =====
+__pycache__/
+*.py[cod]
+*.log
+nul
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# 运行时诊断产物
+desktop/tb_debug.jsonl
