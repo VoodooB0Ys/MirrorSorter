@@ -649,9 +649,10 @@ function closeReader() {
 }
 /* 小黑盒帖子唤起URL: 官方App的RouterActivity对 heybox://<host> 按host分发(反编译实测),
    host=link → 读link_id/link_tag参数构造BBSLinkObj直接进帖子详情页。
-   #web= 供壳在App未装时回落到网页。hexId=帖子链接里的16进制link_id, ltag=feed里的link_tag。 */
-function xhhJumpUrl(webUrl, hexId, ltag) {
-  let u = "heybox://link?link_id=" + encodeURIComponent(hexId || "");
+   id 必须传 App 内部语义的数字 linkid(xlid): 传网页端16进制id帖子能打开但评论会报"帖子id错误"。
+   #web= 供壳在App未装时回落到网页(网页仍用16进制id)。ltag=feed里的link_tag。 */
+function xhhJumpUrl(webUrl, id, ltag) {
+  let u = "heybox://link?link_id=" + encodeURIComponent(id || "");
   if (ltag) u += "&link_tag=" + encodeURIComponent(ltag);
   return u + "#web=" + encodeURIComponent(webUrl);
 }
@@ -671,8 +672,9 @@ async function openXhhReader(lid, title) {
   $("#rbJump").onclick = () => {
     const webUrl = "https://www.xiaoheihe.cn/app/bbs/link/" + lid;
     if (window.AndroidBridge) {
-      // 安卓壳: 官方 heybox://link 协议进帖子(App未装时壳回落到 #web= 网页)
-      window.open(xhhJumpUrl(webUrl, lid, readerBoxLtag), "_blank", "noopener");
+      // 安卓壳: 官方 heybox://link 协议进帖子, id用数字linkid(评论要用, hex会报帖子id错误);
+      // App未装时壳回落到 #web= 网页; 无xlid时退化用网页hex
+      window.open(xhhJumpUrl(webUrl, readerBoxXlid || lid, readerBoxLtag), "_blank", "noopener");
     } else if (readerBoxXlid) {
       const payload = JSON.stringify({
         protocol_type: "openLink",
@@ -797,9 +799,9 @@ $("#feedList").addEventListener("click", async (e) => {
     if (card.dataset.platform === "小黑盒" && card.dataset.xlid) {
       const hexId = (card.dataset.url.match(/bbs\/link\/([0-9a-f]+)/) || [])[1] || "";
       if (window.AndroidBridge) {
-        // 安卓壳: 官方 heybox://link?link_id= 协议进帖子(反编译RouterActivity确认),
-        // App未装时壳回落到 #web= 网页。桌面端仍走下方 heybox:// JSON 载荷。
-        jumpUrl = xhhJumpUrl(card.dataset.url, hexId, card.dataset.ltag);
+        // 安卓壳: 官方 heybox://link?link_id= 协议进帖子, id用数字linkid(评论要用),
+        // 无xlid时退化用hex(至少能打开)。App未装时壳回落到 #web= 网页。
+        jumpUrl = xhhJumpUrl(card.dataset.url, card.dataset.xlid || hexId, card.dataset.ltag);
       } else {
         // 桌面端: 官方H5同款协议 heybox:// + URL编码JSON(PC客户端可接管)
         const payload = JSON.stringify({
@@ -2313,7 +2315,7 @@ window.__nativeTiebaSaved = (ok) => {
     if (card.dataset.platform === "小黑盒" && card.dataset.xlid) {
       if (window.AndroidBridge) {
         const hexId = (card.dataset.url.match(/bbs\/link\/([0-9a-f]+)/) || [])[1] || "";
-        return xhhJumpUrl(jumpUrl, hexId, card.dataset.ltag);
+        return xhhJumpUrl(jumpUrl, card.dataset.xlid || hexId, card.dataset.ltag);
       }
       jumpUrl += "#xlid=" + card.dataset.xlid;
     }

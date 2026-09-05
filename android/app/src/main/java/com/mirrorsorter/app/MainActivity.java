@@ -232,14 +232,21 @@ public class MainActivity extends Activity {
             }
             // 帖子跳转(反编译官方APK的RouterActivity实测): 对 heybox://<host> 的URI按host分发,
             // host=link → 读 link_id/link_tag 查询参数构造BBSLinkObj → 直接进帖子详情页。
-            // www/api 域名的https链接未注册App Link, 直接开App只会落主页。
+            // www/api 域名的https链接未注册App Link, 直接开App只会落到主页。
             // 帖子链接格式 = https://www.xiaoheihe.cn/app/bbs/link/<16进制link_id>
             java.util.regex.Matcher m = java.util.regex.Pattern
                     .compile("^/app/bbs/link/([0-9a-fA-F]+)").matcher(path);
             if (m.find()) {
                 String hex = m.group(1);
-                // ① 官方唤起协议: heybox://link?link_id=<hex>(App自身分享链接同款, host=link)
-                out.add(pkgIntent(Uri.parse("heybox://link?link_id=" + hex), "com.max.xiaoheihe"));
+                // link_id 优先取数字linkid(#xlid=片段, App内部语义, 评论必须用数字);
+                // 只有hex时退化用hex(帖子能打开, 个别操作可能受限)
+                String id = hex;
+                String frag = u.getFragment() == null ? "" : u.getFragment();
+                if (frag.startsWith("xlid=") && frag.substring(5).matches("\\d+")) {
+                    id = frag.substring(5);
+                }
+                // ① 官方唤起协议: heybox://link?link_id=<id>(App自身分享链接同款, host=link)
+                out.add(pkgIntent(Uri.parse("heybox://link?link_id=" + id), "com.max.xiaoheihe"));
                 // ② App未装的兜底: 浏览器打开官方分享H5(能看正文, 并引导装App)
                 out.add(new Intent(Intent.ACTION_VIEW,
                         Uri.parse("https://www.xiaoheihe.cn/bbs/post_share?link_id=" + hex))

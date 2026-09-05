@@ -5951,7 +5951,7 @@ def persist_cold_cache(force=False):
     fields = ("key", "platform", "title", "author", "desc", "cover", "covers", "views",
               "views_known", "likes", "danmaku", "reply", "duration", "duration_known",
               "pubdate", "url", "tname", "area", "tag", "tclass", "gid", "src",
-              "reason", "topic", "interest", "following", "xcomm", "xtopic")
+              "reason", "topic", "interest", "following", "xcomm", "xtopic", "xlid", "ltag")
     slim = [{k: it.get(k) for k in fields} for it in keep]
     sset("cold_start_cache", json.dumps({"ts": int(time.time()), "items": slim}, ensure_ascii=False))
     _cold_last_save[0] = time.time()
