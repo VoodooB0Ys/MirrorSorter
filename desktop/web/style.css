@@ -3,6 +3,8 @@
   --txt:#e8eaf0; --sub:#8a91a0; --accent:#fb7299; --good:#67c23a; --bad:#f56c6c; --blue:#4a9eff;
   --soft:#22262f; --input:#0d0f14;
 }
+/* 手机上按住元素时WebView默认的蓝色点按高亮太晃眼(用户反馈), 统一去掉 */
+* { -webkit-tap-highlight-color: transparent; }
 /* 白天主题 */
 body.light {
   --bg:#f2f4f9; --panel:#ffffff; --card:#ffffff; --line:#dfe3ec;
