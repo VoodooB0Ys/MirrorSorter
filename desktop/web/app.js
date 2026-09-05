@@ -1791,10 +1791,15 @@ async function loadTiebaView() {
 }
 $("#tbAvatarBox").onclick = () => { openAccountModal(); acctTab("tieba"); };
 if (window.AndroidBridge) {
-  const tbN = document.getElementById("tbLoginNative");
-  if (tbN) {
-    tbN.classList.remove("hidden");   // 安卓壳内: 显示应用内登录(替代桌面CDP方案)
-    tbN.onclick = () => window.AndroidBridge.openTiebaLogin();
+  const tbSms = document.getElementById("tbLoginNativeSms");
+  const tbWeb = document.getElementById("tbLoginNativeWeb");
+  if (tbSms) {
+    tbSms.classList.remove("hidden");   // 安卓壳内: 手机版短信验证码登录页(wappass)
+    tbSms.onclick = () => window.AndroidBridge.openTiebaLogin("sms");
+  }
+  if (tbWeb) {
+    tbWeb.classList.remove("hidden");   // 安卓壳内: 电脑版 passport 页(密码/扫码)
+    tbWeb.onclick = () => window.AndroidBridge.openTiebaLogin("web");
   }
 }
 $("#tbLoginStart").onclick = async () => {
@@ -2107,18 +2112,14 @@ if ($("#mFollowMonths")) $("#mFollowMonths").addEventListener("input", syncMonth
   defaultFeedWidth();
 })();
 
-/* 安卓壳应用内登录回传: LoginActivity 抓到贴吧 Cookie 后调用, 走既有保存接口 */
-window.__nativeTiebaCookie = async (cookie) => {
-  try {
-    const res = await api("/api/tieba/login/manual", { method: "POST", body: { cookie } });
-    if (res.ok) {
-      toast("贴吧登录成功");
-      loadTiebaView(); loadMessages(); loadStatus(); loadFeed();
-    } else {
-      toast("登录失败：" + (res.error || "Cookie 无效"), { warn: true });
-    }
-  } catch (e) {
-    toast("登录失败：" + e, { warn: true });
+/* 安卓壳应用内登录回传: Java 侧已把 Cookie 直连 POST 到 /api/tieba/login/manual,
+   这里只负责收到结果通知后刷新界面(页面尚未加载完时跳过, 启动流程会自然读到新登录态) */
+window.__nativeTiebaSaved = (ok) => {
+  if (ok) {
+    toast("贴吧登录成功");
+    loadTiebaView(); loadMessages(); loadStatus(); loadFeed();
+  } else {
+    toast("贴吧登录保存失败，请重试", { warn: true });
   }
 };
 

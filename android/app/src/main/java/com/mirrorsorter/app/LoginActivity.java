@@ -12,6 +12,7 @@ import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+import android.widget.Toast;
 
 /** 应用内登录WebView: 打开平台登录页(短信/密码), 轮询捕获目标Cookie后回传主界面。
  *  贴吧登录在手机上的唯一可行方案(桌面版依赖CDP本机浏览器, 安卓不存在)。
@@ -47,7 +48,7 @@ public class LoginActivity extends Activity {
 
         Button done = new Button(this);
         done.setText("登录完成后点此保存");
-        done.setOnClickListener(v -> reportAndFinish());
+        done.setOnClickListener(v -> saveAndClose());
         root.addView(done);
 
         wv = new WebView(this);
@@ -99,24 +100,35 @@ public class LoginActivity extends Activity {
         if (reported) return;
         try {
             CookieManager cm = CookieManager.getInstance();
-            String ck = cm == null ? null : cm.getCookie(cookieProbeUrl);
-            if (ck != null && ck.contains(cookieName + "=")) {
-                reported = true;
-                getIntent().putExtra("cookie", ck);
-                setResult(RESULT_OK, getIntent());
-                finish();
+            // 多域探针: BDUSS 通常挂在 .baidu.com, 任一命中等价; 兜底防个别机型域匹配差异
+            String[] probes = {cookieProbeUrl, "https://wappass.baidu.com/", "https://www.baidu.com/"};
+            for (String u : probes) {
+                if (u == null || u.isEmpty()) continue;
+                String ck = cm.getCookie(u);
+                if (ck != null && ck.contains(cookieName + "=")) {
+                    reported = true;
+                    getIntent().putExtra("cookie", ck);
+                    setResult(RESULT_OK, getIntent());
+                    finish();
+                    return;
+                }
             }
         } catch (Exception ignored) {}
     }
 
-    private void reportAndFinish() {
+    private void saveAndClose() {
         if (!reported) checkCookie();
+        if (!reported) {
+            // 点保存时还没抓到Cookie: 给出反馈并留在登录页(可继续等自动保存或重试)
+            Toast.makeText(this, "未检测到登录Cookie：请确认页面已显示登录成功，稍候再点一次；返回键可取消", Toast.LENGTH_LONG).show();
+            return;
+        }
         finish();
     }
 
     @Override
     public void onBackPressed() {
         if (wv != null && wv.canGoBack()) wv.goBack();
-        else { reportAndFinish(); }
+        else finish();   // 取消登录: 直接退出, 不弹提示
     }
 }

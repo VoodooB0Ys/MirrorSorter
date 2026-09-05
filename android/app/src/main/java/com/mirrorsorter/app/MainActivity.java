@@ -42,6 +42,7 @@ public class MainActivity extends Activity {
     private final Handler ui = new Handler(Looper.getMainLooper());
     private ValueCallback<Uri[]> fileCallback;   // 设置导入的文件选择回调
     private boolean historyCleared = false;      // 主页面首次加载后清掉启动页历史(防返回键白屏)
+    private volatile int activePort = 8000;      // 探测成功的本地服务端口(登录回传直连用)
 
     // 安卓返回键的智能返回: 关浮层/弹窗 → 切回首页视图, 都没有才走网页回退/退出
     private static final String BACK_JS =
@@ -161,6 +162,7 @@ public class MainActivity extends Activity {
                 c.disconnect();
             } catch (Exception ignored) {}
             if (ok) {
+                activePort = port;
                 ui.post(() -> web.loadUrl("http://127.0.0.1:" + port + "/"));
             } else {
                 ui.post(() -> pollPort(idx + 1));
@@ -280,9 +282,7 @@ public class MainActivity extends Activity {
         if (requestCode == TIEBA_LOGIN_REQ) {
             String cookie = data == null ? null : data.getStringExtra("cookie");
             if (cookie != null && !cookie.isEmpty()) {
-                String js = "window.__nativeTiebaCookie && window.__nativeTiebaCookie("
-                        + org.json.JSONObject.quote(cookie) + ")";
-                web.evaluateJavascript(js, null);
+                saveTiebaCookie(cookie);
             }
             return;
         }
@@ -292,6 +292,54 @@ public class MainActivity extends Activity {
             return;
         }
         super.onActivityResult(requestCode, resultCode, data);
+    }
+
+    /* 登录Cookie保存: Java 直连本地后端 /api/tieba/login/manual。
+       不再经页面 JS 回传 —— 旧路径要求主页已加载完(定义了 __nativeTiebaCookie),
+       页面没就绪时调用是空操作, 表现为"点了保存却没登录"。后端保存成功与否
+       都会 Toast 反馈, 并通知前端刷新(页面未就绪时由启动流程自然读到新状态)。 */
+    private void saveTiebaCookie(String cookie) {
+        final String body = "{\"cookie\":" + org.json.JSONObject.quote(cookie) + "}";
+        new Thread(() -> {
+            boolean ok = false;
+            String detail = "";
+            try {
+                java.net.HttpURLConnection c = (java.net.HttpURLConnection)
+                        new java.net.URL("http://127.0.0.1:" + activePort + "/api/tieba/login/manual")
+                                .openConnection();
+                c.setRequestMethod("POST");
+                c.setDoOutput(true);
+                c.setConnectTimeout(5000);
+                c.setReadTimeout(30000);   // 后端要向百度验证Cookie并抓头像, 可能较慢
+                c.setRequestProperty("Content-Type", "application/json");
+                try (java.io.OutputStream os = c.getOutputStream()) {
+                    os.write(body.getBytes("UTF-8"));
+                }
+                java.io.InputStream in = c.getResponseCode() < 400 ? c.getInputStream() : c.getErrorStream();
+                java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+                byte[] buf = new byte[4096];
+                int n;
+                while (in != null && (n = in.read(buf)) > 0) bos.write(buf, 0, n);
+                String resp = bos.toString("UTF-8");
+                ok = resp.contains("\"ok\":true") || resp.contains("\"ok\": true");
+                if (!ok) detail = resp;
+            } catch (Exception e) {
+                detail = String.valueOf(e);
+            }
+            final boolean fok = ok;
+            final String fdetail = detail;
+            ui.post(() -> {
+                if (fok) {
+                    Toast.makeText(MainActivity.this, "贴吧登录成功，已保存", Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(MainActivity.this, "贴吧登录保存失败：" +
+                            (fdetail.isEmpty() ? "本地服务未响应" : fdetail.substring(0, Math.min(120, fdetail.length()))),
+                            Toast.LENGTH_LONG).show();
+                }
+                String js = "window.__nativeTiebaSaved && window.__nativeTiebaSaved(" + fok + ")";
+                web.evaluateJavascript(js, null);
+            });
+        }).start();
     }
 
     private void copyAssetDir(String assetDir, File target) throws IOException {
@@ -357,15 +405,22 @@ public class MainActivity extends Activity {
             });
         }
 
-        /* 手机贴吧登录: 应用内打开百度移动登录页(短信/密码), 抓到BDUSS后回传 */
+        /* 手机贴吧登录: mode=sms → 手机版wappass页(短信验证码为主);
+           mode=web → 电脑版passport页(密码/扫码)。两入口按钮分开(用户要求)。
+           抓到BDUSS后由 onActivityResult 直连后端保存。 */
         @JavascriptInterface
-        public void openTiebaLogin() {
+        public void openTiebaLogin(final String mode) {
             runOnUiThread(() -> {
                 Intent i = new Intent(MainActivity.this, LoginActivity.class);
-                i.putExtra("url", "https://passport.baidu.com/v2/?login&tpl=tb&u=https%3A%2F%2Ftieba.baidu.com%2F");
+                if ("sms".equals(mode)) {
+                    i.putExtra("url", "https://wappass.baidu.com/passport/?login&u=https%3A%2F%2Ftieba.baidu.com%2F");
+                    i.putExtra("title", "短信验证码登录：输手机号 → 收验证码，成功后自动保存");
+                } else {
+                    i.putExtra("url", "https://passport.baidu.com/v2/?login&tpl=tb&u=https%3A%2F%2Ftieba.baidu.com%2F");
+                    i.putExtra("title", "电脑版页面登录（密码/扫码），成功后自动保存");
+                }
                 i.putExtra("cookieProbeUrl", "https://tieba.baidu.com/");
                 i.putExtra("cookieName", "BDUSS");
-                i.putExtra("title", "登录百度账号（密码/短信/扫码均可），成功后自动保存");
                 startActivityForResult(i, TIEBA_LOGIN_REQ);
             });
         }

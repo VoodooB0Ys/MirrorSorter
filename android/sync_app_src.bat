@@ -1,5 +1,5 @@
 @echo off
-rem 同步桌面版源码(../desktop)到安卓 assets, 构建前运行。
+rem Sync desktop sources (../desktop) into Android assets before building.
 setlocal
 set SRC=%~dp0..\desktop
 set DST=%~dp0app\src\main\assets\python_src
@@ -16,5 +16,5 @@ for %%f in (app.js index.html style.css qrcode.js favicon.ico) do (
   if exist "%SRC%\web\%%f" copy /y "%SRC%\web\%%f" "%DST%\web\%%f" >nul
 )
 
-echo Synced: app.py + web/* -^> app\src\main\assets\python_src
+echo Synced: app.py + web/* into app/src/main/assets/python_src
 endlocal
