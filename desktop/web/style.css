@@ -310,6 +310,8 @@ select option { background:var(--card); color:var(--txt); }
                 border-left:3px solid var(--accent); border-radius:7px;
                 padding:7px 10px; margin-top:9px; }
 .card .reason::before { content:"💡 "; }
+/* 推荐理由默认隐藏(设置栏可开): 省卡片高度 */
+body.hide-reason .card .reason { display:none !important; }
 .card .acts { display:flex; gap:6px; margin-top:9px; align-items:center; flex-wrap:wrap; }
 .card .acts button { background:none; border:1px solid var(--line); color:var(--sub);
                      border-radius:6px; padding:4px 9px; font-size:12px; cursor:pointer; }

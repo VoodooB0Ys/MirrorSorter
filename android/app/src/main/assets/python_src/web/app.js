@@ -214,16 +214,20 @@ if (customAccentInput) customAccentInput.addEventListener("change", (e) => addCu
 function applyView() {
   const layout = localStorage.getItem("layout") || "single";
   const cov = localStorage.getItem("cover") || "m";
+  const reason = localStorage.getItem("reason") || "hide";   // 推荐理由默认隐藏(省高度)
   const list = document.getElementById("feedList");
   list.classList.toggle("dual", layout === "dual");
   list.classList.remove("cov-s", "cov-m", "cov-l");
   list.classList.add("cov-" + cov);
+  document.body.classList.toggle("hide-reason", reason === "hide");
   document.querySelectorAll("#layoutRow .seg").forEach((b) =>
     b.classList.toggle("on", b.dataset.layout === layout));
   document.querySelectorAll("#coverRow .seg").forEach((b) =>
     b.classList.toggle("on", b.dataset.cov === cov));
   document.querySelectorAll("#pvRow .seg").forEach((b) =>
     b.classList.toggle("on", b.dataset.v === String(pvZoom())));
+  document.querySelectorAll("#reasonRow .seg").forEach((b) =>
+    b.classList.toggle("on", b.dataset.reason === reason));
 }
 function pvZoom() {
   const v = parseFloat(localStorage.getItem("pv_zoom")) || 2;
@@ -240,6 +244,8 @@ document.addEventListener("click", (e) => {
   if (lb) { localStorage.setItem("layout", lb.dataset.layout); applyView(); }
   const cb = e.target.closest("#coverRow .seg");
   if (cb) { localStorage.setItem("cover", cb.dataset.cov); applyView(); }
+  const rb = e.target.closest("#reasonRow .seg");
+  if (rb) { localStorage.setItem("reason", rb.dataset.reason); applyView(); }
   const pb = e.target.closest("#pvRow .seg");
   if (pb) { localStorage.setItem("pv_zoom", pb.dataset.v); applyPvZoom(); }
 });
@@ -2373,7 +2379,7 @@ const IO_CATS = [
   ["基础", ["mode"]],
 ];
 /* 界面偏好存于 localStorage, 随导出迁移到新设备 */
-const IO_PREF_KEYS = ["theme", "accent", "custom_accents", "layout", "cover", "pv_zoom"];
+const IO_PREF_KEYS = ["theme", "accent", "custom_accents", "layout", "cover", "pv_zoom", "reason"];
 
 let ioParsed = null;   // 智能解析结果缓存
 
