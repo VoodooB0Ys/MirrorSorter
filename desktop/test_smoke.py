@@ -284,23 +284,28 @@ try:
     # 第二批: 模拟B站枯竭 —— 只来贴吧
     app._universe["items"] += [mk("mix-t2%02d" % i, "贴吧", 1500 - i) for i in range(30)]
     app.serve_chunk(0, 30, "", request_id="sess-test")
-    # 第三批: 新B站到货 → 必须重混进未消费后段, 而不是排在贴吧沉积带之后
+    # 第三批: 新B站到货 → 必须重混进未消费后段, 而不是排在贴吧沉积带之后。
+    # 验证口径 = 用户实际出流: 计划层重混 + serve层防扎堆兜底, 出流同平台最多连2条,
+    # 且新B站(mix-b2*)必须真的被送到用户面前(而非冻在沉积带后)。
     app._universe["items"] += [mk("mix-b2%02d" % i, "B站", 1400 - i) for i in range(20)]
     app._feed_plan(list(app._universe["items"]), False, 1)   # 触发重混(不经会话消费)
-    with app._plan_lock:
-        order = list(app._plan_cache["order"])
-    with app._session_lock:
-        served = set(app._session_served["sess-test"]["keys"])
-    tail = [it for it in order if it["key"] not in served]
-    tail_plats = [it["platform"] for it in tail]
+    stream, b2_served = [], 0
+    for i in range(6):
+        r = app.serve_chunk(0, 30, "", request_id="sess-test")
+        got = r.get("items") or []
+        stream += got
+        b2_served += sum(1 for it in got if it["key"].startswith("mix-b2"))
+        if len(stream) >= 90:
+            break
+    plats = [it["platform"] for it in stream]
     tb_runs, cur = [], 0
-    for p in tail_plats:
+    for p in plats:
         cur = cur + 1 if p == "贴吧" else 0
         tb_runs.append(cur)
-    check("沉积带: 新B站重混进后段且尾部无纯贴吧扎堆",
-          "B站" in tail_plats and (max(tb_runs) if tb_runs else 0) <= 4,
-          {"tail_len": len(tail_plats), "max_tb_run": max(tb_runs) if tb_runs else 0,
-           "bili_in_tail": tail_plats.count("B站")})
+    check("沉积带: 新B站重混进后段且出流无贴吧扎堆",
+          b2_served >= 10 and (max(tb_runs) if tb_runs else 0) <= 2,
+          {"stream": len(plats), "max_tb_run": max(tb_runs) if tb_runs else 0,
+           "bili_new_served": b2_served})
     app._plan_cache.update(key=None, order=[], seq=0)
     with app._session_lock:
         app._session_served.pop("sess-test", None)

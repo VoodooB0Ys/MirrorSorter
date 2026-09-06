@@ -31,3 +31,6 @@ Thumbs.db
 
 # 运行时诊断产物
 desktop/tb_debug.jsonl
+
+# PyInstaller 生成的 spec(每次构建自动生成)
+desktop/*.spec

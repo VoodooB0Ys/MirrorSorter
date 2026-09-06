@@ -5238,7 +5238,7 @@ def _is_newsy(it):
 def _is_evergreen(it):
     """常青干货判定: 教程/深度词或知识类来源(探索区可跨时间窗复现)。"""
     text = ((it.get("title") or "") + (it.get("tag") or "") + (it.get("tname") or "")).lower()
-    if any(k in text for k in SERIOUS_KWS + DEPTH_KWS):
+    if any(k in text for k in LEARNING_KWS + DEPTH_KWS):
         return True
     return (it.get("area") or it.get("tname") or "") in DEEP_AREAS
 
@@ -5663,17 +5663,16 @@ def _feed_plan(acts, new_session, gen):
             # 追加时不做"新批拼尾": 未消费后段整体重新混排。
             # 原因: B站热榜跨构建重叠大(新批B站越来越少), 贴吧/小黑盒游标轮换持续出新,
             # 逐批拼尾会让非B站沉积在计划末尾形成扎堆带; 全局重混让新到的B站插回中间。
+            # 前缀只保留"已实际返回"的条目: serve层防扎堆暂缓的未返回条目若按游标冻结在
+            # 前缀里, 会把沉积带一并冻住, 新B站永远插不进去(游标只代表扫描位置, 不代表消费)。
             with _session_lock:
                 latest = max(_session_served.values(), key=lambda s: s["ts"]) if _session_served else None
                 boundary = latest["cursor"] if latest else 0
                 served_union = set(latest["keys"]) if latest else set()
-            prefix = c["order"][:boundary]   # 已消费前缀: 最新会话游标之前的内容保持不动
-            suffix_in = [it for it in acts if it["key"] not in served_union
-                         and it["key"] not in {p["key"] for p in prefix}]
+            prefix = [it for it in (c["order"] or [])[:boundary] if it["key"] in served_union]
+            served_keys = {p["key"] for p in prefix} | served_union
+            suffix_in = [it for it in acts if it["key"] not in served_keys]
             t, _ = planned_feed(suffix_in, False)
-            if len(prefix) != boundary:   # 旧计划被裁剪等异常: 回退全量重排
-                t, _ = planned_feed(acts, False)
-                prefix = []
             c["order"] = prefix + t
             c["seq"] = c.get("seq", 0) + 1   # 后段已重混 → 会话游标归零重扫(已返回 key 被跳过)
         else:
@@ -6034,14 +6033,39 @@ def serve_chunk(offset=0, limit=30, q="", request_id=""):
             sess["seq"] = plan_seq
             sess["cursor"] = 0   # 计划已重排: 从头重扫(已返回 key 在下方循环中跳过)
         chunk, idx = [], sess["cursor"]
+        # 平台防扎堆(服务层兜底): 某轮构建单平台新批偏大(如B站抓空时贴吧一批五六十条)时,
+        # 计划虽经 mix_sources 交错, 但会话游标跳过"已返回"的旧条目后, 用户实际看到的
+        # 未返回流就是连片新批 —— 开屏刷着刷着贴吧成堆出现。这里对实际吐出的流兜底:
+        # 同平台最多连2条(与 mix_sources 同标准), 多余的暂缓(不入已返回集合, 留在池中
+        # 等下次重排再上); 暂缓导致本页不满时按"构建中"处理, 让后台补池接续, 不误报到底。
+        # 单平台池不启用(否则吞吐退化为每页2条轮询)。
+        plat_multi = len({(it.get("platform") or "B站") for it in acts}) > 1
+        spaced_defer = 0
+        last_p, run = sess.get("last_p"), sess.get("last_run", 0)   # 跨页持续: 上页末尾的连排不算清零
         while idx < len(acts) and len(chunk) < limit:
             it = acts[idx]
             if it.get("key") not in sess["keys"]:
+                p = it.get("platform") or "B站"
+                if plat_multi and p == last_p and run >= 2:
+                    spaced_defer += 1
+                    idx += 1
+                    continue
                 chunk.append(it)
+                sess["keys"].add(it.get("key"))
+                last_p, run = (p, run + 1) if p == last_p else (p, 1)
             idx += 1
+        sess["last_p"], sess["last_run"] = last_p, run
         consumed_end = idx
         sess["cursor"] = consumed_end
-        sess["keys"].update(it.get("key") for it in chunk)
+        if spaced_defer:
+            sess["defer_ts"] = time.time()
+            if len(chunk) < limit and not building \
+                    and time.time() - uni["built_at"] > 10:
+                need_full = time.time() - _last_full_build_ts > 90
+                threading.Thread(target=build_universe,
+                                 kwargs={"quick": not need_full}, daemon=True).start()
+            if len(chunk) < limit:
+                building = True   # 前端按"构建中"静默轮询续上, 不显示"已到底"
     else:
         chunk = acts[offset:offset + limit]
         consumed_end = min(offset + limit, len(acts))
@@ -6062,7 +6086,8 @@ def serve_chunk(offset=0, limit=30, q="", request_id=""):
                              kwargs={"quick": not need_full}, daemon=True).start()
             building = True
         if not chunk:
-            if building and not q:   # 正在构建(池尚未发布): 让前端继续轮询, 不误报"已到底"
+            # 最近发生过平台防扎堆暂缓: 构建补充中, 让前端继续轮询, 不误报"已到底"
+            if (building or (sess and time.time() - sess.get("defer_ts", 0) < 120)) and not q:
                 return {"ok": True, "items": [], "building": True, "gen": uni["gen"],
                         "source": uni["source"], "offline": uni["offline"],
                         "ai": uni["ai"], "mode": uni["mode"], "account": uni["account"],

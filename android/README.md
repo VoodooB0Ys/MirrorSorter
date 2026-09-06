@@ -23,7 +23,7 @@ android/
 ## 一键打包
 
 双击或运行 `android\build_apk.bat` 即可：自动同步桌面版源码 → 构建 →
-把 APK 复制到仓库根的 releases/，命名 `洞鉴虚明-<版本号>-debug.apk`（版本号自动读自
+把 APK 复制到仓库根的 releases/，命名 `洞鉴虚明-<版本号>.apk`（版本号自动读自
 `app/build.gradle` 的 versionName）。
 
 版本命名约定：安卓版版本号以 **e** 结尾（如 `0.1.1e`），与桌面版的 a 结尾
@@ -46,7 +46,7 @@ cmd //c "gradlew.bat assembleDebug --no-daemon"
 | Android SDK (platform 34 / build-tools 34) | `D:\Information Sorter\android-sdk` |
 | Gradle 8.5 | `D:\Information Sorter\android-sdk\gradle-8.5` |
 
-产物: `releases/洞鉴虚明-<版本号>-debug.apk` (约 35MB, debug 签名可直接安装)。
+产物: `releases/洞鉴虚明-<版本号>.apk` (约 35MB, debug 签名可直接安装)。
 
 注意: 本机路径含空格, 环境变量/`local.properties` 均用 8.3 短路径
 (`D:\INFORM~1\ANDROI~1`)绕过 cmd 的引号问题; `gradle.properties`/wrapper 已配好。

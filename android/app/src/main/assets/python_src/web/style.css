@@ -427,6 +427,9 @@ body.hide-reason .card .reason { display:none !important; }
 .conv-foot button:hover { background:var(--line); }
 
 /* AI 推荐模式卡片框 */
+/* 功能未完成, 暂时隐藏整个入口(开关/详细设置/状态行); 详细设置弹窗无入口不可达。
+   HTML/JS 全部保留, 恢复功能时删除下面这条规则即可。 */
+.ai-mode-box { display:none !important; }
 .ai-mode-box { background:var(--card); border:1px solid var(--line); border-radius:10px;
                padding:12px; display:flex; flex-direction:column; gap:8px; margin:6px 0; }
 .ai-mode-head { display:flex; flex-direction:column; gap:4px; }

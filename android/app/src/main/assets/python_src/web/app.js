@@ -1,4 +1,4 @@
-/* 洞鉴虚明 v0.2.6.3a - 前端逻辑 */
+/* 洞鉴虚明 v0.2.6.7a - 前端逻辑 */
 "use strict";
 
 const $ = (s) => document.querySelector(s);
@@ -681,15 +681,8 @@ async function openXhhReader(lid, title) {
       // 安卓壳: 官方 heybox://link 协议进帖子, id用数字linkid(评论要用, hex会报帖子id错误);
       // App未装时壳回落到 #web= 网页; 无xlid时退化用网页hex
       window.open(xhhJumpUrl(webUrl, readerBoxXlid || lid, readerBoxLtag), "_blank", "noopener");
-    } else if (readerBoxXlid) {
-      const payload = JSON.stringify({
-        protocol_type: "openLink",
-        link: { link_tag: 11, linkid: readerBoxXlid, use_concept_type: "0", has_video: 0 },
-        open_source: "/bbs/post_share",
-        page_identifier: JSON.stringify({ link_id: lid })
-      });
-      window.open("heybox://" + encodeURIComponent(payload) + "#web=" + encodeURIComponent(webUrl), "_blank", "noopener");
     } else {
+      // 桌面端: 直接开网页(heybox://深链留给安卓壳; 浏览器没装PC客户端时协议跳转体验差)
       window.open(webUrl, "_blank", "noopener");
     }
   };
@@ -808,16 +801,8 @@ $("#feedList").addEventListener("click", async (e) => {
         // 安卓壳: 官方 heybox://link?link_id= 协议进帖子, id用数字linkid(评论要用),
         // 无xlid时退化用hex(至少能打开)。App未装时壳回落到 #web= 网页。
         jumpUrl = xhhJumpUrl(card.dataset.url, card.dataset.xlid || hexId, card.dataset.ltag);
-      } else {
-        // 桌面端: 官方H5同款协议 heybox:// + URL编码JSON(PC客户端可接管)
-        const payload = JSON.stringify({
-          protocol_type: "openLink",
-          link: { link_tag: 11, linkid: card.dataset.xlid, use_concept_type: "0", has_video: 0 },
-          open_source: "/bbs/post_share",
-          page_identifier: JSON.stringify({ link_id: hexId })
-        });
-        jumpUrl = "heybox://" + encodeURIComponent(payload) + "#web=" + encodeURIComponent(jumpUrl);
       }
+      // 桌面端: 直接开网页(heybox://深链留给安卓壳; 浏览器没装PC客户端时协议跳转体验差)
     }
     openItem(key, jumpUrl);
   }

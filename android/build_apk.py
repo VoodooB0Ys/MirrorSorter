@@ -59,10 +59,10 @@ def main():
     gradle = open(os.path.join(BASE, "app", "build.gradle"), encoding="utf-8").read()
     ver = re.search(r'versionName "([^"]+)"', gradle).group(1)
     apk = os.path.join(BASE, "app", "build", "outputs", "apk", "debug", "app-debug.apk")
-    out = os.path.join(ROOT, "releases", "洞鉴虚明-%s-debug.apk" % ver)
+    out = os.path.join(ROOT, "releases", "洞鉴虚明-%s.apk" % ver)
     shutil.copy2(apk, out)
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    print("[3/3] 完成: releases/洞鉴虚明-%s-debug.apk" % ver)
+    print("[3/3] 完成: releases/洞鉴虚明-%s.apk" % ver)
 
 
 if __name__ == "__main__":
