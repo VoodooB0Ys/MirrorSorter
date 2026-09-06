@@ -1,56 +1,64 @@
 # 洞鉴虚明 (Mirror·Sorter)
 
-本地优先的多平台内容分拣器：聚合 **B站 / 百度贴吧 / 小黑盒** 三平台内容，
-经规则引擎 + AI（OpenAI 兼容接口）筛选排序，输出可交互的推荐流，内置 AI 聊天。
+A local-first multi-platform content sorter for Windows & Android. It aggregates
+content from **Bilibili / Baidu Tieba / Xiaoheihe (HeyBox)**, filters and ranks it
+with a rule engine plus AI (any OpenAI-compatible API), and serves an interactive
+feed with built-in AI chat.
 
-- **单文件后端**：`app.py` 只用 Python 标准库，零第三方依赖
-- **前后端一体**：前端为原生 HTML/JS，由本地 HTTP 服务直接伺服
-- **一套代码，两端运行**：电脑版直接跑；安卓版把同一套 Python 服务嵌进 APK
+- **Single-file backend**: `app.py` uses only the Python standard library — zero third-party dependencies
+- **Bundled frontend**: vanilla HTML/JS served directly by the local HTTP service
+- **One codebase, two platforms**: desktop runs as-is; Android embeds the same Python service inside the APK
 
-## 仓库结构
+## Repository Layout
 
 ```
-├─ desktop/   电脑版：Python 本地服务 + 浏览器界面（app.py + web/ + 一键脚本）
-├─ android/   安卓版：Chaquopy 壳，APK 内自带 Python 运行时，WebView 加载本地服务
-├─ releases/  打包产物输出目录（APK / exe，git 忽略）
+├─ desktop/   Desktop: local Python service + browser UI (app.py + web/ + one-click scripts)
+├─ android/   Android: Chaquopy shell, APK ships with its own Python runtime, WebView loads the local service
+├─ releases/  Build artifacts (APK / exe, git-ignored)
 └─ .gitignore
 ```
 
-> 登录凭证（B站 Cookie / 贴吧 BDUSS / 小黑盒登录态）只存在本机数据目录，
-> 仓库源码不包含任何用户数据与密钥。
+> Login credentials (Bilibili cookies / Tieba BDUSS / HeyBox session) are stored
+> only in the local data directory on each device. The repository contains no
+> user data or secrets.
 
-## 电脑版
+## Desktop
 
-见 [desktop/README.md](desktop/README.md)。快速开始：
+See [desktop/README.md](desktop/README.md). Quick start:
 
 ```bat
 cd desktop
-启动.bat          :: 启动本地服务并自动打开浏览器 (需 Python 3.10+)
-构建exe.bat       :: PyInstaller 打包单文件 exe 到 desktop\dist\
-python test_smoke.py   :: 回归测试
+启动.bat          :: start the local service and open the browser (Python 3.10+)
+构建exe.bat       :: build a single-file exe with PyInstaller into desktop\dist\
+python test_smoke.py   :: regression tests
 ```
 
-- 运行数据存于 `%LOCALAPPDATA%\LocalLow\MirrorSorter`（不污染仓库目录）
-- 平台采集：B站 Web API / 贴吧移动接口 / 小黑盒签名 API（含扫码登录）
+- Runtime data lives in `%LOCALAPPDATA%\LocalLow\MirrorSorter` (never pollutes the repo)
+- Platform adapters: Bilibili Web API / Tieba mobile API / HeyBox signed API (with QR login)
 
-## 安卓版
+## Android
 
-见 [android/README.md](android/README.md)。快速开始：
+See [android/README.md](android/README.md). Quick start:
 
 ```bat
-android\build_apk.bat    :: 同步桌面版源码 → Gradle 构建 → 产物到 releases\
+android\build_apk.bat    :: sync desktop sources → Gradle build → artifact in releases\
 ```
 
-- 一键脚本自动从 `../desktop` 同步 `app.py + web/` 进 APK assets
-- 产物：`releases/洞鉴虚明-<版本号>.apk`（约 35MB，debug 签名直接安装）
-- 版本命名：安卓版以 `e` 结尾（如 `0.1.5.21e`），桌面版以 `a` 结尾（如 `0.2.6.3a`）
+- The one-click script syncs `app.py + web/` from `../desktop` into the APK assets
+- Artifact: `releases/洞鉴虚明-<version>.apk` (~35MB, debug-signed, install directly)
+- Versioning: Android versions end with `e` (e.g. `0.1.5.21e`), desktop with `a` (e.g. `0.2.6.3a`)
 
-## 反馈与交流
+## Feedback & Community
 
-问题反馈 / 功能建议 / 交流：**QQ 群 533068204**。反馈前请先看[反馈指南](反馈指南.md)（含常见问题与反馈模板）。
+For bug reports, feature requests and discussion, join our QQ group: **533068204**.
+Please read the [feedback guide](FEEDBACK.md) first (common issues + report template).
 
-## 声明
+## Disclaimer
 
-- 本项目仅供学习交流，**严禁商用**
-- 采集仅限各平台公开接口，请控制频率、遵守平台条款
-- AI 功能需自行配置 OpenAI 兼容接口（如 DeepSeek），Key 只存本机
+- This project is for learning and personal use only. **Commercial use is strictly prohibited.**
+- Content aggregation uses public APIs of each platform only. Please keep request rates low and respect the platforms' terms of service.
+- AI features require your own OpenAI-compatible API endpoint (e.g. DeepSeek). Keys are stored locally only.
+
+---
+
+反馈与交流请加 QQ 群：**533068204**（反馈前请先看上方反馈指南）
