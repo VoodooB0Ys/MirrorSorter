@@ -1,4 +1,4 @@
-/* 洞鉴虚明 v0.2.6.7a - 前端逻辑 */
+/* 洞鉴虚明 v0.2.6.8a - 前端逻辑 */
 "use strict";
 
 const $ = (s) => document.querySelector(s);
@@ -268,7 +268,8 @@ function updateFeedMeta(d) {
       "</b> 条 · 多平台·相关度排序 · 下滑自动续" + extra;
     return;
   }
-  let html = "来源：<b>" + esc(d.source) + "</b> · 已加载 <b>" + feedState.offset + "</b> 条 · 下滑自动续";
+  const srcHtml = "来源：<b>" + esc(d.source) + "</b>";
+  let html = "已加载 <b>" + feedState.offset + "</b> 条 · 下滑自动续";
   if (d.partitions) html += " · 分区：<b>" + esc(d.partitions) + "</b>";
   if (d.offline) html += ' <span class="warn">⚠ 离线示例数据</span>';
   if (d.account) html += " · <b>账号画像已生效</b>";
@@ -276,7 +277,8 @@ function updateFeedMeta(d) {
   else html += ' <span class="warn">· AI 未配置（按热度排序）</span>';
   if (d.slots && Object.keys(d.slots).length)
     html += ' · <span class="tip">套餐：' + esc(Object.keys(d.slots).map((k) => k + d.slots[k]).join(" / ")) + "</span>";
-  meta.innerHTML = html;
+  // 手机版来源行默认收起为一行: 状态信息在前, 冗长的来源列表放最后(点按展开可见)
+  meta.innerHTML = (window.matchMedia("(max-width: 1023.9px)").matches ? html + " · " + srcHtml : srcHtml + " · " + html);
 }
 function clearFeed() {
   const list = $("#feedList");

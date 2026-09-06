@@ -612,7 +612,7 @@ body.hide-reason .card .reason { display:none !important; }
 
   /* ---- 信息流卡片: 大触控目标 + 统一封面 ---- */
   .meta-line { padding:8px 10px; font-size:11.5px; }
-  #feedMeta.clamp { max-height:2.9em; overflow:hidden; cursor:pointer; }
+  #feedMeta.clamp { max-height:1.8em; overflow:hidden; cursor:pointer; }   /* 手机默认收起为一行, 点按展开 */
   #feedMeta.expanded { max-height:none; }
   #feedList { padding:10px 10px calc(80px + env(safe-area-inset-bottom)); }
   /* 双栏=竖版瀑布流(封面在上/标题在下); 单栏仍为大横卡 */
