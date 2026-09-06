@@ -1,4 +1,4 @@
-# 洞鉴虚明 (Mirror·Sorter)
+# Mirror·Sorter
 
 A local-first multi-platform content sorter for Windows & Android. It aggregates
 content from **Bilibili / Baidu Tieba / Xiaoheihe (HeyBox)**, filters and ranks it

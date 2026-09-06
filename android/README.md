@@ -1,90 +1,102 @@
-# 洞鉴虚明 · 安卓版 (Chaquopy 壳)
+# Mirror·Sorter · Android (Chaquopy shell)
 
-把桌面版 (`desktop/app.py` + `web/`) 原样嵌进安卓应用: APK 内自带 Python 3.12
-运行时, 启动时把 Python 源码解包到应用私有目录, 在后台线程跑起本地 HTTP 服务,
-再用 WebView 全屏加载 `http://127.0.0.1:8000`。业务代码零改动。
+Embeds the desktop app (`desktop/app.py` + `web/`) unchanged into an Android app:
+the APK ships its own Python 3.12 runtime, unpacks the Python sources into the
+app's private directory at startup, runs the local HTTP service on a background
+thread, and loads `http://127.0.0.1:8000` in a fullscreen WebView. Zero changes
+to the business code.
 
-## 目录结构
+## Layout
 
 ```
 android/
 ├─ app/build.gradle                 # Chaquopy 15.0.1 + AGP 8.2.2, Python 3.12
 ├─ app/src/main/
-│  ├─ AndroidManifest.xml           # INTERNET 权限 + cleartext(仅127.0.0.1)
+│  ├─ AndroidManifest.xml           # INTERNET permission + cleartext (127.0.0.1 only)
 │  ├─ java/com/mirrorsorter/app/MainActivity.java
-│  │                                # assets解包 → launcher.start() → 轮询端口 → WebView
-│  ├─ python/launcher.py            # Python 启动器: 设环境变量/打补丁/线程跑 app.py
-│  ├─ assets/python_src/            # 桌面版源码镜像(app.py + web/*), 构建前由脚本同步
-│  └─ res/mipmap-*/ic_launcher.png  # 由 desktop/djxm_icon_128x128.ico 生成
-├─ sync_app_src.bat                 # 从 ../desktop 同步最新源码到 assets
-└─ gradlew.bat                      # Wrapper(下载源已改腾讯镜像)
+│  │                                # unpack assets → launcher.start() → poll port → WebView
+│  ├─ python/launcher.py            # Python bootstrap: env vars / patches / runs app.py in a thread
+│  ├─ assets/python_src/            # mirror of desktop sources (app.py + web/*), synced by script before build
+│  └─ res/mipmap-*/ic_launcher.png  # generated from desktop/djxm_icon_128x128.ico
+├─ sync_app_src.bat                 # syncs latest desktop sources into assets
+└─ gradlew.bat                      # wrapper (download mirror: Tencent)
 ```
 
-## 一键打包
+## One-click Build
 
-双击或运行 `android\build_apk.bat` 即可：自动同步桌面版源码 → 构建 →
-把 APK 复制到仓库根的 releases/，命名 `洞鉴虚明-<版本号>.apk`（版本号自动读自
-`app/build.gradle` 的 versionName）。
+Run `android\build_apk.bat`: syncs desktop sources → Gradle build → copies the
+APK to `releases/` at the repo root as `洞鉴虚明-<version>.apk` (version read
+automatically from `versionName` in `app/build.gradle`).
 
-版本命名约定：安卓版版本号以 **e** 结尾（如 `0.1.1e`），与桌面版的 a 结尾
-（如 `0.2.6.2a`）区分；发版时改 `app/build.gradle` 里的 versionCode/versionName。
+Versioning convention: Android versions end with **e** (e.g. `0.1.1e`), desktop
+with **a** (e.g. `0.2.6.2a`); bump versionCode/versionName in `app/build.gradle`
+on release.
 
-手动构建 (Git Bash):
+Manual build (Git Bash):
 
 ```bash
 export JAVA_HOME='D:\INFORM~1\ANDROI~1\JDK-17~1.1_1'
 cd "D:\Information Sorter\android"
-cmd //c sync_app_src.bat          # 先同步桌面版最新源码
+cmd //c sync_app_src.bat          # sync latest desktop sources first
 cmd //c "gradlew.bat assembleDebug --no-daemon"
 ```
 
-## 本机构建环境(已装好, 勿删)
+## Local Build Environment (installed, do not delete)
 
-| 组件 | 位置 |
+| Component | Location |
 |---|---|
 | JDK 17 | `D:\Information Sorter\android-sdk\jdk-17.0.20.1+1` |
 | Android SDK (platform 34 / build-tools 34) | `D:\Information Sorter\android-sdk` |
 | Gradle 8.5 | `D:\Information Sorter\android-sdk\gradle-8.5` |
 
-产物: `releases/洞鉴虚明-<版本号>.apk` (约 35MB, debug 签名可直接安装)。
+Artifact: `releases/洞鉴虚明-<version>.apk` (~35MB, debug-signed, installable directly).
 
-注意: 本机路径含空格, 环境变量/`local.properties` 均用 8.3 短路径
-(`D:\INFORM~1\ANDROI~1`)绕过 cmd 的引号问题; `gradle.properties`/wrapper 已配好。
+Note: the local path contains spaces, so env vars / `local.properties` use 8.3
+short paths (`D:\INFORM~1\ANDROI~1`) to dodge cmd quoting issues;
+`gradle.properties` / wrapper are preconfigured.
 
-## 安装到手机
+## Install on a Phone
 
-APK 传到手机直接点开安装 (需允许"未知来源"), 或:
+Copy the APK to the phone and open it (allow "unknown sources"), or:
 
 ```bash
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## 运行原理与已适配项
+## How It Works & Adaptations
 
-- **数据目录**: `launcher.py` 设 `MIRRORSORTER_DATA_DIR=<filesDir>/data`,
-  app.py 的 DATA_DIR 覆盖机制原生支持 → 设置/登录/历史全部存应用私有目录。
-- **不弹浏览器**: `launcher.py` 里 `sys.argv` 不带 `--auto-open` 并给
-  `webbrowser.open` 打了空补丁。
-- **外链跳转**: WebView 把非 127.0.0.1 的 URL 和 `window.open(_blank)`
-  全部转交系统浏览器 (B站视频页/贴吧帖等)。
-- **本机扫码登录**: 手机上无法"自己扫自己", `web/app.js` 在触屏设备上会在
-  B站/小黑盒二维码下方显示「📱 本机登录」按钮 → 打开系统浏览器 →
-  跳进对应 App 确认 → 壳内轮询自动完成登录。
+- **Data directory**: `launcher.py` sets `MIRRORSORTER_DATA_DIR=<filesDir>/data`,
+  natively supported by app.py's DATA_DIR override → settings / logins / history
+  all live in app-private storage.
+- **No browser popup**: `launcher.py` omits `--auto-open` from `sys.argv` and
+  patches `webbrowser.open` to a no-op.
+- **External links**: the WebView hands all non-127.0.0.1 URLs and
+  `window.open(_blank)` to the system browser (Bilibili video pages, Tieba posts, etc.).
+- **Self-contained QR login**: a phone cannot scan its own screen, so on touch
+  devices `web/app.js` shows a "📱 login on this device" button under the
+  Bilibili / HeyBox QR code → opens the system browser → confirms inside the
+  corresponding app → the shell polls and completes login automatically.
 
-## 已知限制(待做)
+## Known Limitations (TODO)
 
-1. **贴吧登录**: 已用应用内 WebView 登录页实现 (LoginActivity, 抓 BDUSS +
-       newmoindex 取昵称/头像); 每次打开登录页自动清 Cookie, 可随意换号。
-2. **无后台抓取**: 进程退到后台可能被系统回收, 纯手动打开刷新没问题;
-   需要"定时自动抓"得加前台服务 (通知栏常驻)。
-3. **debug 签名**: 正式分发前应做 release 签名 (keystore + `assembleRelease`)。
-4. **图标**: 直接缩放的方图, 未做自适应圆角/maskable。
+1. **Tieba login**: implemented via an in-app WebView login page (LoginActivity,
+   captures BDUSS + nickname/avatar via newmoindex); cookies are cleared each
+   time the login page opens, so switching accounts is painless.
+2. **No background fetching**: the OS may kill the process in the background;
+   manual open-and-refresh works fine. Scheduled auto-fetching would need a
+   foreground service (persistent notification).
+3. **Debug signature**: a release keystore + `assembleRelease` is needed before
+   proper distribution.
+4. **Icon**: plain scaled square, no adaptive rounded / maskable variant.
 
-## 版本 0.1.3e 新增
+## Added in 0.1.3e
 
-- **聊天边缘手势**: 手机上从屏幕右缘向左滑打开 AI 聊天, 聊天里左缘向右滑返回;
-  底部 Tab 只剩 首页/记录/设置, 聊天页左上角有返回按钮兜底。
-- **设置导入导出**: 设置栏 → 数据管理 → 设置导入/导出。导出含 AI 配置/筛选规则/
-  平台权重/偏好备注/黑白名单/界面偏好, 登录凭证默认不导(勾选后导入方可免扫码登录)。
-  手机端经 AndroidBridge 剪贴板桥一键读取, 智能解析(可从夹杂文本中抠出 JSON)后
-  按类勾选合并导入, 只覆盖勾选项。
+- **Chat edge gestures**: swipe left from the right screen edge to open AI chat;
+  swipe right from the left edge inside chat to go back. Bottom tabs are now
+  Home / Records / Settings only, with a back button in the chat header as fallback.
+- **Settings import/export**: settings rail → data management → export/import.
+  Exports include AI config / filtering rules / platform weights / preference
+  notes / black & white lists / UI preferences; login credentials are excluded
+  by default (opt-in, lets the importing device skip QR login). On Android the
+  import reads via an AndroidBridge clipboard bridge, smart-parses JSON out of
+  mixed text, and merges only the selected categories.

@@ -1,81 +1,86 @@
-# 洞鉴虚明 (Mirror·Sorter) · 电脑版
+# Mirror·Sorter · Desktop
 
-> 当前版本以 `web/index.html` 页脚为准 (如 v0.2.6.3a)。安卓版见仓库根 `android/`。
+> Current version follows the `web/index.html` footer (e.g. v0.2.6.7a). Android lives in `android/`.
 
-本地运行的信息分拣器：聚合 B站 / 百度贴吧 / 小黑盒 三平台内容 → 规则 + AI 分拣 → 推荐流 + 数据源状态面板 + AI 聊天。
-**零第三方依赖**（只用 Python 标准库），数据全部存在本机用户目录 (`%LOCALAPPDATA%\LocalLow\MirrorSorter`), 仓库目录不存任何用户数据。
+A locally-running content sorter: aggregates Bilibili / Baidu Tieba / HeyBox
+content → rule + AI filtering → interactive feed + source status panel + AI chat.
+**Zero third-party dependencies** (Python standard library only); all data stays
+in the user directory (`%LOCALAPPDATA%\LocalLow\MirrorSorter`) — the repo itself
+never stores user data.
 
-## 一键启动（推荐）
+## Quick Start (recommended)
 
-| 方式 | 操作 | 说明 |
+| Action | What it does | Notes |
 |---|---|---|
-| **双击 `启动.bat`** | 自动启动服务 → 自动打开浏览器 | 需要已安装 Python |
-| **双击 `dist\洞鉴虚明.exe`** | 同上，独立单文件 | **无需安装 Python**，可拷到任意 Windows 电脑 |
-| **双击 `停止.bat`** | 停止所有相关进程 | 或任务管理器结束 |
-| **双击 `构建exe.bat`** | 重新打包 exe | 改完代码后重新生成 |
+| Double-click `启动.bat` | starts the service → opens the browser | requires Python |
+| Double-click `dist\洞鉴虚明.exe` | same, standalone single file | **no Python needed**, portable to any Windows PC |
+| Double-click `停止.bat` | stops all related processes | or kill via Task Manager |
+| Double-click `构建exe.bat` | rebuild the exe | run after changing code |
 
-重复双击是安全的：会检测到服务已在运行，只打开浏览器。
-> ⚠ PyInstaller 打包的程序偶尔被杀毒软件误报，如遇提示把 `dist\洞鉴虚明.exe` 加入信任区即可。
+Double-clicking again is safe: it detects the running service and just opens the browser.
+> ⚠ PyInstaller builds occasionally trigger antivirus false positives — if so, add `dist\洞鉴虚明.exe` to the trust list.
 
-## 界面功能（对应定稿设计）
+## UI Overview
 
-- **左·设置栏**：AI 配置（OpenAI 兼容接口，默认 DeepSeek）/ 偏好备注 / 黑白名单（关键词·作者）/ 数据管理；可折叠成窄轨道
-- **顶栏**：过滤档位（严格/标准/宽松）、搜索、历史、收藏、个人菜单
-- **中·信息流**：卡片 = 平台徽标 + 标题 + 简介 + 作者/热度/时间 + **AI 推荐理由** + 👍👎⏳🚫 + 去平台看；点卡片直接打开原平台并自动记入历史
-- **大面板**：数据源状态（各平台状态/今日入库/筛掉条数/AI 调用/成本）+ 历史 + 收藏（稍后再看/收藏）
-- **右·AI 聊天**：告诉 AI 你爱看什么；聊天意愿会参与后续评分
+- **Left · settings rail**: AI config (OpenAI-compatible API, DeepSeek by default) / preference notes / black & white lists (keywords · authors) / data management; collapsible to a narrow rail
+- **Top bar**: filter level (strict/standard/relaxed), search, history, saved, account menu
+- **Middle · feed**: cards = platform badge + title + summary + author/heat/time + **AI recommendation reason** + 👍👎⏳🚫 + open on platform; clicking a card opens the original post and records it into history
+- **Large panel**: data source status (per-platform status / today's intake / filtered counts / AI calls / cost) + history + saved
+- **Right · AI chat**: tell the AI what you like; chat signals feed into future scoring
 
-## 刷新与新内容
+## Refresh & New Content
 
-- 点「↻」会**强制拉取并轮换数据源**（全站榜/热门1-3页/分区榜，每次换 4 个源），保证每次刷新都有新内容
-- 未配 AI 时也能用：排序 = 账号常看作者 > 新面孔 > 账号高频词 > 热度
+- The "↻" button **force-fetches and rotates sources** (overall ranking / hot pages 1-3 / partition rankings, 4 sources per round), so every refresh brings new content
+- Works without AI configured: ranking = frequently-watched authors > fresh faces > personal frequent keywords > popularity
 
-## B站账号（可选，优化推荐）
+## Bilibili Account (optional, improves recommendations)
 
-「个人 → B站账号」：
+"Account → Bilibili account":
 
-1. 点「打开B站登录页」→ 用已经登录的浏览器打开 bilibili.com
-2. 按 F12 → Network（网络）→ 刷新页面 → 点任意请求 → Request Headers 里复制整段 Cookie
-3. 粘贴到输入框 → 「保存并登录」
+1. Click "Open Bilibili login page" → open bilibili.com in a browser where you are already logged in
+2. Press F12 → Network → refresh the page → click any request → copy the whole Cookie from Request Headers
+3. Paste it into the input box → "Save & login"
 
-之后程序会读取你的**观看历史 / 收藏夹**，自动生成画像（常看作者/高频词/收藏夹）：
-**无 AI 时**用它给排序加权；**有 AI 时**把它写进评分上下文。Cookie 只存本机 data.db。
+The app then reads your **watch history / favorites** and builds a profile
+(frequent authors / frequent keywords / favorites): without AI it weights the
+ranking; with AI it is injected into the scoring context. Cookies are stored
+only in the local data.db.
 
-## AI 配置（可选）
+## AI Config (optional)
 
-未配置时：按热度排序，功能完整可用（无推荐理由/过滤）。
-配置后：开启 引战分/低质分 过滤（档位即阈值）+ 个性化推荐理由 + AI 聊天。
+Without configuration: ranked by popularity, fully functional (no recommendation reasons / AI filtering).
+Once configured: flame/low-quality score filtering (level = threshold) + personalized recommendation reasons + AI chat.
 
-1. 左侧设置 → API 地址（默认 `https://api.deepseek.com/v1`，可换成任意 OpenAI 兼容服务）
-2. 填入 API Key（DeepSeek 等注册即送额度，也可用智谱/通义/Qwen，换地址+模型即可）
-3. 保存 → 刷新信息流即生效；右侧面板可看今日 AI 成本
+1. Left settings → API URL (default `https://api.deepseek.com/v1`, any OpenAI-compatible service works)
+2. Enter an API key (DeepSeek gives free credit on signup; Zhipu / Qwen also work — just change URL + model)
+3. Save → refresh the feed; today's AI cost shows in the right panel
 
-## 源码方式运行
+## Run from Source
 
 ```
-cd D:\Information Sorter\bili-demo
+cd desktop
 python app.py
-# 打开 http://127.0.0.1:8000
+# open http://127.0.0.1:8000
 ```
 
-## 目录结构
+## Layout
 
 ```
-bili-demo/
-├── app.py            # 后端：数据获取 + AI评分 + SQLite + 全部API + 本地服务
-├── web/index.html    # 界面骨架
-├── web/style.css     # 样式
-├── web/app.js        # 前端逻辑
-├── data.db           # 数据(自动生成, 删除即重置)
+desktop/
+├── app.py            # backend: fetching + AI scoring + SQLite + all APIs + local server
+├── web/index.html    # UI skeleton
+├── web/style.css     # styles
+├── web/app.js        # frontend logic
+├── data.db           # data (auto-created; delete to reset)
 ├── 启动.bat / 停止.bat / 构建exe.bat
-└── dist\洞鉴虚明.exe  # 独立运行单文件
+└── dist\洞鉴虚明.exe  # standalone single-file build
 ```
 
-## 常见问题
+## Troubleshooting
 
-| 现象 | 处理 |
+| Symptom | Fix |
 |---|---|
-| 页面显示"离线示例数据" | 本机网络不通或 B站风控，点「立即刷新数据」，稍后再试 |
-| AI 调用失败 | 检查左侧设置的 API 地址/Key/模型；DeepSeek 的 Key 需 `sk-` 开头 |
-| 想全部重来 | 删除 `data.db`（或「个人→清空全部数据」） |
-| 端口被占用 | 自动尝试 8000 → 8010 → 8020 |
+| Page shows "offline sample data" | no network or Bilibili rate-limiting; click "Refresh now" and retry later |
+| AI calls fail | check API URL / key / model in settings; DeepSeek keys start with `sk-` |
+| Start over | delete `data.db` (or Account → clear all data) |
+| Port busy | automatically falls back 8000 → 8010 → 8020 |
