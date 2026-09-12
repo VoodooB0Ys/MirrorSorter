@@ -287,9 +287,10 @@ _funnel_lock = threading.Lock()
 _funnel = {"day": today(), "counts": {}}
 _FUNNEL_LABELS = {
     "fetched": "抓回候选", "partition": "分区不符", "age": "超时间窗", "news": "资讯保鲜",
-    "views": "播放量窗口", "duration": "时长窗口", "emotion": "情绪过滤", "dislike": "厌恶词",
+    "views": "播放量窗口", "duration": "时长窗口", "emotion": "情绪/广告过滤", "dislike": "厌恶词",
     "blocklist": "拉黑名单", "help": "求助帖", "xhh": "小黑盒筛选", "dedup": "重复标题",
     "follow_window": "关注超强调窗", "cooldown": "展示冷却", "cooldown_relaxed": "冷却不足复用", "ai_gate": "AI门禁", "kept": "最终入池",
+    "pref_fetch": "偏好·搜到", "pref_kept": "偏好·入池", "pref_drop": "偏好·被拦",
     "build_full": "全量构建", "build_quick": "快速构建",
 }
 
@@ -646,6 +647,8 @@ _kw_cursor = 0
 _kw_page = 0
 _fetch_count = 0
 _pref_cursor = 0   # 偏好词轮换游标
+_pref_page = 0     # 偏好词翻页游标(逐轮推进, 永远只搜第1页会反复同一批视频)
+_PREF_PAGE_MAX = 4 # 偏好词翻页深度(4页×30条/词, 覆盖小众主题的近期供给)
 
 
 def pref_keywords(enabled):
@@ -673,6 +676,16 @@ def pref_all_kws():
         if 2 <= len(p) <= 12:
             out.append(p)
     return out
+
+
+def _pref_search_terms(enabled, quick):
+    """本轮要搜的(偏好词, 页码): 完整构建取2词/快速开屏取1词(轮换游标覆盖全部偏好),
+    页码游标逐轮推进 —— 永远只搜第1页会把同一批视频翻来覆去, 被已看窗口压光后偏好就"消失"了。"""
+    prefs = pref_keywords(enabled)
+    if not prefs:
+        return []
+    pg = (_pref_page % _PREF_PAGE_MAX) + 1
+    return [(kw, pg) for kw in prefs[:1 if quick else 2]]
 
 
 def serious_kw_pool(enabled):
@@ -1432,7 +1445,7 @@ def xhh_thread_content(link_id):
                             "comments": [], "comment_total": it.get("reply")}
         except Exception:
             pass
-        return {"ok": False, "error": "小黑盒要求人机验证(访问过频)，稍后再试或点右上角跳转App"}
+        return {"ok": False, "error": "小黑盒要求人机验证(访问过频或未登录)：稍后再试，或在设置登录小黑盒账号后重试；也可点右上角跳转App查看"}
     if d.get("status") != "ok":
         return {"ok": False, "error": "接口状态异常: %s" % d.get("status")}
     res = d.get("result") or {}
@@ -2443,7 +2456,7 @@ def fetch_xhh_pool(quick=False):
 def fetch_pool(quick=False):
     """轮换取源 + 页游标 + 相关推荐链 + 搜索词引擎 + 随机采样 + 贴吧(网络请求全部并行)。
     quick=True: 只取2个源(快速开屏, 后续后台补全)。"""
-    global _src_cursor, _page_cursor, _kw_cursor, _kw_page, _fetch_count, _pref_cursor
+    global _src_cursor, _page_cursor, _kw_cursor, _kw_page, _fetch_count, _pref_cursor, _pref_page
     errors, seen, items, ok, names = [], {}, [], 0, []
     enabled = enabled_source_ids()
     avail = [s for s in BILI_SOURCES if s[1] in enabled] or BILI_SOURCES
@@ -2506,6 +2519,16 @@ def fetch_pool(quick=False):
             xhh_future = _FX.submit(fetch_xhh_pool, False)
         if sget("bili_follow_emph") == "1":
             fol_future = _FX.submit(fetch_following_videos)
+    # --- 偏好词引擎(提前并行提交): 用户偏好备注=最高优先级的主动意图 ---
+    # 与榜单/贴吧/小黑盒同批发出请求; 结果在榜单消费后立即收编(见下方消费块),
+    # 保证预算不被相关链/搜索词引擎挤占 —— 旧版排最末且带 len(items)<420 闸门,
+    # 相关链+词引擎把池子灌满后偏好词整段被跳过(用户"偏好几乎刷不到"的根因);
+    # 快速开屏也搜1词(旧版quick完全不搜偏好); 页码游标逐轮翻页防同一批视频反复。
+    pref_terms = _pref_search_terms(enabled, quick)
+    _push0 = search_pushdown()
+    pref_futures = [(kw, pg, _FX.submit(search_items, kw, pg,
+                                        order=_push0.get("order"), duration=_push0.get("duration")))
+                    for kw, pg in pref_terms]
     cur_gids = []
     jobs = []
     for i, (name, gid, tpl, rid, pages) in enumerate(picked if not ser_mode else []):
@@ -2530,6 +2553,30 @@ def fetch_pool(quick=False):
             ok += 1
         else:
             errors.append("%s: %s" % (shown, (data or {}).get("code") or err))
+
+    # --- 偏好词引擎(消费): 紧跟榜单之后、贴吧/相关链/词引擎之前收编, 预算必有富余 ---
+    # 偏好备注是用户明写的主动意图, 优先级高于分区白名单与严肃模式硬拒:
+    # 结果统一打 pref_kw 标记, 在 machine_filter(时间窗)/bake_universe/planned_feed 各层豁免。
+    for kw, pg, fut in pref_futures:
+        try:
+            res = fut.result() or []
+        except Exception:
+            res = []
+        made = 0
+        for x in res:
+            bvid = (x.get("url") or "").rsplit("/", 1)[-1]
+            if bvid and bvid not in seen and len(items) < 450:
+                seen[bvid] = 1
+                x["src"] = "偏·" + kw[:6]   # 混排桶标记(偏好词)
+                x["pref_kw"] = kw           # 偏好意图标记: 下游各层据此豁免/加成
+                items.append(x)
+                made += 1
+        if made:
+            names.append("偏好·%s×%d" % (kw, made))
+            _funnel_bump("pref_fetch", made)
+    if pref_terms:
+        _pref_cursor += 1 if quick else 2   # 下轮换下一批偏好词(quick搜1词只进1格)
+        _pref_page += 1                     # 下轮翻新的一页
 
     # --- 快速开屏: 消费与榜单同时发出的搜索词请求(见 quick 分支的提前提交) ---
     if quick:
@@ -2782,29 +2829,9 @@ def fetch_pool(quick=False):
             if made:
                 names.append("随机·%s×%d" % (kw, made))
 
-    # --- 偏好词引擎: 把偏好备注里的具体主题直接搜进信息流(用户"我偏好的怎么刷不到"根因) ---
-    if not quick and len(items) < 420:
-        prefs = pref_keywords(enabled)
-        if prefs:
-            pick = prefs[:2]   # 每轮最多搜2个偏好词, 多轮刷新时轮换
-            _push = search_pushdown()
-            for kw, res in zip(pick, _FX.map(lambda a: search_items(a, 1, order=_push.get("order"), duration=_push.get("duration")), pick)):
-                made = 0
-                for x in res:
-                    if ser_mode and not is_serious_ok(x):   # 严肃模式下偏好词同样过严肃判定
-                        continue
-                    if not item_domain_ok(x, enabled):   # 分区白名单(严格)
-                        continue
-                    bvid = (x.get("url") or "").rsplit("/", 1)[-1]
-                    if bvid and bvid not in seen and len(items) < 450:
-                        seen[bvid] = 1
-                        x["src"] = "偏·" + kw[:6]   # 混排桶标记(偏好词)
-                        items.append(x)
-                        made += 1
-                if made:
-                    names.append("偏好·%s×%d" % (kw, made))
-        if prefs:
-            _pref_cursor += 2   # 下轮换下两个偏好词
+    # (偏好词引擎已上移: 提前并行提交 + 榜单消费后立即收编, 见 fetch_pool 前段。
+    #  旧版排在此处且带 len(items)<420 闸门, 相关链+词引擎灌满池子后整段被跳过,
+    #  快速开屏也完全不搜 —— 这是"偏好几乎刷不到"的根因, 已修。)
 
     # --- 严肃模式旧串行深挖已由上方并行搜索替代, 保留代码路径关闭以便回滚参考 ---
     if False and not quick and len(items) < 420 and ser_mode:
@@ -3438,17 +3465,21 @@ def score_batch():
 
 
 SCORER_SKILL = """
-【内容筛选技能 v1】你是一名专业内容筛选员，为「洞鉴虚明」工作。你的唯一任务：对每条内容给出质量与匹配度判断，供系统决定是否推送给用户。
+【内容筛选技能 v2】你是一名专业内容筛选员，为「洞鉴虚明」工作。你的唯一任务：对每条内容给出质量与匹配度判断，供系统决定是否推送给用户。
 
-【内容形态】条目可能来自两个平台，评分口径略有差异：
+【内容形态】条目可能来自三个平台，评分口径略有差异：
 - B站视频(platform=B站): 视频内容, 判据照常(标题/作者/简介)。
 - 贴吧帖子(platform=贴吧): 文字论坛帖, title=帖子标题, desc=首楼摘要, author=楼主。
   引战分判据: 对线/吵架/挂人/带节奏; 低质分判据: 广告帖/纯水贴/无信息量搬运/引流帖;
   兴趣分判据: 主题是否与用户画像相关(教程/知识/军事解析/数码等), 水贴闲聊给低分。
+- 小黑盒帖子(platform=小黑盒): 游戏社区图文帖, title=帖子标题, desc=正文摘要。
+  引战分判据: 带节奏/互喷/挂人开团/主机与装备攀比/玩家阵营对立拱火;
+  低质分判据: 纯图无文字水贴/无信息量搬运/代购广告引流帖;
+  兴趣分判据: 与用户游戏画像的匹配度(平台/品类/玩法), 闲聊灌水给低分。
 
 【评分维度】每条内容必须给出全部 8 项：
-1. flame 引战分 0-10：内容挑起对立/拉踩/煽动情绪/恶意碰瓷的程度。判据：地域性别等对立话题、引战标题("XX都看不下去了")、评论区天天吵架的选题、明知争议还要拱火。0=完全平和，10=最恶劣的挑事内容。
-2. spam 低质分 0-10：营销广告/无信息量搬运/粗制滥造/货不对板程度。判据：大量水军营销号、AI生成图片配空洞文案骗点击、标题说A内容讲B、纯水时长拼凑、赤裸推销。0=制作认真，10=纯垃圾。
+1. flame 引战分 0-10：内容挑起对立/拉踩/煽动情绪/恶意碰瓷的程度。判据：地域性别等对立话题、引战标题("XX都看不下去了")、挂人/开团/扣帽子、评论区天天吵架的选题、明知争议还要拱火。0=完全平和，10=最恶劣的挑事内容。
+2. spam 低质分 0-10：营销广告/无信息量搬运/粗制滥造/货不对板程度。判据：大量水军营销号、AI生成图片配空洞文案骗点击、标题说A内容讲B、纯水时长拼凑、赤裸推销。**标题党算低质**: 震惊党开头/悬念党/数字党/货不对板骗点击, spam 至少 6 分。0=制作认真，10=纯垃圾。
 3. interest 兴趣分 0-10：与"用户信息"中画像的匹配度。判据：主题相关、作者熟悉、玩法/内容形式符合偏好；用户明显不感兴趣的主题给低分。无法判断时给 5。
 4. density 信息密度 0-10：能否用一句话概括全部有效信息。判据：废话/注水/车轱辘话/空镜凑时长越多分越低；教程干货、数据密集内容高分。0=全是废话，10=句句有信息。
 5. emo 情绪净值 -10~10：正数=建设性/正向价值(即使讲坏事，给了解决方案或深度剖析也给正分)，负数=纯负能量/煽动焦虑/贩卖恐慌。0=中性陈述。判据：讲问题但给方法→正；只输出情绪、制造对立焦虑、贩卖恐慌→负。
@@ -3929,9 +3960,75 @@ def set_last_feed(item):
         return
     try:
         sset("last_feed", json.dumps({"key": item.get("key", ""), "title": item.get("title", ""),
-                                      "author": item.get("author", "")}, ensure_ascii=False))
+                                      "author": item.get("author", ""),
+                                      "desc": (item.get("desc") or "")[:300],
+                                      "platform": item.get("platform", "")}, ensure_ascii=False))
     except Exception:
         pass
+
+
+# --- 会话条目上下文("问AI"): cid → 用户正在聊的条目, 由卡片长按"问AI"写入 ---
+# 进程内存即可: 服务重启后丢失 → 降级为无上下文聊天, 不报错。
+_conv_item_ctx = {}
+
+
+def chat_ctx_set(cid, key, title):
+    key = (key or "").strip()
+    if not key:
+        _conv_item_ctx.pop(cid, None)
+        return None
+    _conv_item_ctx[cid] = {"key": key, "title": (title or "")[:40]}
+    return _conv_item_ctx[cid]
+
+
+def chat_ctx_clear(cid):
+    _conv_item_ctx.pop(cid, None)
+
+
+def chat_ctx_get(cid):
+    return _conv_item_ctx.get(cid)
+
+
+def chat_item_context(cid):
+    """把会话正在聊的条目拼成AI可读上下文(评分取缓存 score_json)。无条目返回''。"""
+    ctx = _conv_item_ctx.get(cid)
+    if not ctx:
+        return ""
+    it = item_by_key(ctx.get("key", ""))
+    if not isinstance(it, dict):
+        return ""
+    sc = {}
+    with _db_lock:
+        row = db().execute("SELECT score_json FROM items WHERE key=?", (it.get("key", ""),)).fetchone()
+    if row and row[0]:
+        try:
+            sc = json.loads(row[0])
+        except Exception:
+            sc = {}
+    parts = ["【用户当前正在聊的条目】",
+             "平台: %s ｜ 标题: %s ｜ 作者: %s" % (it.get("platform", ""), it.get("title", ""), it.get("author", ""))]
+    if it.get("desc"):
+        parts.append("简介: " + (it.get("desc") or "")[:400])
+    if it.get("tag"):
+        parts.append("标签: " + (it.get("tag") or "")[:100])
+    if it.get("src"):
+        parts.append("来源: " + it.get("src", ""))
+    if sc:
+        parts.append("AI评分: 兴趣%s/10, 引战%s, 低质%s, 主题「%s」, 推荐理由: %s" % (
+            sc.get("interest", "?"), sc.get("flame", "?"), sc.get("spam", "?"),
+            sc.get("topic", ""), (sc.get("reason") or "")[:80]))
+    return "\n".join(parts)
+
+
+def chat_last_context(msg):
+    """用户消息提到"刚才那条/这条"等指代时, 附上最近点开条目的简介(供"讲讲刚才那条")。"""
+    if not (REF_NOUN.search(msg or "") and last_feed_item()):
+        return ""
+    it = last_feed_item()
+    line = "【用户指代的最近条目】%s《%s》作者:%s" % (it.get("platform", ""), it.get("title", ""), it.get("author", ""))
+    if it.get("desc"):
+        line += " 简介:" + it.get("desc", "")[:300]
+    return line
 
 
 # 指代句式: 动作 + 最近条目
@@ -3994,6 +4091,7 @@ def build_chips():
     mode = sget("mode")
     chips = [
         {"label": "🎲 换一批", "cmd": "随机来一批"},
+        {"label": "📋 今日简报", "cmd": "今日简报"},
         {"label": "📊 今日统计", "cmd": "今日统计"},
         {"label": "⚙️ 当前配置", "cmd": "当前配置"},
     ]
@@ -4002,6 +4100,22 @@ def build_chips():
     chips.append({"label": "🔒 更严格点" if mode != "严格" else "🫧 宽松点",
                   "cmd": "更严格点" if mode != "严格" else "宽松点"})
     return chips
+
+
+def apply_partition_ids(ids):
+    """写入分区开关并立即生效(清不匹配沉淀池 + 重建)。返回展示名串。"""
+    sset("m_sources", json.dumps(sorted(set(ids))))
+    purge_items_by_parts(set(ids))
+    force_rebuild()
+    return "、".join(_ID2NAME[i] for i in sorted(ids) if i in _ID2NAME)
+
+
+def _open_explore():
+    """探索模式执行器(命令引擎与AI意图共用): 30分钟内拉高探索区配额。"""
+    sset("explore_boost_ts", str(int(time.time() + 30 * 60)))
+    preview = _explore_candidates(set(), limit=5)
+    lines = " / ".join("《%s》" % ((it.get("title") or "")[:22]) for it in preview) or "暂无跨领域候选"
+    return "已开启探索模式（30分钟）：探索区配额临时拉高到 30%。候选预览：" + lines
 
 
 def handle_command(msg):
@@ -4015,6 +4129,10 @@ def handle_command(msg):
     if any(w in m for w in ("新对话", "新建对话", "换个话题", "重新开个", "开个新对话", "开新对话")):
         cid = conv_create()
         return {"reply": "已开新对话。说说这次想看点什么？", "trigger": "conv", "cid": cid}
+    # --- 今日简报(AI评价+偏好/厌恶增减建议; 未配置AI时模板兜底) ---
+    if any(w in m for w in ("今日简报", "简报", "今天看了什么", "今天看了啥", "总结今天", "今天刷了什么")):
+        reply, rep_chips, _trig = daily_report_reply()
+        return {"reply": reply, "trigger": _trig, "chips": rep_chips}
     # --- 统计 ---
     if any(w in m for w in ("成本", "花了多少", "统计", "调用次数", "花了多少钱", "花了多少")):
         st = day_stats()
@@ -4051,9 +4169,7 @@ def handle_command(msg):
             base = cur if (cur and cur != {g[0] for g in SOURCE_GROUPS}) else set()
             ids = sorted(base | want)
         if ids:
-            sset("m_sources", json.dumps(ids))
-            purge_items_by_parts(set(ids))
-            names = "、".join(_ID2NAME[i] for i in ids if i in _ID2NAME)
+            names = apply_partition_ids(ids)
             return {"reply": "已切换分区：%s（%d 个，点击即生效）" % (names, len(ids)), "trigger": "settings"}
     # --- 临时屏蔽(实时干预): "未来1小时内别推游戏" / "接下来30分钟少推二次元" ---
     # 放在厌恶追加之前: 带时限的"别推"是临时屏蔽, 不应写入永久厌恶备注
@@ -4073,11 +4189,7 @@ def handle_command(msg):
                 "%d个%s" % (n, unit), kw, until), "trigger": "random"}
     # --- 探索模式(实时干预): 临时拉高探索区配额并预览新领域 ---
     if any(w in m for w in ("探索", "发现新领域", "来点新东西", "看看别的", "换换领域", "新鲜领域")):
-        sset("explore_boost_ts", str(int(time.time() + 30 * 60)))
-        preview = _explore_candidates(set(), limit=5)
-        lines = " / ".join("《%s》" % ((it.get("title") or "")[:22]) for it in preview) or "暂无跨领域候选"
-        return {"reply": "已开启探索模式（30分钟）：探索区配额临时拉高到 30%。候选预览：" + lines,
-                "trigger": "random"}
+        return {"reply": _open_explore(), "trigger": "random"}
     # --- 厌恶追加(把不想看的内容写进厌恶备注) ---
     # 隐含句式: "我不想看/别看/别推/少来 X" (取动词后的关键词, 到标点为止)
     mdis = re.search(r"(?:别|不要|别再|不想再|不想|少来|别看|别刷|别推)[^。，,\s]*?(?:推|看|刷|来)\s*([^。，,\s]{2,16})", m)
@@ -4117,8 +4229,188 @@ def handle_command(msg):
     return None
 
 
+def _note_add(note, kws):
+    """把关键词追加进逗号分隔备注(去重)。返回 (新备注, 实际新增列表)。"""
+    new, added = note, []
+    for k in kws:
+        k = (k or "").strip()
+        if not k:
+            continue
+        if k not in new:
+            new = (new + "，" + k).strip("，") if new else k
+            added.append(k)
+    return new, added
+
+
+def _note_remove(note, kws):
+    """从逗号分隔备注中剔除含关键词的片段。返回 (新备注, 实际移除列表)。"""
+    parts = [p.strip() for p in re.split(r"[，,、;；]", note or "") if p.strip()]
+    removed = []
+    for k in kws:
+        k = (k or "").strip().lower()
+        if not k:
+            continue
+        keep = []
+        for p in parts:
+            if k in p.lower() and p not in removed:
+                removed.append(p)
+            else:
+                keep.append(p)
+        parts = keep
+    return "，".join(parts), removed
+
+
+def handle_chat_payload(payload):
+    """chips 确认通道: 带结构化 payload 的消息直接执行对应操作(不进命令引擎/意图识别)。
+    写入类操作统一清评分缓存+重建, 与既有厌恶写入路径一致。"""
+    op = (payload or {}).get("op", "")
+    kws = [str(k).strip() for k in (payload or {}).get("keywords", []) if str(k).strip()]
+    if op == "add_pref":
+        if not kws:
+            return {"reply": "没有要写入的偏好词。", "trigger": None}
+        cur = sget("prefs_note")
+        new, added = _note_add(cur, kws)
+        if added:
+            sset("prefs_note", new)
+            clear_score_cache()
+            force_rebuild()
+        return {"reply": "已写进偏好备注：%s。之后会多推这类内容。" % ("、".join(added) or "(已在备注中)"),
+                "trigger": "settings"}
+    if op == "remove_pref":
+        new, removed = _note_remove(sget("prefs_note"), kws)
+        if removed:
+            sset("prefs_note", new)
+            clear_score_cache()
+            force_rebuild()
+        return {"reply": ("已从偏好备注移除：%s" % "、".join(removed)) if removed
+                else "偏好备注里没有这些词，无需改动。", "trigger": "settings"}
+    if op == "add_dislike":
+        new, added = _note_add(sget("dislike_note"), kws)
+        if added:
+            sset("dislike_note", new)
+            clear_score_cache()
+            force_rebuild()
+        return {"reply": "已写进厌恶备注：%s。之后会避开这些内容。" % ("、".join(added) or "(已在备注中)"),
+                "trigger": "settings"}
+    if op == "remove_dislike":
+        new, removed = _note_remove(sget("dislike_note"), kws)
+        if removed:
+            sset("dislike_note", new)
+            clear_score_cache()
+            force_rebuild()
+        return {"reply": ("已从厌恶备注移除：%s，相关内容可能重新出现" % "、".join(removed)) if removed
+                else "厌恶备注里没有这些词，无需改动。", "trigger": "settings"}
+    if op == "partition_only":
+        ids = sorted({GROUP_NAMES[g] for g in kws if g in GROUP_NAMES})
+        if not ids:
+            return {"reply": "没有可切换的分区。", "trigger": None}
+        names = apply_partition_ids(ids)
+        return {"reply": "已切换分区：只看 %s（%d 个）" % (names, len(ids)), "trigger": "settings"}
+    if op == "noop":
+        return {"reply": "好的，没有做任何改动。", "trigger": None}
+    return {"reply": "未知操作，已忽略。", "trigger": None}
+
+
+# 每日简报: 聚合今日数据(观看/喜欢/不喜欢/漏斗/成本/画像) → LLM 评价与偏好建议
+def daily_report_data():
+    """纯本地数据聚合(零AI)。返回 (数据文本, 观看数, 喜欢数, 不喜欢数)。"""
+    midnight = time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
+
+    def _brief(key):
+        it = item_by_key(key)
+        if not isinstance(it, dict):
+            return None
+        return {"t": (it.get("title") or "")[:30], "a": (it.get("author") or "")[:14],
+                "topic": (it.get("topic") or (it.get("tag") or "").split(",")[0] or it.get("tname") or "")[:10],
+                "p": it.get("platform", ""), "src": it.get("src", "")}
+
+    seen_rows = db().execute("SELECT key, ts FROM shown WHERE ts >= ? ORDER BY ts DESC",
+                             (int(midnight),)).fetchall()
+    seen = [b for b in (_brief(k) for (k, _ts) in seen_rows) if b]
+    fb_rows = db().execute("SELECT key, action FROM feedback WHERE ts >= ? AND action IN ('like','dislike')",
+                           (int(midnight),)).fetchall()
+    likes = [b for b in (_brief(k) for (k, act) in fb_rows if act == "like") if b]
+    dislikes = [b for b in (_brief(k) for (k, act) in fb_rows if act == "dislike") if b]
+
+    def _top(seq, field, n):
+        cnt = {}
+        for x in seq:
+            v = (x.get(field) or "").strip()
+            if v:
+                cnt[v] = cnt.get(v, 0) + 1
+        return "、".join("%s×%d" % (k, c) for k, c in sorted(cnt.items(), key=lambda kv: -kv[1])[:n]) or "无"
+
+    pref_hits = sum(1 for x in seen if (x.get("src") or "").startswith("偏·"))
+    funnel = funnel_stats()
+    top_blocks = sorted(((k, v) for k, v in funnel.items()
+                         if k not in ("fetched", "kept", "build_full", "build_quick")),
+                        key=lambda kv: -kv[1])[:3]   # 拦截数Top3的规则
+    st = day_stats()
+    blocks = ["今日观看: %d 条 (偏好直搜命中 %d)" % (len(seen), pref_hits),
+              "观看主题Top: " + _top(seen, "topic", 5),
+              "观看作者Top: " + _top(seen, "author", 5),
+              "平台分布: " + _top(seen, "p", 3),
+              "今日点喜欢 %d 条: %s" % (len(likes),
+                                       "; ".join("《%s》(%s)" % (x["t"], x["a"]) for x in likes[:12]) or "无"),
+              "今日点不喜欢 %d 条: %s" % (len(dislikes),
+                                          "; ".join("《%s》(%s)" % (x["t"], x["a"]) for x in dislikes[:12]) or "无"),
+              "筛选漏斗: 抓回%s条, 最终入池%s条, 拦截大头: %s" % (
+                  funnel.get("fetched", 0), funnel.get("kept", 0),
+                  "、".join("%s×%s" % (_FUNNEL_LABELS.get(k, k), v) for k, v in top_blocks) or "无"),
+              "AI成本: ¥%s (调用%s次)" % (st["cost"] if st["cost"] >= 0.01 else "%.4f" % st["cost"], st["ai_calls"]),
+              "当前偏好备注: %s" % ((sget("prefs_note") or "（空）")[:200]),
+              "当前厌恶备注: %s" % ((sget("dislike_note") or "（空）")[:200])]
+    return "\n".join(blocks), len(seen), len(likes), len(dislikes)
+
+
+def daily_report_reply():
+    """今日简报: AI 开启 → LLM 评价+偏好/厌恶增减建议(收尾行解析成确认chips);
+    未配置 → 模板统计兜底。返回 (reply, chips, trigger)。"""
+    data, n_seen, n_like, n_dis = daily_report_data()
+    if n_seen == 0 and n_like == 0 and n_dis == 0:
+        return "今天还没有看/互动记录，先去信息流刷几条，晚上再来找我复盘吧～", None, None
+    if not ai_on():
+        return ("今天看了 %d 条内容。\n%s\n\n（配置 AI 后我可以给出口味分析和偏好调整建议）" % (
+            n_seen, data.split("\n", 1)[1].split("\nAI成本")[0])), None, None
+    prompt = ("你是「洞鉴虚明」的信息分拣分析师。以下用户今天的使用数据(本地统计), 请输出:\n"
+              "①总体评价(2-3句, 口语化, 说今天内容质量如何/偏好命中如何)\n"
+              "②口味归纳(今天明显偏爱什么)\n"
+              "③偏好与厌恶调整建议: 结合已有备注给出具体可执行的增减(减少=写得太宽或已过时的词);\n"
+              "输出末尾必须恰好以这两行收尾(没有建议写'无'):\n"
+              "建议新增偏好：词1、词2\n"
+              "建议新增厌恶：词A、词B\n"
+              "不要输出markdown符号。\n\n使用数据:\n" + data)
+    try:
+        content, _ = call_llm([{"role": "system", "content": prompt}], max_tokens=900)
+    except Exception as e:
+        return "简报生成失败（%s）。数据如下：\n%s" % (str(e)[:80], data), None, None
+    reply = (content or "").strip() or "今天数据不多，没有特别的建议。"
+
+    def _tail(line_name):
+        m = None
+        for line in reply.splitlines()[::-1]:   # 取最后出现的收尾行(防正文引用干扰)
+            if line.strip().startswith(line_name):
+                m = line.split("：", 1)[-1].split(":", 1)[-1]
+                break
+        if not m:
+            return []
+        return [w.strip() for w in re.split(r"[，,、;；]", m) if 1 < len(w.strip()) <= 16][:6]
+
+    chips = []
+    add_pref, add_dis = _tail("建议新增偏好"), _tail("建议新增厌恶")
+    if add_pref and "无" not in add_pref:
+        chips.append({"label": "✅ 采纳偏好建议：" + "、".join(add_pref[:3]), "cmd": "确认写入偏好建议",
+                      "payload": {"op": "add_pref", "keywords": add_pref}})
+    if add_dis and "无" not in add_dis:
+        chips.append({"label": "🚫 采纳厌恶建议：" + "、".join(add_dis[:3]), "cmd": "确认写入厌恶建议",
+                      "payload": {"op": "add_dislike", "keywords": add_dis}})
+    return reply, (chips or None), None
+
+
 def extract_intent(msg):
-    """从聊天消息提取搜索意图: {"action":"search","keywords":[..]} 或 {"action":"reply","keywords":[]}"""
+    """从聊天消息提取意图(JSON动作集, LLM识别+句式兜底):
+    search / add_dislike / add_pref / set_mode / set_window / toggle_partition /
+    open_explore / digest / reply"""
     msg = (msg or "").strip()
     if not msg:
         return {"action": "reply", "keywords": []}
@@ -4134,8 +4426,19 @@ def extract_intent(msg):
                     "2) 想把某些词/内容加进厌恶备注(不想看/不喜欢/屏蔽/别再推) → "
                     "{\"action\":\"add_dislike\",\"keywords\":[\"词1\",\"词2\",...]}\n"
                     "   关键词要具体(如:性别对立、两性对立、彩礼纠纷), 可补充相关词, 2-15个, 每个2-16字\n"
-                    "3) 想切换档位(严格/标准/宽松/严肃) → {\"action\":\"set_mode\",\"mode\":\"严格\"}\n"
-                    "4) 其他闲聊/提问 → {\"action\":\"reply\",\"keywords\":[]}"},
+                    "3) 想多看某类内容/喜欢某类(多推/以后常推/写进偏好) → "
+                    "{\"action\":\"add_pref\",\"keywords\":[\"词1\",\"词2\",...]}, 关键词要求同上\n"
+                    "4) 想切换档位(严格/标准/宽松/严肃) → {\"action\":\"set_mode\",\"mode\":\"严格\"}\n"
+                    "5) 想调时间窗(只看最近N个月/新鲜一点的) → {\"action\":\"set_window\",\"months\":N}\n"
+                    "   (N为月数整数; 「不限/都要」→ months=0)\n"
+                    "6) 想调分区(只看某几个分区/加上/关掉某分区) → "
+                    "{\"action\":\"toggle_partition\",\"groups\":[\"分区名\"],\"mode\":\"only|add|remove\"}\n"
+                    "   分区名必须是: 全站榜/热门/动画/番剧/国创/鬼畜/音乐/舞蹈/游戏/电竞/知识/科技/数码/\n"
+                    "   生活/美食/动物圈/生活Vlog/影视/电影/电视剧/纪录片/运动/赛事/汽车/时尚/美妆/娱乐/\n"
+                    "   漫画/资讯/直播/军事 之一; 只看→only, 加上→add, 关掉→remove\n"
+                    "7) 想看点新领域/探索模式 → {\"action\":\"open_explore\"}\n"
+                    "8) 想要今日简报/复盘今天看了什么 → {\"action\":\"digest\"}\n"
+                    "9) 其他闲聊/提问 → {\"action\":\"reply\",\"keywords\":[]}"},
                 {"role": "user", "content": msg[:300]}], max_tokens=1500)
             d = json.loads(content)
             if isinstance(d, dict):
@@ -4151,11 +4454,35 @@ def extract_intent(msg):
                     if kws:
                         return {"action": "add_dislike", "keywords": kws[:15]}
                     return {"action": "reply", "keywords": []}
+                if act == "add_pref":
+                    kws = [k.strip() for k in d.get("keywords", [])
+                           if k.strip() and 2 <= len(k.strip()) <= 16]
+                    if kws:
+                        return {"action": "add_pref", "keywords": kws[:15]}
+                    return {"action": "reply", "keywords": []}
                 if act == "set_mode":
                     md = (d.get("mode") or "").strip()
                     if md in MODE_THRESH:
                         return {"action": "set_mode", "mode": md}
                     return {"action": "reply", "keywords": []}
+                if act == "set_window":
+                    try:
+                        months = int(d.get("months"))
+                    except Exception:
+                        months = -1
+                    if 0 <= months <= 60:
+                        return {"action": "set_window", "months": months}
+                    return {"action": "reply", "keywords": []}
+                if act == "toggle_partition":
+                    groups = [str(g).strip() for g in d.get("groups", []) if str(g).strip() in GROUP_NAMES]
+                    mode = d.get("mode")
+                    if groups and mode in ("only", "add", "remove"):
+                        return {"action": "toggle_partition", "groups": groups[:6], "mode": mode}
+                    return {"action": "reply", "keywords": []}
+                if act == "open_explore":
+                    return {"action": "open_explore"}
+                if act == "digest":
+                    return {"action": "digest"}
                 if act == "reply":
                     return {"action": "reply", "keywords": []}
         except Exception:
@@ -4302,9 +4629,10 @@ def machine_filter(items):
             if fm and now - it["pubdate"] > fm * 30.44 * 86400:
                 _funnel_bump("follow_window")
                 continue   # 超出强调月数 → 直接丢弃(单独机制, 不符合规则不进池)
-        if max_age and not it.get("following") and it["pubdate"] and now - it["pubdate"] > max_age * 30.44 * 86400:
+        if max_age and not it.get("following") and not it.get("pref_kw") \
+                and it["pubdate"] and now - it["pubdate"] > max_age * 30.44 * 86400:
             _funnel_bump("age")
-            continue   # 只保留最近 N 个月发布的内容(关注的人强调豁免一般窗, 由强调窗单独约束)
+            continue   # 只保留最近 N 个月发布的内容(关注的人/偏好词直搜结果豁免一般窗)
         if news_fresh and it.get("pubdate") and _is_newsy(it) and now - it["pubdate"] > 86400:
             _funnel_bump("news")
             continue   # 时效分层: 资讯/热点只推24小时内(干货/教程不受此限)
@@ -4343,9 +4671,13 @@ def machine_filter(items):
                               " " + (it.get("tag") or "")).lower() for k in dkws):
             _funnel_bump("dislike")
             continue   # 厌恶备注关键词命中(含tag) → 直接剔除
-        if emotion and _emo_bad(it):
-            _funnel_bump("emotion")
-            continue   # 情绪过滤器: 感叹号轰炸/引战黑话/标题党句式(纯规则零token)
+        if emotion:
+            why = _emo_bad(it)
+            if not why and _ad_bad(it):
+                why = "广告"   # 广告识别查简介(硬标记/软标记≥2), 与情绪过滤共占漏斗
+            if why:
+                _funnel_bump("emotion")
+                continue   # 情绪过滤器: 轰炸/引战/标题党(标题) + 广告引流(简介), 纯规则零token
         if dedup:
             fp = _title_fp(it["title"])
             if fp in seen_titles:
@@ -4390,11 +4722,13 @@ def is_help_post(it):
     return any(k.lower() in text for k in HELP_POST_KWS)
 
 
-def rules_filter(items, skip_age=False):
+def rules_filter(items, skip_age=False, apply_blocks=True):
     """机器规则过滤(保留原顺序, 用于显式搜索): 时间窗/播放量/时长/拉黑名单。
     skip_age=True 时跳过时间窗(主动搜索想找特定主题, 老内容也应出现)。
-    负反馈(不喜欢/黑名单/临时屏蔽)同样生效: 搜索也不该递回用户明确拒绝的内容。"""
-    items = negative_feedback_filter(items)
+    apply_blocks=False 时跳过屏蔽类机制(负反馈/账号拉黑/厌恶词): 搜索默认不受用户屏蔽影响,
+    搜索词前缀 * 表示"保留屏蔽"(见 search_all)。播放量/时长/求助帖等质量窗不受此开关影响。"""
+    if apply_blocks:
+        items = negative_feedback_filter(items)
     min_views = int(sget("m_min_views") or 0)
     max_views = int(sget("m_max_views") or 0)
     max_dur = int(sget("m_max_duration") or 0)
@@ -4404,8 +4738,9 @@ def rules_filter(items, skip_age=False):
     else:
         max_age = int(sget("m_max_age_months") or 0)
     sync_bl = sget("m_blocklist_sync") == "1"
-    ablock_authors = {r[0] for r in db().execute("SELECT name FROM ablock")} if sync_bl else set()
-    dkws = dislike_keywords()
+    ablock_authors = ({r[0] for r in db().execute("SELECT name FROM ablock")}
+                      if (sync_bl and apply_blocks) else set())
+    dkws = dislike_keywords() if apply_blocks else []
     allow_help = sget("tb_allow_help") != "0"
     now = time.time()
     fm = int(sget("bili_follow_months") or 1)   # 关注的人强调时间窗(0=不限)
@@ -4538,7 +4873,7 @@ def _local_pool_hits(terms, seen, limit=100):
     return [it for _, it in scored[:limit]]
 
 
-def _search_first_wave(q):
+def _search_first_wave(q, apply_blocks=True):
     """搜索第一波: B站WBI直搜(≤5页, 空页即止) + 贴吧全站实时搜索(与B站翻页并行)
     + 本地沉淀池分词命中 → 跨平台3:1交错 → 机器规则过滤。"""
     seen, bili = set(), []
@@ -4563,10 +4898,10 @@ def _search_first_wave(q):
     local = _local_pool_hits([q], seen)
     candidates = _interleave3(bili, tb + local)
     _annotate_following(candidates)
-    return rules_filter(candidates, skip_age=True)
+    return rules_filter(candidates, skip_age=True, apply_blocks=apply_blocks)
 
 
-def _search_expand_wave(q, used_terms):
+def _search_expand_wave(q, used_terms, apply_blocks=True):
     """近义词深挖扩波: LLM生成新近义词(排除已用) → 每词并行搜B站1页+贴吧10条
     + 本地池分词命中 → 去重过滤。返回 (new_items, terms)。terms为空=深挖到头。"""
     terms = search_expand_terms(q, exclude=list(used_terms))
@@ -4600,7 +4935,7 @@ def _search_expand_wave(q, used_terms):
             out.append(x)
     out.extend(_local_pool_hits(terms, seen))
     _annotate_following(out)
-    return rules_filter(out, skip_age=True), terms
+    return rules_filter(out, skip_age=True, apply_blocks=apply_blocks), terms
 
 
 def _prune_search_waves():
@@ -4611,30 +4946,62 @@ def _prune_search_waves():
         _search_wave.pop(k, None)
 
 
-def search_all(q, offset=0, limit=30, refresh=False):
+SEARCH_SORTS = ("default", "views", "pubdate", "hot")
+
+
+def _hot_score(it, now):
+    """最新热门重力分(HN式): 播放量/(小时龄+2)^1.5 — 新发布内容获得显著加成,
+    老视频要靠播放量硬堆。贴吧/小黑盒的 views 是点击量, 与B站播放量共用一套分
+    (量级差异在混合排序下可接受)。pubdate 缺失按0(极老)沉底。"""
+    views = it.get("views") or 0
+    age_h = max(0.0, (now - (it.get("pubdate") or 0)) / 3600.0)
+    return views / (age_h + 2.0) ** 1.5
+
+
+def _sort_search_pool(items, mode, now):
+    """搜索结果排序: 返回快照列表, 不改动主池顺序(综合序仍是翻页稳定基准)。
+    views=播放量降序; pubdate=最新发布在前(缺失沉底); hot=最新热门重力分降序。
+    sorted 为稳定排序, 同分保持抓取时的相对顺序。"""
+    if mode == "views":
+        return sorted(items, key=lambda it: -(it.get("views") or 0))
+    if mode == "pubdate":
+        return sorted(items, key=lambda it: -(it.get("pubdate") or 0))
+    if mode == "hot":
+        return sorted(items, key=lambda it: -_hot_score(it, now))
+    return list(items)
+
+
+def search_all(q, offset=0, limit=30, refresh=False, sort="default"):
     """显式搜索(波次制+无限深挖):
     第1波 = B站直搜 + 贴吧实时搜索 + 本地池; 滚到底(offset+limit≥total)自动触发
     近义词深挖扩波(LLM生成新词, 每词B站+贴吧+本地池), 直到无新词/无新内容/达波次上限。
     波次缓存1h: 翻页不再重打B站接口(旧版每滚一屏全量重搜, 既慢又喂风控)。
-    refresh=True: 丢弃该词的波次与近义词缓存, 强制重搜(前端↻刷新)。"""
-    q = (q or "").strip()
+    排序(sort): default=综合(抓取相关度序, 分页零漂移) / views=播放量 / pubdate=最新 /
+    hot=最新热门。四种排序共享同一波次池 — 切换排序只重排不重抓; 非default排序按
+    w["orders"][mode] 缓存快照, 扩波追加了新内容后(池长度变化)自动重排。
+    屏蔽开关: 搜索默认不受用户屏蔽机制影响(负反馈/账号拉黑/厌恶词/AI语义厌恶);
+    搜索词前缀 * 表示"保留屏蔽"(如 *原神 → 屏蔽了原神就搜不到)。缓存键=原始输入,
+    "原神"与"*原神"互不串缓存。refresh=True: 丢弃该词的波次与近义词缓存, 强制重搜(前端↻刷新)。"""
+    raw = (q or "").strip()
+    apply_blocks = raw.startswith("*")
+    q = raw[1:].strip() if apply_blocks else raw   # *只作开关, 不进搜索词
     if not q:
         return {"ok": True, "q": q, "items": [], "offset": 0, "total": 0,
                 "end": True, "deep_terms": [], "building": False, "platform_hits": 0}
     with _search_wave_lock:
         if refresh:
-            _search_wave.pop(q, None)
+            _search_wave.pop(raw, None)
             _search_deep_cache.pop("__terms__" + q, None)
     work = False   # 本请求是否负责干活(建波/扩波, 其余并发请求仅读快照)
     with _search_wave_lock:
-        w = _search_wave.get(q)
+        w = _search_wave.get(raw)
         if w and time.time() - w["ts"] > SEARCH_WAVE_TTL:
-            _search_wave.pop(q, None)
+            _search_wave.pop(raw, None)
             w = None
         if w is None:
             w = {"items": [], "ts": time.time(), "used_terms": [q], "deep_terms": [],
-                 "waves": 0, "end": False, "building": False}
-            _search_wave[q] = w
+                 "waves": 0, "end": False, "building": False, "orders": {}}
+            _search_wave[raw] = w
             _prune_search_waves()
         if not w["building"]:
             w["building"] = True
@@ -4643,11 +5010,11 @@ def search_all(q, offset=0, limit=30, refresh=False):
     if work:
         try:
             if not w["items"]:   # 首建: 第一波
-                w["items"] = _search_first_wave(q)
+                w["items"] = _search_first_wave(q, apply_blocks)
                 w["ts"] = time.time()
             while (not w["end"] and w["waves"] < SEARCH_MAX_WAVES
                    and offset + limit > len(w["items"])):
-                new_items, terms = _search_expand_wave(q, w["used_terms"])
+                new_items, terms = _search_expand_wave(q, w["used_terms"], apply_blocks)
                 terms = [t for t in terms if t not in w["used_terms"]]
                 if terms:
                     exist = {it.get("key") for it in w["items"]}
@@ -4667,10 +5034,19 @@ def search_all(q, offset=0, limit=30, refresh=False):
             with _search_wave_lock:
                 w["building"] = False
     with _search_wave_lock:
-        raw_chunk = list(w["items"][offset:offset + limit])
+        pool = w["items"]
+        if sort in SEARCH_SORTS and sort != "default":
+            snap = w["orders"].get(sort)
+            if snap is None or len(snap) != len(pool):   # 扩波追加了新内容 → 快照失配自动重排
+                snap = _sort_search_pool(pool, sort, time.time())
+                w["orders"][sort] = snap
+            view = snap
+        else:
+            view = pool   # 综合=原序(与旧版分页行为一致, 零漂移)
+        raw_chunk = list(view[offset:offset + limit])
         chunk = list(raw_chunk)
         consumed = len(raw_chunk)
-        total = len(w["items"])
+        total = len(view)
         end = w["end"]
         deep_terms = list(w["deep_terms"])
         building = w["building"]
@@ -4691,8 +5067,8 @@ def search_all(q, offset=0, limit=30, refresh=False):
         if ai_on() and sget("ai_full_scan") == "1":   # 搜索=显式动作, 保留同步补评(与历史一致); feed主路径已改只读缓存
             try:
                 cut = MODE_THRESH.get(sget("mode"), 6)
-                imin = int(sget("ai_interest_min") or 0)
-                dkws = dislike_keywords()
+                imin = int(sget("ai_interest_min") or 0) if apply_blocks else 0
+                dkws = dislike_keywords() if apply_blocks else []
                 scored = score_items(chunk)
                 kept, dropped = [], 0
                 for it in chunk:
@@ -4704,8 +5080,8 @@ def search_all(q, offset=0, limit=30, refresh=False):
                         continue   # 门禁: 无分数不展示
                     if sc.get("flame", 0) >= cut or sc.get("spam", 0) >= SPAM_CUT:
                         dropped += 1
-                        continue
-                    if (sc.get("interest", 5) or 0) == 0:   # AI语义厌恶命中(评分器强制0分) → 一票剔除
+                        continue   # 质量 门禁(引战/低质)不受屏蔽开关影响, 搜索也不该递垃圾
+                    if apply_blocks and (sc.get("interest", 5) or 0) == 0:   # AI语义厌恶命中 → 一票剔除
                         dropped += 1
                         continue
                     if imin and sc.get("interest", 5) < imin:
@@ -4750,6 +5126,14 @@ def bake_universe(payload, quick=False):
             it["following"] = True
     _annotate_following(payload["items"])
     items = machine_filter(payload["items"])   # 时间窗/播放量/时长/去重/拉黑名单
+    # 偏好词直搜结果存活统计: 数据面板可见"偏好·搜到/入池/被拦", 不再只混在通用桶里
+    n_pref = sum(1 for it in payload["items"] if it.get("pref_kw"))
+    if n_pref:
+        n_pref_kept = sum(1 for it in items if it.get("pref_kw"))
+        if n_pref_kept:
+            _funnel_bump("pref_kept", n_pref_kept)
+        if n_pref_kept < n_pref:
+            _funnel_bump("pref_drop", n_pref - n_pref_kept)
     # 源产出率自学习: 统计各可裁剪源"抓回→筛选存活"通过率, 低产源后续少抓/跳过。
     _g_fetched, _g_kept = {}, {}
     for it in payload["items"]:
@@ -4765,7 +5149,7 @@ def bake_universe(payload, quick=False):
     _annotate_following(items)   # 正常刷到的视频里, 作者是关注的人且月内 → 标 following(作者名强调色+标签)
     acct = account_slim()
     acct_authors = {a["name"] for a in (acct.get("authors") or [])}
-    acct_kws = [k for k in (acct.get("keywords") or []) if k]
+    acct_kws = [k for k in (acct.get("keywords") or []) if k] + pref_all_kws()   # 偏好备注参与排序加成
     ai = ai_on()
     full = sget("ai_full_scan") == "1"
     _score_progress.update(full=full)
@@ -4793,10 +5177,12 @@ def bake_universe(payload, quick=False):
     ser = sget("mode") == "严肃"
     if ser:
         # 严肃模式先筛出合格内容; 候选不足一批时恢复近期看过的合格条目, 避免首屏只剩个位数。
-        fresh_serious = [it for it in pool_items if is_serious_ok(it)]
+        # 偏好词直搜结果(pref_kw)豁免: 用户明写的主动意图不被分区硬拒拦杀。
+        fresh_serious = [it for it in pool_items if is_serious_ok(it) or it.get("pref_kw")]
         if len(fresh_serious) < 30:
             fresh_keys = {it.get("key") for it in fresh_serious}
-            fresh_serious += [it for it in items if it.get("key") not in fresh_keys and is_serious_ok(it)]
+            fresh_serious += [it for it in items if it.get("key") not in fresh_keys
+                              and (is_serious_ok(it) or it.get("pref_kw"))]
         pool_items = fresh_serious
     kept, filtered = [], 0
     for it in pool_items:
@@ -4806,7 +5192,7 @@ def bake_universe(payload, quick=False):
                 it["_scored"] = False
                 it.setdefault("reason", "")
                 it.setdefault("topic", "")
-                it.setdefault("interest", 5)
+                it.setdefault("interest", 7 if it.get("pref_kw") else 5)
                 kept.append(it)   # 无分数: 保留进池供后台评分, 展示门禁在 serve_chunk
                 continue
             if sc.get("flame", 0) >= cut or sc.get("spam", 0) >= SPAM_CUT:
@@ -5154,13 +5540,36 @@ SLOT_NAMES = {"comfort": "舒适区", "expand": "拓展区", "explore": "探索�
 
 NEWS_KWS = ("新闻", "资讯", "突发", "官宣", "发布", "上线", "更新公告", "版本更新", "降价", "涨价",
             "发布会", "首曝", "宣布", "上新", "开售", "发售", "停售", "下架", "翻车", "道歉", "回应",
-            "热搜", "热点", "实锤", "最新进展", "辟谣", "通报", "公示", "直播", "预告")
+            "热搜", "热点", "实锤", "最新进展", "辟谣", "通报", "公示", "直播", "预告",
+            "爆料", "被曝", "被爆", "吃瓜", "偷跑", "泄露", "传闻")
 CLICKBAIT_KWS = ("惊了", "居然", "竟然", "万万没想到", "99%的人", "不看后悔", "看完惊呆",
                  "炸裂", "颠覆认知", "彻底改变", "一夜之间", "背后真相", "细思极恐", "你绝对",
                  "必看", "秒懂", "天塌了", "全网疯传", "刷屏", "爆火", "神反转", "当场", "惊呆了",
-                 "最后悔", "血赚", "血亏", "逆天", "还能这样", "直接看傻", "不会吧不会吧")
+                 "最后悔", "血赚", "血亏", "逆天", "还能这样", "直接看傻", "不会吧不会吧",
+                 "震惊", "惊爆", "离大谱", "删前速看", "速看", "手慢无", "内幕", "黑幕",
+                 "毁三观", "颠覆三观", "你敢信", "敢信", "别怪我没提醒", "全网最低", "史上最",
+                 "后悔没早", "紧急提醒", "紧急通知", "再不看就", "错过再等")
 FLAME_SLURS = ("开喷", "对线", "孝子", "结晶", "薄纱", "暴杀", "滚出", "别洗了", "急了", "破防了",
-               "带节奏", "拉踩", "碰瓷", "饭圈", "脑残粉", "黑子", "水军", "恰烂钱", "割韭菜", "智商税")
+               "带节奏", "拉踩", "碰瓷", "饭圈", "脑残粉", "黑子", "水军", "恰烂钱", "割韭菜", "智商税",
+               "乐子人", "杠精", "喷子", "挂人", "网暴", "回旋镖", "老登", "拱火", "泼脏水", "扣帽子",
+               "骂战", "对喷", "互喷", "人身攻击", "引战")
+# 刻意不收"开团/团建/杂鱼/小鬼"等词: 它们在游戏区/生活区有大量正常用法(开团打本/公司团建), 收进来会误伤。
+# 标题党句式兜底(词表只能抓固定词): 开头党/诱导党/绝对化/悬念党/拉踩式/数字党/挑衅式
+CLICKBAIT_RE = re.compile(
+    r"^(?:震惊|惊呆|突发|重磅|紧急|劲爆|炸裂|离谱|离大谱|活久见)"
+    r"|不看后悔|后悔没早|错过再等|删前速看|删前必看|再不看就"
+    r"|(?:全网|全球|全服)(?:第一|首个|唯一|最强|最全)"
+    r"|(?:真相|内幕|黑幕)[^，。！？]{0,6}(?:竟然?|居然|曝光|大白)"
+    r"|(?:吊打|完爆)(?:全场|同行|所有|一切|同级)"
+    r"|\d{2}%的人"
+    r"|不服来[辩战]|不接受反驳|杠就是你对|你敢信[?？!！]*$")
+# 广告/引流识别(查简介, 非标题): 硬标记任一命中即判广告;
+# 软标记需≥2个同时出现才判(正常教程简介单提一句"欢迎关注公众号"不会被拦)
+AD_HARD = ("加微信", "加qq", "加vx", "优惠券", "优惠码", "返利", "折扣码", "私聊获取",
+           "私信领取", "扫码关注", "闲鱼", "带货", "下单链接", "拼团", "秒杀价", "代购",
+           "有偿", "付费进群")
+AD_SOFT = ("公众号", "粉丝群", "微信群", "扫码", "回复关键词", "领取资料", "私信我",
+           "后台回复", "进群", "赞助", "推广")
 LIGHT_AREAS = ("娱乐", "搞笑", "日常", "生活", "音乐", "鬼畜", "综艺", "影视")
 DEEP_AREAS = ("纪录片", "知识", "科技", "人文历史")
 
@@ -5173,7 +5582,7 @@ _score_epoch = 0         # 评分写入世代: 每次有新评分落库 +1(规�
 
 
 def _title_fp(title):
-    """标题指纹(规则②): 拉丁词/数字 + 中文二元组, 去重排序取前24字符。
+    """标题指纹(规则②): 拉丁词/数字 + 中文二元组, 去重排序取前28字符。
     同主题不同措辞的标题共享大量二元组 → 指纹相同被合并, 杜绝"同一新闻换个说法反复推"。"""
     t = (title or "").lower()
     toks = re.findall(r"[a-z0-9]{2,}", t)
@@ -5181,7 +5590,7 @@ def _title_fp(title):
     toks += [zh[i:i + 2] for i in range(max(0, len(zh) - 1))]
     if not toks:
         return "x" + t[:20]
-    return "".join(sorted(set(toks)))[:24]
+    return "".join(sorted(set(toks)))[:28]
 
 
 def _fp_dup(fp, now):
@@ -5244,17 +5653,35 @@ def _is_evergreen(it):
 
 
 def _emo_bad(it):
-    """情绪过滤器(纯规则零token): 感叹号轰炸/引战黑话/标题党句式 → 返回原因, 通过返回''。
-    只对标题判定(简介可能引用原文, 防误伤)。"""
+    """情绪过滤器(纯规则零token): 感叹号/问号/混合/叠词轰炸、引战黑话、标题党词表与句式
+    → 返回原因, 通过返回''。只对标题判定(简介可能引用原文, 防误伤)。"""
     t = (it.get("title") or "").lower()
-    ex = t.count("!") + t.count("！")
-    if ex >= 3 or (ex >= 2 and len(t) <= 12):
+    ex = t.count("!") + t.count("！") + t.count("‼") + t.count("⁉")
+    qm = t.count("?") + t.count("？")
+    if ex >= 3 or (ex >= 2 and len(t) <= 16):
         return "情绪"
+    if qm >= 4 or (qm >= 3 and len(t) <= 14) or (ex >= 1 and qm >= 2):
+        return "情绪"
+    if re.search(r"([\u4e00-\u9fff])\1{3}", t) or re.search(r"([\u4e00-\u9fff]{2})\1\1", t):
+        return "情绪"   # 叠词轰炸: 同字4连(哈哈哈哈)/同二字词3连(完了完了完了)
     if any(k in t for k in FLAME_SLURS):
         return "引战"
     if any(k in t for k in CLICKBAIT_KWS):
         return "标题党"
+    if CLICKBAIT_RE.search(t):
+        return "标题党"
     return ""
+
+
+def _ad_bad(it):
+    """广告/引流判定(查简介, 非标题): 硬标记任一命中即判广告;
+    软标记≥2个同时出现才判, 防误伤正常教程简介。"""
+    d = (it.get("desc") or "").lower()
+    if not d:
+        return False
+    if any(k in d for k in AD_HARD):
+        return True
+    return sum(1 for k in AD_SOFT if k in d) >= 2
 
 
 def tmp_block_kws():
@@ -5429,8 +5856,9 @@ def planned_feed(acts, new_session=False, exclude=None):
     imin = int(sget("ai_interest_min") or 0)
     now = time.time()
     # --- 门禁(信息流路径总入口; 搜索路径仍走原逻辑) ---
+    # 偏好词直搜结果(pref_kw)豁免严肃硬拒: 备注里的主题是用户主动要看的, 不被分区拦杀。
     if mode == "严肃":
-        acts = [it for it in acts if is_serious_ok(it)]
+        acts = [it for it in acts if is_serious_ok(it) or it.get("pref_kw")]
     keep, dropped = [], 0
     tmp = tmp_block_kws()
     scores = {}
@@ -5456,8 +5884,15 @@ def planned_feed(acts, new_session=False, exclude=None):
         if full:
             sc = scores.get(it["key"])
             if not sc:
-                dropped += 1
-                continue   # 门禁: 未评分不展示(后台渐进补评分)
+                if not it.get("pref_kw"):
+                    dropped += 1
+                    continue   # 门禁: 未评分不展示(后台渐进补评分)
+                # 偏好词直搜结果: 用户主动意图, 未评分也放行(评分落库后仍受质量门禁约束)
+                it["reason"] = "来自你的偏好备注，评分稍后补上"
+                it["topic"] = ""
+                it["interest"] = 7
+                keep.append(it)
+                continue
             if sc.get("flame", 0) >= cut or sc.get("spam", 0) >= SPAM_CUT:
                 dropped += 1
                 continue
@@ -6256,6 +6691,10 @@ def item_by_key(key):
     return json.loads(row[0]) if row else None
 
 
+# 前端图标贴图(web/icons/*.svg 与 web/icons/png/*.png)的静态白名单: 只放行这两种形状的路径, 杜绝目录穿越
+_ICON_PATH_RE = re.compile(r"^/icons/(?:png/[a-z]+-(?:24|48|96|192)\.png|[a-z]+\.svg)$")
+
+
 class Handler(BaseHTTPRequestHandler):
     def send_json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -6293,12 +6732,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_file("qrcode.js", "application/javascript")
         if path == "/style.css":
             return self.send_file("style.css", "text/css")
+        if _ICON_PATH_RE.match(path):
+            return self.send_file(path[1:], "image/svg+xml" if path.endswith(".svg") else "image/png")
         if path == "/api/search":
             q = qs.get("q", [""])[0].strip()
             offset = int(qs.get("offset", ["0"])[0] or 0)
             limit = min(int(qs.get("limit", ["30"])[0] or 30), 50)
             refresh = qs.get("refresh", ["0"])[0] == "1"
-            return self.send_json(search_all(q, offset, limit, refresh=refresh))
+            sort = qs.get("sort", ["default"])[0]
+            if sort not in SEARCH_SORTS:
+                sort = "default"   # 非法值回退综合排序
+            return self.send_json(search_all(q, offset, limit, refresh=refresh, sort=sort))
         if path == "/api/feed":
             q = qs.get("q", [""])[0]
             refresh = qs.get("refresh", ["0"])[0] == "1"
@@ -6376,7 +6820,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"items": items})
         if path == "/api/conv":
             convs, cur = conv_list()
-            return self.send_json({"convs": convs, "cur": cur})
+            return self.send_json({"convs": convs, "cur": cur, "ctx": chat_ctx_get(cur)})
         if path == "/api/chat":
             cid = conv_cur(qs.get("cid", [None])[0])
             rows = db().execute("SELECT role,content FROM chat WHERE cid=? ORDER BY id DESC LIMIT 200",
@@ -6979,8 +7423,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": False, "error": "空消息"}, 400)
             stream = bool(body.get("stream")) and ai_on()
             chips = build_chips()
+            # chips确认通道: 带payload的消息直接执行对应操作(跳过命令引擎/意图识别)
+            payload = body.get("payload") if isinstance(body.get("payload"), dict) else None
+            has_payload = bool(payload and payload.get("op"))
             # 命令引擎优先(纯规则, 不烧token): 指代/分区/统计/新对话等
-            cmd = handle_command(msg)
+            cmd = None if has_payload else handle_command(msg)
             cid = conv_cur(body.get("cid") or (cmd.get("cid") if cmd else None))
             conv_touch(cid, msg)   # 首句自动命名
             db().execute("INSERT INTO chat(role,content,ts,cid) VALUES('user',?,?,?)",
@@ -6998,7 +7445,7 @@ class Handler(BaseHTTPRequestHandler):
                 db().commit()
                 return self.send_json({"ok": ok, "reply": reply, "intent": intent,
                                        "chips": chips, "cid": cid, "error": err,
-                                       "trigger": trigger})
+                                       "trigger": trigger, "ctx": chat_ctx_get(cid)})
 
             def sse_reply(reply, intent, trigger=None):
                 """一次性回复的 SSE 事件流(无增量): meta → done。"""
@@ -7006,12 +7453,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
-                sse_send("meta", {"intent": intent, "chips": chips, "cid": cid})
+                sse_send("meta", {"intent": intent, "chips": chips, "cid": cid,
+                                  "ctx": chat_ctx_get(cid)})
                 sse_send("done", {"reply": reply, "chips": chips, "ok": True,
-                                  "trigger": trigger})
+                                  "trigger": trigger, "ctx": chat_ctx_get(cid)})
                 db().execute("INSERT INTO chat(role,content,ts,cid) VALUES('assistant',?,?,?)",
                              (reply, int(time.time()), cid))
                 db().commit()
+
+            if has_payload:
+                intent = {"action": "reply", "keywords": []}
+                res = handle_chat_payload(payload)
+                reply = res.get("reply", "")
+                if stream:
+                    sse_reply(reply, intent, res.get("trigger"))
+                    return
+                return finish(reply, trigger=res.get("trigger"))
 
             if cmd:
                 intent = {"action": "reply", "keywords": []}
@@ -7060,6 +7517,86 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 return finish(reply, trigger="settings")
 
+            if intent["action"] == "add_pref":
+                # 确认制: 写偏好备注会清评分缓存并重建(全扫模式下有重评费用), chips确认后经payload执行
+                kws = intent.get("keywords") or []
+                fresh = [k for k in kws if k not in sget("prefs_note")]
+                if fresh:
+                    reply = ("要把这些写进偏好备注吗？\n%s\n写入后我会重建信息流并对内容重新评分。" %
+                             "、".join(fresh))
+                    chips = chips + [
+                        {"label": "✅ 确认写入", "cmd": "确认写入偏好：" + "、".join(fresh),
+                         "payload": {"op": "add_pref", "keywords": fresh}},
+                        {"label": "❌ 先不了", "cmd": "先不写入偏好", "payload": {"op": "noop"}}]
+                else:
+                    reply = "这些已经在偏好备注里了：%s" % "、".join(kws)
+                intent = {"action": "reply", "keywords": []}
+                if stream:
+                    sse_reply(reply, intent, None)
+                    return
+                return finish(reply)
+
+            if intent["action"] == "set_window":
+                months = intent.get("months", 0)
+                sset("m_max_age_months", months)
+                force_rebuild()
+                reply = "已设置：只显示最近 %s 个月的内容%s，信息流已重建。" % (
+                    months, "（0=不限）" if months == 0 else "")
+                intent = {"action": "reply", "keywords": []}
+                if stream:
+                    sse_reply(reply, intent, "settings")
+                    return
+                return finish(reply, trigger="settings")
+
+            if intent["action"] == "toggle_partition":
+                groups, mode = intent.get("groups") or [], intent.get("mode")
+                ids = {GROUP_NAMES[g] for g in groups if g in GROUP_NAMES}
+                if mode == "only":
+                    names = "、".join(groups)
+                    reply = ("要切换成只看「%s」吗？其余分区的沉淀池会被清理（之后可再切回来）。" % names)
+                    chips = chips + [
+                        {"label": "✅ 确认只看：" + names, "cmd": "确认切换分区：" + names,
+                         "payload": {"op": "partition_only", "keywords": groups}},
+                        {"label": "❌ 先不了", "cmd": "先不切换分区", "payload": {"op": "noop"}}]
+                    intent = {"action": "reply", "keywords": []}
+                    if stream:
+                        sse_reply(reply, intent, None)
+                        return
+                    return finish(reply)
+                full = {g[0] for g in SOURCE_GROUPS}
+                cur = enabled_source_ids()
+                if mode == "remove":
+                    base = cur if (cur and cur != full) else full
+                    ids = base - ids
+                else:
+                    base = cur if (cur and cur != full) else set()
+                    ids = base | ids
+                names = apply_partition_ids(ids)
+                reply = "已%s分区：%s（%d 个）" % ("关掉" if mode == "remove" else "加上", names, len(ids))
+                intent = {"action": "reply", "keywords": []}
+                if stream:
+                    sse_reply(reply, intent, "settings")
+                    return
+                return finish(reply, trigger="settings")
+
+            if intent["action"] == "open_explore":
+                reply = _open_explore()
+                intent = {"action": "reply", "keywords": []}
+                if stream:
+                    sse_reply(reply, intent, "random")
+                    return
+                return finish(reply, trigger="random")
+
+            if intent["action"] == "digest":
+                reply, rep_chips, _t = daily_report_reply()
+                if rep_chips:
+                    chips = chips + rep_chips   # 采纳建议的确认chips追加到回复下方
+                intent = {"action": "reply", "keywords": []}
+                if stream:
+                    sse_reply(reply, intent, _t)
+                    return
+                return finish(reply)
+
             if intent["action"] == "search":
                 reply = ("收到！已按你的要求刷「%s」相关视频，左侧正在搜索，下滑看更多～" %
                          "、".join(intent["keywords"]))
@@ -7081,12 +7618,16 @@ class Handler(BaseHTTPRequestHandler):
             rows = db().execute("SELECT role,content FROM chat WHERE cid=? ORDER BY id DESC LIMIT 16",
                                 (cid,)).fetchall()
             history = [{"role": r, "content": c} for r, c in reversed(rows) if (c or "").strip()]  # 过滤空消息, 防API拒绝
+            extra_ctx = "\n".join(x for x in (chat_item_context(cid), chat_last_context(msg)) if x)
             messages = ([{"role": "system", "content":
                           "你是「洞鉴虚明」的偏好助手。帮用户定义想看什么内容，"
                           "回复要简短友好。注意：你只能口头回答，无法真正推送/搜索/切换视频；"
                           "用户想刷视频时会直接说「给我刷/推/看XX」，系统会自动执行并另行确认，"
                           "你不要声称「已推送」或「已切换到左侧」之类的话。"
-                          "可参考的用户画像:\n" + (user_context() or "(空)")}]
+                          "如果上下文里有【用户当前正在聊的条目】或【用户指代的最近条目】，"
+                          "围绕它可以做总结、点评、回答追问；没有依据的部分不要编造。"
+                          "可参考的用户画像:\n" + (user_context() or "(空)")
+                          + (("\n\n" + extra_ctx) if extra_ctx else "")}]
                         + history)
             if stream:
                 self.send_response(200)
@@ -7144,6 +7685,12 @@ class Handler(BaseHTTPRequestHandler):
             if not reply:
                 reply = "模型思考后没有给出文字回答，再问一次或换个说法试试～"
             return finish(reply)
+
+        if path == "/api/chat/ctx":
+            # "问AI"上下文: 卡片长按菜单写入, 前端✕或换会话清除(key为空=清除)
+            cid = conv_cur(body.get("cid"))
+            ctx = chat_ctx_set(cid, body.get("key", ""), body.get("title", ""))
+            return self.send_json({"ok": True, "ctx": ctx})
 
         if path == "/api/chat/clear":
             cid = conv_cur(body.get("cid"))
@@ -7226,10 +7773,10 @@ def port_busy(port):
 
 
 if __name__ == "__main__":
-    # 评分器升级(新增 信息密度/情绪净值/事实锚点 三维度): 只做版本标记, 不整体清评分缓存
-    # (全量清缓存会让全扫模式下首屏长时间空白; 新维度随条目自然重评在缓存期内补全)
-    if sget("scorer_v") != "2":
-        sset("scorer_v", "2")
+    # 评分器升级(v2: 标题党判低质/挂人开团扣帽子判引战/补小黑盒口径): 只做版本标记,
+    # 不整体清评分缓存(全量清缓存会让全扫模式下首屏长时间空白; 新判据随条目自然重评生效)
+    if sget("scorer_v") != "3":
+        sset("scorer_v", "3")
     _ensure_score_bg()   # 启动后台渐进评分守护线程(评分写库, 交互路径只读缓存不阻塞)
     AUTO_OPEN = ("--auto-open" in sys.argv) or bool(getattr(sys, "frozen", False))
     for port in PORTS:

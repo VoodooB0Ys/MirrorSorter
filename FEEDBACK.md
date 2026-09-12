@@ -14,7 +14,7 @@ For bug reports and feature requests, join our QQ group: **533068204**
 
 | Item | Notes |
 |------|-------|
-| Version | Desktop e.g. `v0.2.6.7a`, Android e.g. `0.1.5.28e` |
+| Version | Desktop e.g. `v0.2.7.0b`, Android e.g. `0.1.5.30e` |
 | Platform | Desktop (browser) or Android |
 | Symptom | One-sentence description + screenshot (with error text if any) |
 | Steps to reproduce | What you did, and whether it happens every time |

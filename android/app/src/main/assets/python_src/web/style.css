@@ -242,6 +242,16 @@ select option { background:var(--card); color:var(--txt); }
 .tool-btn:active { filter:brightness(1.12); }
 .meta-line b { color:var(--txt); }
 .meta-line .warn { color:#e6a23c; }
+
+/* ---------- 搜索排序条(仅搜索模式显示, 切换不重抓只重排) ---------- */
+.sort-bar { display:flex; align-items:center; flex-wrap:wrap; gap:6px;
+            padding:8px 12px; border-bottom:1px solid var(--line); flex-shrink:0; }
+.sort-bar .sort-label { color:var(--sub); font-size:12px; margin-right:2px; }
+.sort-bar button { border:1px solid var(--line); background:transparent; color:var(--sub);
+                   border-radius:20px; padding:5px 14px; font-size:12px; cursor:pointer;
+                   white-space:nowrap; transition:color .12s, border-color .12s, background .12s; }
+.sort-bar button:hover { color:var(--accent); border-color:var(--accent); }
+.sort-bar button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
 #feedList { flex:1; overflow-y:auto; padding:10px; }
 #feedList.dual { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; align-content:start; }
 #feedList.dual .card { margin-bottom:0; min-width:0; width:100%; }
@@ -253,13 +263,44 @@ select option { background:var(--card); color:var(--txt); }
 #feedList.cov-m .thumb-wrap { width:128px; height:72px; }
 #feedList.cov-l .thumb-wrap { width:168px; height:94px; }
 #feedList.cov-xl .thumb-wrap { width:220px; height:124px; }
+/* 大图模式: 封面瀑布流(无简介), 作者叠印封面顶部, 纯文字帖用简介代替封面
+   (须放在封面三档之后: 同权重选择器后者覆盖 cov-s/m/l/xl 的固定宽高) */
+#feedList.big { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px;
+                align-content:start; grid-auto-rows:max-content; }   /* max-content行高: auto行在overflow:hidden+flex卡片上会塌缩成56px裁掉内容(实测bug) */
+#feedList.big .card { display:flex; flex-direction:column; margin-bottom:0; min-width:0; width:100%;
+                      padding:0 0 4px; overflow:hidden; }
+#feedList.big h3 { order:2; padding:7px 10px 2px; max-height:calc(2.9em + 9px); }   /* max-height: 兜底2行截断(新内核-webkit-box被归一化后line-clamp可能失效) */
+#feedList.big .card-media { order:0; display:block; position:relative; margin:0; }
+#feedList.big .thumb-wrap { display:block; width:100%; height:auto; min-height:88px; border-radius:0; }
+/* 图片必须走文档流(静态img用天然高度参与网格行高计算): aspect-ratio/百分比padding这类
+   高度在flex容器的固有尺寸趟里贡献为0 → 行高塌缩, overflow:hidden把标题/按钮全裁掉(实测bug) */
+#feedList.big .thumb-wrap img { position:static; display:block; width:100%; height:auto; aspect-ratio:16/9; object-fit:cover; }   /* 统一按B站封面16:9裁切, 整列对齐 */
+#feedList.big .thumb-wrap .ph { position:absolute; top:0; left:0; right:0; bottom:0;
+                                display:flex; align-items:center; justify-content:center; }
+#feedList.big .thumb-wrap.multi { display:flex; }
+#feedList.big .thumb-wrap.multi img { width:50%; height:auto; }
+#feedList.big .thumb-stats { display:none; }
+/* 作者信息: 封面下方、标题上方(不再叠印在图上) */
+#feedList.big .meta-text { position:static; padding:7px 10px 0; color:var(--sub); font-size:11.5px; }
+#feedList.big .desc { display:none; }
+#feedList.big .reason { display:none; }
+#feedList.big .acts { order:3; padding:0 8px; margin-top:6px; }
+#feedList.big .card-media.no-cover { padding:8px 10px 2px; background:var(--soft); min-height:88px; }
+#feedList.big .no-cover .meta-text { padding:0 0 4px; }
+#feedList.big .no-cover .desc { display:block; }
+#feedList.big #feedMore { grid-column:1 / -1; }
 #feedMore { text-align:center; color:var(--sub); font-size:12px; padding:14px 0 6px; }
 #feedMore.show { color:var(--accent); }
 
 /* 卡片 */
 .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
         padding:10px 12px; margin-bottom:10px; cursor:pointer; transition:border-color .15s; }
-.card:hover { border-color:var(--accent); }
+/* 悬停描边只给真鼠标设备: 触屏 WebView 滑动时手指会把 :hover "粘"在扫过的卡片上,
+   强调色描边卡住不消失(用户反馈很怪); (hover:hover) 仅匹配有真实悬停指针的设备 */
+@media (hover: hover) {
+  .card:hover { border-color:var(--accent); }
+  .card .acts button:hover { border-color:var(--accent); color:var(--txt); }
+}
 .card h3 { font-size:14px; line-height:1.45; display:-webkit-box; -webkit-line-clamp:2;
            -webkit-box-orient:vertical; overflow:hidden; }
 .card .badge { display:inline-block; background:var(--accent); color:#fff; border-radius:4px;
@@ -317,9 +358,28 @@ body.hide-reason .card .reason { display:none !important; }
 .card .acts { display:flex; gap:6px; margin-top:9px; align-items:center; flex-wrap:wrap; }
 .card .acts button { background:none; border:1px solid var(--line); color:var(--sub);
                      border-radius:6px; padding:4px 9px; font-size:12px; cursor:pointer; }
-.card .acts button:hover { border-color:var(--accent); color:var(--txt); }
 .card .acts button.on { border-color:var(--good); color:var(--good); }
 .card .acts button.dis.on { border-color:var(--bad); color:var(--bad); }
+/* 操作栏图标贴图(.ic, PNG蒙版染色): 统一 18px, 激活态用同色底衬托 */
+.card .acts button { display:inline-flex; align-items:center; justify-content:center; }
+.card .acts button.on { background:rgba(103,194,58,.16); }
+.card .acts button.dis.on { background:rgba(245,108,108,.16); }
+
+/* ---------- 图标体系(.ic): 白色PNG(web/icons/png/)做alpha蒙版, background:currentColor染色 ——
+   自动跟随昼夜主题/强调色/按钮状态(喜欢变绿/不喜欢变红/悬停变色); ---------- */
+.ic { display:inline-block; width:18px; height:18px; flex-shrink:0; background:currentColor;
+      -webkit-mask:var(--ic) center/contain no-repeat; mask:var(--ic) center/contain no-repeat; }
+.ic-play { --ic:url("/icons/png/play-48.png"); }
+.ic-read { --ic:url("/icons/png/read-48.png"); }
+.ic-next { --ic:url("/icons/png/next-48.png"); }
+.ic-like { --ic:url("/icons/png/like-48.png"); }
+.ic-dislike { --ic:url("/icons/png/dislike-48.png"); }
+.ic-block { --ic:url("/icons/png/block-48.png"); }
+/* 卡片操作图标默认染强调色; 喜欢/不喜欢激活时回到按钮语义色(绿/红) */
+.card .acts button > .ic { background:var(--accent); }
+.card .acts button.on > .ic,
+.card .acts button.dis.on > .ic { background:currentColor; }
+/* 纯白贴图在白天主题(--card #ffffff)会隐形: 反相成深灰, 与 --sub 观感一致 */
 .card .go { margin-left:auto; background:var(--accent); color:#fff !important; border:none !important; }
 
 /* 分隔条 */
@@ -379,6 +439,13 @@ body.hide-reason .card .reason { display:none !important; }
               cursor:pointer; padding:2px 6px; border-radius:5px; }
 .conv-title:hover { background:var(--line); }
 #chatMsgs { flex:1; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:10px; }
+/* "问AI"条目上下文条: 长按卡片带入, ✕切出 */
+#chatCtxBar { display:flex; align-items:center; gap:6px; margin:8px 10px 0; padding:6px 10px;
+              background:var(--soft); border:1px solid var(--line); border-radius:8px; font-size:12px;
+              color:var(--sub); flex-shrink:0; }
+#chatCtxBar #chatCtxTitle { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--txt); }
+#chatCtxBar button { background:none; border:none; color:var(--sub); cursor:pointer; padding:2px 5px; font-size:13px; }
+#chatCtxBar button:hover { color:var(--bad); }
 .msg { max-width:88%; padding:8px 11px; border-radius:10px; font-size:13px; line-height:1.6;
        white-space:pre-wrap; word-break:break-word; }
 .msg-text { white-space:pre-wrap; word-break:break-word; }
@@ -612,6 +679,8 @@ body.hide-reason .card .reason { display:none !important; }
 
   /* ---- 信息流卡片: 大触控目标 + 统一封面 ---- */
   .meta-line { padding:8px 10px; font-size:11.5px; }
+  .sort-bar { padding:6px 10px; gap:5px; }
+  .sort-bar button { padding:7px 13px; font-size:11.5px; }   /* 触控目标≥32px */
   #feedMeta.clamp { max-height:1.8em; overflow:hidden; cursor:pointer; }   /* 手机默认收起为一行, 点按展开 */
   #feedMeta.expanded { max-height:none; }
   #feedList { padding:10px 10px calc(80px + env(safe-area-inset-bottom)); }
@@ -627,7 +696,15 @@ body.hide-reason .card .reason { display:none !important; }
   #feedList.dual .card h3 { order:1; font-size:13.5px; -webkit-line-clamp:3; }
   #feedList.dual .card .acts { order:3; margin-top:7px; }
   #feedList.dual .card .acts button { padding:6px 9px; font-size:12px; min-height:0; }
+  #feedList.dual .card .acts button > .ic { width:17px; height:17px; }
   #feedList.dual .card .reason { order:4; margin-top:7px; }
+  /* 大图模式(手机=双列): 封面在上/标题在下, 作者叠印封面顶部, 无简介 */
+  #feedList.big { grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; }
+  #feedList.big .card h3 { font-size:12.5px; padding:6px 8px 2px; }
+  #feedList.big .card .acts { padding:0 6px; }
+  #feedList.big .card .acts button { padding:5px 7px; font-size:11.5px; min-height:0; }
+  #feedList.big .card .acts button > .ic { width:16px; height:16px; }
+  #feedList.big .card .meta-text { font-size:11px; padding:6px 8px 0; }
   .card { padding:12px; border-radius:12px; margin-bottom:10px; }
   .card h3 { font-size:15px; }
   /* 封面大小档位在手机上的映射(单栏; 双栏瀑布流封面恒为卡片通栏) */
@@ -636,6 +713,7 @@ body.hide-reason .card .reason { display:none !important; }
   #feedList.cov-l .thumb-wrap { width:160px; height:90px; }
   #feedList.cov-xl .thumb-wrap { width:200px; height:113px; }
   .card .acts button { padding:8px 13px; font-size:13.5px; min-height:36px; }
+  .card .acts button > .ic { width:20px; height:20px; }
   .card .desc, .card .meta-text { font-size:12.5px; }
   .chip { padding:6px 12px; font-size:12.5px; }
   #feedMore { padding:16px 0 10px; }

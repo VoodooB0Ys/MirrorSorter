@@ -39,6 +39,7 @@
           <div class="row" id="layoutRow">
             <button data-layout="single" class="seg on">单栏（默认）</button>
             <button data-layout="dual" class="seg">双栏</button>
+            <button data-layout="big" class="seg">大图</button>
           </div>
           <label>推荐理由（💡舒适区等，占卡片高度）</label>
           <div class="row" id="reasonRow">
@@ -165,7 +166,7 @@
         </div>
       </details>
 
-      <footer>洞鉴虚明 v0.2.6.8a<br>数据只存本机</footer>
+      <footer>洞鉴虚明 v0.2.7.0b<br>数据只存本机</footer>
     </div>
   </aside>
 
@@ -189,7 +190,7 @@
       <select id="modeSelect" title="过滤档位(严肃=只推硬核教程与知识)">
         <option>严格</option><option>标准</option><option>宽松</option><option>严肃</option>
       </select>
-      <input id="searchInput" placeholder="搜索 标题 / 作者 / 简介…">
+      <input id="searchInput" placeholder="搜索 标题 / 作者 / 简介…（前加 * = 保留屏蔽规则）">
       <button id="btnHistory" class="tb">历史</button>
       <button id="btnSaved" class="tb">收藏</button>
       <span id="avatarGroup">
@@ -230,6 +231,13 @@
           <button id="feedMetaToggle" class="tool-btn" title="收起/展开来源信息">▲</button>
           <button id="feedClear" class="tool-btn" title="清空信息池并重新收录：丢弃当前已收录内容，按当前设置重新抓取">清空信息池</button>
         </div>
+        <div id="sortBar" class="sort-bar hidden">
+          <span class="sort-label">排序</span>
+          <button data-sort="default" class="on">综合</button>
+          <button data-sort="views">播放</button>
+          <button data-sort="pubdate">最新</button>
+          <button data-sort="hot">最新热门</button>
+        </div>
         <div id="feedList"><div id="feedMore">正在获取更多…</div></div>
         <button id="feedRefresh" title="刷新数据">↻</button>
       </section>
@@ -262,6 +270,10 @@
             <div class="conv-foot"><button id="convNew2">＋ 新对话</button></div>
           </div>
         </header>
+        <div id="chatCtxBar" class="hidden">
+          <span>🤖</span><span id="chatCtxTitle"></span>
+          <button id="chatCtxClear" title="切出该条目，恢复普通聊天">✕</button>
+        </div>
         <div id="chatMsgs"><div class="chat-empty">告诉 AI 你想看什么样的信息</div></div>
         <div id="chatRow">
           <input id="chatInput" placeholder="如：多推点独立游戏">

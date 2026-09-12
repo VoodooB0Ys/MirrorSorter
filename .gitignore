@@ -2,7 +2,8 @@
 desktop/data.db*
 desktop/_tb_login_profile/
 desktop/smoke-tmp/
-desktop/test-tmp/
+desktop/test-tmp*/
+desktop/rules-tmp/
 
 # ===== 构建产物 =====
 desktop/build/

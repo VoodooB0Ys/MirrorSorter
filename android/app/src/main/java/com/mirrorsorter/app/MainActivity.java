@@ -432,7 +432,18 @@ public class MainActivity extends Activity {
             });
         }
 
-        /* 导出分享: 调系统分享面板, 可存到微信/网盘/本地备忘等, 规避 WebView 不支持下载 */
+        /* 目标App是否已安装: 前端点卡片跳转前先查, 未装B站/贴吧/小黑盒时改开本地播放器/阅读器,
+       而不是逐级回落到系统浏览器。 */
+    @JavascriptInterface
+    public boolean hasApp(final String pkg) {
+        try {
+            return getPackageManager().getLaunchIntentForPackage(pkg) != null;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /* 导出分享: 调系统分享面板, 可存到微信/网盘/本地备忘等, 规避 WebView 不支持下载 */
         @JavascriptInterface
         public void shareText(final String text) {
             runOnUiThread(() -> {

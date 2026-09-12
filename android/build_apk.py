@@ -16,6 +16,7 @@ SDK = os.path.join(os.path.dirname(BASE), "android-sdk")
 GRADLE_BAT = os.path.join(SDK, "gradle-8.5", "bin", "gradle.bat")
 JAVA_HOME = os.path.join(SDK, "jdk-17.0.20.1+1")
 WEB_FILES = ("app.js", "index.html", "style.css", "qrcode.js", "favicon.ico")
+WEB_DIRS = ("icons",)   # 图标贴图等子目录(整体递归同步)
 
 
 def sync_src():
@@ -27,6 +28,10 @@ def sync_src():
         p = os.path.join(SRC, "web", f)
         if os.path.exists(p):
             shutil.copy2(p, os.path.join(DST, "web", f))
+    for d in WEB_DIRS:
+        p = os.path.join(SRC, "web", d)
+        if os.path.isdir(p):
+            shutil.copytree(p, os.path.join(DST, "web", d), dirs_exist_ok=True)
     print("[1/3] 已同步桌面版源码 -> assets")
 
 

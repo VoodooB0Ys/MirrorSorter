@@ -16,5 +16,8 @@ for %%f in (app.js index.html style.css qrcode.js favicon.ico) do (
   if exist "%SRC%\web\%%f" copy /y "%SRC%\web\%%f" "%DST%\web\%%f" >nul
 )
 
-echo Synced: app.py + web/* into app/src/main/assets/python_src
+rem 图标贴图等子目录(递归同步)
+if exist "%SRC%\web\icons" xcopy /e /i /y "%SRC%\web\icons" "%DST%\web\icons" >nul
+
+echo Synced: app.py + web/* (+ web/icons) into app/src/main/assets/python_src
 endlocal

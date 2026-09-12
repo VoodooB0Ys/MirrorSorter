@@ -8,6 +8,9 @@ feed with built-in AI chat.
 - **Single-file backend**: `app.py` uses only the Python standard library — zero third-party dependencies
 - **Bundled frontend**: vanilla HTML/JS served directly by the local HTTP service
 - **One codebase, two platforms**: desktop runs as-is; Android embeds the same Python service inside the APK
+- **Tunable feed & AI chat**: single / dual / large-image display modes, search with sort modes
+  (relevance / views / newest / trending-hot, `*` prefix keeps personal blocks) and an AI chat that
+  can act on your behalf (search, tune preferences, ask-about-a-card, daily digest with preference suggestions)
 
 ## Repository Layout
 

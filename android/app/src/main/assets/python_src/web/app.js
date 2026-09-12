@@ -1,4 +1,4 @@
-/* 洞鉴虚明 v0.2.6.8a - 前端逻辑 */
+/* 洞鉴虚明 v0.2.7.0b - 前端逻辑 */
 "use strict";
 
 const $ = (s) => document.querySelector(s);
@@ -70,7 +70,6 @@ const state = {
   q: "",
   liked: new Set(),
   disliked: new Set(),
-  later: new Set(),
 };
 
 /* ---------- 工具 ---------- */
@@ -217,6 +216,7 @@ function applyView() {
   const reason = localStorage.getItem("reason") || "hide";   // 推荐理由默认隐藏(省高度)
   const list = document.getElementById("feedList");
   list.classList.toggle("dual", layout === "dual");
+  list.classList.toggle("big", layout === "big");
   list.classList.remove("cov-s", "cov-m", "cov-l");
   list.classList.add("cov-" + cov);
   document.body.classList.toggle("hide-reason", reason === "hide");
@@ -253,9 +253,14 @@ applyView();
 
 /* ---------- 信息流 ---------- */
 /* ---------- 信息流(无限滚动: 边刷边补) ---------- */
+const SEARCH_SORTS = { default: "综合排序", views: "播放量排序", pubdate: "最新发布", hot: "最新热门" };
 const feedState = { offset: 0, q: "", loading: false, gen: 0, timer: null, ctrl: null,
   session: (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36)),
-  statusSynced: false };
+  statusSynced: false,
+  sort: (function () {
+    const s = localStorage.getItem("searchSort");
+    return s && SEARCH_SORTS[s] ? s : "default";
+  })() };
 function updateFeedMeta(d) {
   const meta = $("#feedMeta");
   if (feedState.q) {
@@ -265,7 +270,8 @@ function updateFeedMeta(d) {
     if (d && d.deep_terms && d.deep_terms.length)
       extra += ' <span class="tip">· 已深挖：' + esc(d.deep_terms.join(" / ")) + "</span>";
     meta.innerHTML = "搜索「<b>" + esc(feedState.q) + "</b>」 · 已加载 <b>" + feedState.offset +
-      "</b> 条 · 多平台·相关度排序 · 下滑自动续" + extra;
+      "</b> 条 · " + (SEARCH_SORTS[feedState.sort] || SEARCH_SORTS.default) +
+      " · 下滑自动续" + extra;
     return;
   }
   const srcHtml = "来源：<b>" + esc(d.source) + "</b>";
@@ -318,7 +324,10 @@ async function feedFetch(force, gen) {
     : "正在获取更多…（AI 筛查中）";
   try {
     const p = [];
-    if (q) p.push("q=" + encodeURIComponent(q));
+    if (q) {
+      p.push("q=" + encodeURIComponent(q));
+      p.push("sort=" + encodeURIComponent(feedState.sort));
+    }
     if (force) p.push("refresh=1");
     if (!q) p.push("rid=" + encodeURIComponent(feedState.session));
     p.push("offset=" + offset, "limit=30");
@@ -396,8 +405,25 @@ async function feedFetch(force, gen) {
     if (gen === feedState.gen) feedState.loading = false;
   }
 }
+/* 搜索排序条: 仅搜索模式显示; 切换只带 sort 参数重排服务端缓存池, 不重新抓源(秒切) */
+function applySortBar() {
+  const bar = $("#sortBar");
+  if (!bar) return;
+  bar.classList.toggle("hidden", !feedState.q);
+  bar.querySelectorAll("button[data-sort]").forEach((b) =>
+    b.classList.toggle("on", b.dataset.sort === feedState.sort));
+}
+$("#sortBar").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-sort]");
+  if (!b || b.dataset.sort === feedState.sort) return;
+  feedState.sort = b.dataset.sort;
+  localStorage.setItem("searchSort", feedState.sort);
+  applySortBar();
+  loadFeed();   // 不带force: 不发refresh=1, 服务端同一波次池直接重排
+});
 function loadFeed(force) {
   feedState.gen += 1;
+  applySortBar();
   // 会话语义: 仅强制刷新/清池时重置会话(新 rid → 服务端已返回集合清零);
   // 设置变更等普通重建保留会话, 服务端会话去重继续防止同一内容反复出现。
   if (force || !feedState.session) {
@@ -447,11 +473,11 @@ function cardHTML(it) {
   const authorHtml = follow ? '<span class="follow-author">' + esc(it.author) + '</span>' : esc(it.author);
   const bvid = (!isTb && !isXhh) ? ((it.url || "").match(/BV[0-9A-Za-z]{8,12}/) || [])[0] : "";
   const playBtn = (bvid && !isTouchDevice())
-    ? '<button data-act="play" data-bvid="' + bvid + '" data-title="' + esc(it.title) + '" title="站内播放">▶</button>' : "";
+    ? '<button data-act="play" data-bvid="' + bvid + '" data-title="' + esc(it.title) + '" title="站内播放"><i class="ic ic-play"></i></button>' : "";
   const tid = isTb ? ((it.url || "").match(/\/p\/(\d+)/) || [])[1] : "";
   const xhhLid = isXhh ? ((it.url || "").match(/bbs\/link\/([0-9a-f]+)/) || [])[1] : "";
-  const readBtn = tid ? '<button data-act="read" data-tid="' + tid + '" title="站内阅读">📖</button>' :
-    (xhhLid ? '<button data-act="xread" data-lid="' + xhhLid + '" title="站内预览">📖</button>' : "");
+  const readBtn = tid ? '<button data-act="read" data-tid="' + tid + '" title="站内阅读"><i class="ic ic-read"></i></button>' :
+    (xhhLid ? '<button data-act="xread" data-lid="' + xhhLid + '" title="站内预览"><i class="ic ic-read"></i></button>' : "");
   const meta = (isTb || isXhh)
     ? '<div class="meta-text">' + esc(it.author || "用户") + " · " + ago(it.pubdate) +
       (isTb ? " · " + esc(it.tname || "") : "") + "</div>"
@@ -463,11 +489,10 @@ function cardHTML(it) {
       : '<div class="card-media no-cover"><div class="card-side">' + meta + desc + '</div></div>'}
     <div class="acts">
       ${playBtn}${readBtn}
-      <button data-act="refresh" title="换一条(刷新)">🔄<i></i></button>
-      <button data-act="like" title="喜欢">👍<i></i></button>
-      <button data-act="dislike" title="不喜欢">👎<i></i></button>
-      <button data-act="later" title="稍后再看">⏳<i></i></button>
-      <button data-act="block" title="屏蔽作者">🚫</button>
+      <button data-act="refresh" title="换一条(刷新)"><i class="ic ic-next"></i></button>
+      <button data-act="like" title="喜欢"><i class="ic ic-like"></i></button>
+      <button data-act="dislike" class="dis" title="不喜欢"><i class="ic ic-dislike"></i></button>
+      <button data-act="block" title="屏蔽作者"><i class="ic ic-block"></i></button>
     </div>
     ${reason}
   </article>`;
@@ -477,10 +502,8 @@ function renderCardState() {
     const key = card.dataset.key;
     const like = card.querySelector('[data-act="like"]');
     const dis = card.querySelector('[data-act="dislike"]');
-    const later = card.querySelector('[data-act="later"]');
     like.classList.toggle("on", state.liked.has(key));
     dis.classList.toggle("on", state.disliked.has(key));
-    later.classList.toggle("on", state.later.has(key));
   });
 }
 
@@ -680,6 +703,10 @@ async function openXhhReader(lid, title) {
   $("#rbJump").onclick = () => {
     const webUrl = "https://www.xiaoheihe.cn/app/bbs/link/" + lid;
     if (window.AndroidBridge) {
+      if (window.AndroidBridge.hasApp && !window.AndroidBridge.hasApp("com.max.xiaoheihe")) {
+        toast("未安装小黑盒App，可继续在本地预览");
+        return;
+      }
       // 安卓壳: 官方 heybox://link 协议进帖子, id用数字linkid(评论要用, hex会报帖子id错误);
       // App未装时壳回落到 #web= 网页; 无xlid时退化用网页hex
       window.open(xhhJumpUrl(webUrl, readerBoxXlid || lid, readerBoxLtag), "_blank", "noopener");
@@ -776,14 +803,6 @@ $("#feedList").addEventListener("click", async (e) => {
       }
       return;
     }
-    if (act === "later") {
-      const on = !state.later.has(key);
-      state.later[on ? "add" : "delete"](key);
-      await api("/api/saved", { method: "POST", body: { key, kind: "later", remove: !on } });
-      renderCardState();
-      if (on) toast("已加入稍后再看");
-      return;
-    }
     if (act === "block") {
       await api("/api/blacklist", { method: "POST", body: { kind: "author", value: author } });
       // 服务端负反馈过滤即刻生效: 直接移除该作者的所有在屏卡片, 无需整流重建。
@@ -796,19 +815,50 @@ $("#feedList").addEventListener("click", async (e) => {
       return;
     }
   } else {
-    let jumpUrl = card.dataset.url;
-    if (card.dataset.platform === "小黑盒" && card.dataset.xlid) {
-      const hexId = (card.dataset.url.match(/bbs\/link\/([0-9a-f]+)/) || [])[1] || "";
-      if (window.AndroidBridge) {
-        // 安卓壳: 官方 heybox://link?link_id= 协议进帖子, id用数字linkid(评论要用),
-        // 无xlid时退化用hex(至少能打开)。App未装时壳回落到 #web= 网页。
-        jumpUrl = xhhJumpUrl(card.dataset.url, card.dataset.xlid || hexId, card.dataset.ltag);
-      }
-      // 桌面端: 直接开网页(heybox://深链留给安卓壳; 浏览器没装PC客户端时协议跳转体验差)
-    }
-    openItem(key, jumpUrl);
+    openCard(card, key);
   }
 });
+function cardHeading(card) {
+  const h = card.querySelector("h3");
+  if (!h) return "";
+  return [...h.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("").trim();
+}
+/* 卡片主体点按: 安卓壳先查目标App是否安装, 未装时改开本地播放器/阅读器
+   (旧版逐级回落到系统浏览器, 手机没装官方App时体验极差);
+   桌面浏览器或已装App → 照旧外跳。长按菜单的"跳转软件"保留强制外跳作逃生门。 */
+function openCard(card, key) {
+  const plat = card.dataset.platform || "";
+  const url = card.dataset.url || "";
+  if (window.AndroidBridge && window.AndroidBridge.hasApp) {
+    const hexId = (url.match(/bbs\/link\/([0-9a-f]+)/) || [])[1] || "";
+    if (plat === "贴吧" && !AndroidBridge.hasApp("com.baidu.tieba")) {
+      const tid = (url.match(/\/p\/(\d+)/) || [])[1] || "";
+      if (tid) {
+        toast("未安装贴吧，已在本地阅读");
+        return openReader(tid, cardHeading(card));
+      }
+    } else if (plat === "小黑盒" && !AndroidBridge.hasApp("com.max.xiaoheihe")) {
+      const lid = card.dataset.xlid || hexId;
+      if (lid) {
+        toast("未安装小黑盒，已在本地预览");
+        return openXhhReader(lid, cardHeading(card));
+      }
+    } else if (plat === "B站" && !AndroidBridge.hasApp("tv.danmaku.bili")) {
+      const bvid = (url.match(/BV[0-9A-Za-z]{8,12}/) || [])[0] || "";
+      if (bvid) {
+        toast("未安装B站客户端，已在本地播放");
+        return openPlayer(bvid, cardHeading(card));
+      }
+    }
+    if (plat === "小黑盒" && (card.dataset.xlid || hexId)) {
+      // 安卓壳: 官方 heybox://link?link_id= 协议进帖子, id用数字linkid(评论要用),
+      // 无xlid时退化用hex(至少能打开)
+      return openItem(key, xhhJumpUrl(url, card.dataset.xlid || hexId, card.dataset.ltag));
+    }
+    return openItem(key, url);
+  }
+  return openItem(key, url);   // 桌面端: 直接开网页(heybox://深链留给安卓壳)
+}
 function openItem(key, url) {
   api("/api/click", { method: "POST", body: { key } });
   window.open(url, "_blank", "noopener");
@@ -968,6 +1018,40 @@ let curConv = 0;
 let convs = [];
 let streamCtrl = null;   // 当前流式请求的 AbortController
 
+/* 会话条目上下文("问AI"): 长按卡片写入, 聊天框顶部显示, ✕切出 */
+let chatCtx = { key: "", title: "" };
+function setChatCtxBar() {
+  const bar = $("#chatCtxBar");
+  if (!bar) return;
+  if (chatCtx.key) {
+    $("#chatCtxTitle").textContent = "正在聊：" + (chatCtx.title || "一条内容");
+    bar.classList.remove("hidden");
+  } else {
+    bar.classList.add("hidden");
+  }
+}
+async function chatCtxApply(key, title) {
+  chatCtx = { key: key || "", title: title || "" };
+  setChatCtxBar();
+  try {
+    await api("/api/chat/ctx", { method: "POST", body: { cid: curConv, key: key || "", title: title || "" } });
+  } catch (_) {}
+}
+async function askAiAboutCard(card) {
+  const key = card.dataset.key || "";
+  if (!key) return;
+  await chatCtxApply(key, cardHeading(card).slice(0, 40));
+  openChatPanel();
+  toast("已带上这条内容，直接提问即可");
+}
+function openChatPanel() {
+  if (window.matchMedia("(max-width: 1023.9px)").matches) {
+    if (window.__setMobileView) window.__setMobileView("chat");
+  } else if ($("#chat").classList.contains("collapsed")) {
+    $("#chatCollapse").click();   // 折叠中 → 展开(复用折叠逻辑与宽度记忆)
+  }
+  setTimeout(() => { const i = $("#chatInput"); if (i) i.focus(); }, 80);
+}
 function msgEl(role, content, chips) {
   const w = document.createElement("div");
   w.className = "msg " + role;
@@ -985,7 +1069,7 @@ function chipsRow(chips) {
     const b = document.createElement("button");
     b.textContent = c.label;
     b.title = c.cmd;
-    b.onclick = () => sendChatText(c.cmd);
+    b.onclick = () => sendChatText(c.label, c.payload);   // payload=确认通道(后端直接执行)
     row.appendChild(b);
   });
   return row;
@@ -994,6 +1078,8 @@ async function loadConvs() {
   const d = await api("/api/conv");
   convs = d.convs || [];
   curConv = d.cur || 0;
+  chatCtx = d.ctx || { key: "", title: "" };   // 每个会话独立的条目上下文, 切换即同步
+  setChatCtxBar();
   $("#convItems").innerHTML = convs.length ? convs.map((c) => `
     <div class="conv-item ${c.id === curConv ? "on" : ""}" data-id="${c.id}">
       <span class="conv-name" title="${esc(c.title)}">${esc(c.title)}<em>${c.count || ""}</em></span>
@@ -1069,7 +1155,7 @@ async function sendChat() {
   input.value = "";
   await sendChatText(msg);
 }
-async function sendChatText(text) {
+async function sendChatText(text, payload) {
   if (streamCtrl) return;
   const box = $("#chatMsgs");
   const empty = box.querySelector(".chat-empty");
@@ -1088,11 +1174,20 @@ async function sendChatText(text) {
     const r = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, cid: curConv, stream: true }),
+      body: JSON.stringify({ message: text, cid: curConv, stream: true, payload: payload || undefined }),
       signal: ctrl.signal,
     });
     if (!r.ok || !r.body) {
       reply = "请求失败（HTTP " + r.status + "）";
+      done = true;
+    } else if ((r.headers.get("Content-Type") || "").indexOf("application/json") >= 0) {
+      // AI未配置/总开关关闭等场景: 后端回普通JSON而非SSE(旧版解析不出任何事件 → 空气泡)
+      const d = await r.json();
+      reply = d.reply || "";
+      chips = d.chips || [];
+      trig = d.trigger || null;
+      sentCid = d.cid || sentCid;
+      if (d.ctx !== undefined) { chatCtx = d.ctx || { key: "", title: "" }; setChatCtxBar(); }
       done = true;
     } else {
       const reader = r.body.getReader();
@@ -1112,6 +1207,7 @@ async function sendChatText(text) {
             else if (line.startsWith("data:")) { try { data = JSON.parse(line.slice(5).trim()); } catch (_) {} }
           }
           if (ev === "meta") { intent = data.intent; chips = data.chips || []; sentCid = data.cid || sentCid; }
+          else if (data.ctx !== undefined) { chatCtx = data.ctx || { key: "", title: "" }; setChatCtxBar(); }
           else if (ev === "think") {   // 推理模型: 思考阶段先占位, 出字再替换
             if (!aiText.textContent) {
               aiText.textContent = "🧠 思考中…";
@@ -1188,6 +1284,7 @@ $("#chatClear").onclick = async () => {
   await api("/api/chat/clear", { method: "POST", body: { cid: curConv } });
   loadChat(); loadConvs();
 };
+$("#chatCtxClear").onclick = () => chatCtxApply("", "");
 /* 折叠到最右: 省出空间 */
 $("#chatCollapse").onclick = () => {
   const collapsed = $("#chat").classList.toggle("collapsed");
@@ -2101,9 +2198,6 @@ if ($("#mFollowMonths")) $("#mFollowMonths").addEventListener("input", syncMonth
   loadChat();
   loadFeed();
   loadPanel();
-  const d = await api("/api/saved?kind=later");
-  d.items.forEach((it) => state.later.add(it.key));
-  renderCardState();
   defaultFeedWidth();
 })();
 
@@ -2259,6 +2353,7 @@ window.__nativeTiebaSaved = (ok) => {
     const tbTid = platform === "贴吧" ? ((url.match(/\/p\/(\d+)/) || [])[1] || "") : "";
     const xhhLid = platform === "小黑盒" ? ((url.match(/bbs\/link\/([0-9a-f]+)/) || [])[1] || "") : "";
     const acts = [];
+    acts.push(["🤖 问AI", () => askAiAboutCard(card)]);
     if (bvid) acts.push(["▶ 本地预览", () => openPlayer(bvid, cardTitle(card))]);
     if (tbTid) acts.push(["📖 本地阅读", () => openReader(tbTid, "")]);
     if (xhhLid) acts.push(["📖 本地预览", () => openXhhReader(xhhLid, "")]);
