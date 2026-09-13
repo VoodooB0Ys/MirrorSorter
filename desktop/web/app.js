@@ -563,14 +563,11 @@ async function startPreview(tw) {
   const zoom = pvZoom();
   const ovW = Math.round(rect.width * zoom);
   const ovH = Math.round(rect.height * zoom);
-  // 双栏: 左列朝右放大(左缘锚点); 右列以封面中心为锚点对称放大(朝左扩展但不过度偏左); 单栏统一朝右。
-  // 三列大图: 中列=原位(左缘锚点不移动), 最后一列中心锚点后向左钳回边界, 不压到右侧面板。
+  // 统一中心锚点: 预览以封面中心对称放大(中列视觉=原位, 不朝任何方向飘),
+  // 越出信息流左右边界的方向被钳回(左列贴左缘/最后一列整体左移, 不压设置栏与右侧面板)。
   const feed = document.getElementById("feedList");
   const feedRect = feed.getBoundingClientRect();
-  const isRightCol = rect.left > feedRect.left + feedRect.width / 2;
-  let left = isRightCol
-    ? Math.round(rect.left + rect.width / 2 - ovW / 2)   // 中心锚点
-    : Math.round(rect.left);
+  let left = Math.round(rect.left + rect.width / 2 - ovW / 2);   // 中心锚点
   left = Math.max(feedRect.left, Math.min(left, Math.round(feedRect.left + feedRect.width - ovW)));   // 左右都不出信息流边界
   const ov = document.createElement("div");
   ov.className = "pv-overlay";
