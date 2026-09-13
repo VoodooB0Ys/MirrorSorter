@@ -268,7 +268,7 @@ select option { background:var(--card); color:var(--txt); }
 #feedList.big { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px;
                 align-content:start; grid-auto-rows:max-content; }   /* max-content行高: auto行在overflow:hidden+flex卡片上会塌缩成56px裁掉内容(实测bug) */
 #feedList.big .card { display:flex; flex-direction:column; margin-bottom:0; min-width:0; width:100%;
-                      padding:0 0 4px; overflow:hidden; }
+                      height:100%; padding:0 0 4px; overflow:hidden; }   /* height:100%填满行高(max-content轨道不自动stretch), 保证同行卡片等高 */
 #feedList.big h3 { order:2; padding:7px 10px 2px; max-height:calc(2.9em + 9px); }   /* max-height: 兜底2行截断(新内核-webkit-box被归一化后line-clamp可能失效) */
 #feedList.big .card-media { order:0; display:block; position:relative; margin:0; }
 #feedList.big .thumb-wrap { display:block; width:100%; height:auto; min-height:88px; border-radius:0; }
@@ -284,7 +284,7 @@ select option { background:var(--card); color:var(--txt); }
 #feedList.big .meta-text { position:static; padding:7px 10px 0; color:var(--sub); font-size:11.5px; }
 #feedList.big .desc { display:none; }
 #feedList.big .reason { display:none; }
-#feedList.big .acts { order:3; padding:0 8px; margin-top:6px; }
+#feedList.big .acts { order:3; padding:6px 8px 0; margin-top:auto; }   /* margin-top:auto: 按钮条钉在卡片底部, 同行所有按钮条同一高度 */
 #feedList.big .card-media.no-cover { padding:8px 10px 2px; background:var(--soft); min-height:88px; }
 #feedList.big .no-cover .meta-text { padding:0 0 4px; }
 #feedList.big .no-cover .desc { display:block; }
@@ -504,6 +504,11 @@ body.hide-reason .card .reason { display:none !important; }
                font-weight:600; cursor:pointer; }
 .ai-mode-btn.off:hover { border-color:var(--accent); color:var(--accent); }
 .ai-mode-box .tip { margin:0; }
+/* AI 悬浮窗卡片框: 与 ai-mode-box 同款视觉, 但不能共用其类名——
+   上面的旧规则把 .ai-mode-box 整体隐藏了(未完成的 AI 推荐模式入口) */
+.fb-box { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:12px; display:flex; flex-direction:column; gap:8px; margin:6px 0; }
+.fb-box .tip { margin:0; }
 #railBody .sub { color:var(--sub); font-size:12px; min-width:110px; }
 
 /* 弹窗 */
