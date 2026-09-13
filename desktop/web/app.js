@@ -1,4 +1,4 @@
-/* 洞鉴虚明 v0.2.7.0b - 前端逻辑 */
+/* 洞鉴虚明 v0.2.8.0a - 前端逻辑 */
 "use strict";
 
 const $ = (s) => document.querySelector(s);
@@ -145,6 +145,19 @@ function customAccents() {
 function saveCustomAccents(colors) {
   localStorage.setItem(CUSTOM_ACCENTS_KEY, JSON.stringify([...new Set(colors)].slice(0, 24)));
 }
+/* 强调色/主题变化时推送给悬浮球(桌面小组件, 颜色跟随主界面) */
+function pushBallTheme() {
+  const theme = localStorage.getItem("theme") || "dark";
+  const accent = localStorage.getItem("accent") || "pink";
+  const custom = accent.startsWith("custom:") ? accent.slice(7) : "";
+  const hit = ACCENTS.find((a) => a.id === accent);
+  const hex = HEX_COLOR_RE.test(custom) ? custom : (hit ? hit.color : "#fb7299");
+  fetch("/api/floatball", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ theme: { accent: hex, light: theme === "light" } }),
+  }).catch(() => {});
+}
 function applyTheme() {
   const theme = localStorage.getItem("theme") || "dark";
   const accent = localStorage.getItem("accent") || "pink";
@@ -155,6 +168,7 @@ function applyTheme() {
   if (theme === "light") document.body.classList.add("light");
   if (HEX_COLOR_RE.test(customColor)) document.body.style.setProperty("--accent", customColor);
   else if (accent !== "pink") document.body.classList.add("accent-" + accent);
+  pushBallTheme();   // 悬浮球跟随主界面强调色/深浅主题
   document.querySelectorAll("#themeRow .seg").forEach((b) =>
     b.classList.toggle("on", b.dataset.theme === theme));
   const row = document.getElementById("accentRow");
@@ -549,14 +563,15 @@ async function startPreview(tw) {
   const zoom = pvZoom();
   const ovW = Math.round(rect.width * zoom);
   const ovH = Math.round(rect.height * zoom);
-  // 双栏: 左列朝右放大(左缘锚点); 右列以封面中心为锚点对称放大(朝左扩展但不过度偏左); 单栏统一朝右
+  // 双栏: 左列朝右放大(左缘锚点); 右列以封面中心为锚点对称放大(朝左扩展但不过度偏左); 单栏统一朝右。
+  // 三列大图: 中列=原位(左缘锚点不移动), 最后一列中心锚点后向左钳回边界, 不压到右侧面板。
   const feed = document.getElementById("feedList");
   const feedRect = feed.getBoundingClientRect();
   const isRightCol = rect.left > feedRect.left + feedRect.width / 2;
   let left = isRightCol
     ? Math.round(rect.left + rect.width / 2 - ovW / 2)   // 中心锚点
     : Math.round(rect.left);
-  left = Math.max(feedRect.left, left);   // 不越过信息流左缘(防盖到设置栏)
+  left = Math.max(feedRect.left, Math.min(left, Math.round(feedRect.left + feedRect.width - ovW)));   // 左右都不出信息流边界
   const ov = document.createElement("div");
   ov.className = "pv-overlay";
   ov.style.left = left + "px";
@@ -1371,6 +1386,7 @@ async function loadSettings() {
   applyAiMainBtn(s.ai_enabled === "1");
   aiModeVals = s;
   loadTiebaSettings();
+  refreshFloatBall();
   return s;
 }
 /* ---------- 各平台推送设置(动态权重行 + 贴吧吧列表) ---------- */
@@ -1435,6 +1451,48 @@ function applyAiMainBtn(on) {
     ? "状态：已开启（评分/聊天/自动加词按下方配置运行）"
     : "状态：已关闭（不消耗 token）";
 }
+/* ---------- AI 悬浮窗(仅电脑版): 设置开关 + 状态 ---------- */
+function applyFloatBallBtn(enabled, running, supported) {
+  const btn = $("#floatBallToggle"), st = $("#floatBallState");
+  if (!btn) return;
+  btn.textContent = enabled ? "已开启 · 点击关闭" : "开启悬浮窗";
+  btn.classList.toggle("off", !enabled);
+  st.textContent = !supported ? "状态：当前环境不支持（仅 Windows 电脑版可用）"
+    : enabled ? (running ? "状态：悬浮球运行中 · 单击小球打开 AI 助手，右键小球退出"
+                          : "状态：已开启但悬浮球未运行（重启应用后自动出现）")
+    : "状态：未开启";
+}
+async function refreshFloatBall() {
+  if (window.AndroidBridge) {   // Android 共用同一前端, 悬浮窗是桌面专属
+    $("#floatBallSec").classList.add("hidden");
+    return;
+  }
+  try {
+    const d = await api("/api/floatball");
+    applyFloatBallBtn(d.enabled, d.running, d.supported);
+  } catch (_) {}
+}
+$("#floatBallToggle").onclick = async () => {
+  const btn = $("#floatBallToggle");
+  const on = !btn.classList.contains("off");
+  try {
+    const d = await api("/api/floatball", { method: "POST", body: { enabled: !on } });
+    applyFloatBallBtn(!on, d.running, d.supported);
+    if (d.supported) toast(!on ? "悬浮球已出现在屏幕上" : "悬浮窗已关闭");
+    if (!on && d.supported) {   // 拉起后复查: 进程闪退(如缺 tkinter)给出提示
+      setTimeout(async () => {
+        try {
+          const s = await api("/api/floatball");
+          applyFloatBallBtn(s.enabled, s.running, s.supported);
+          if (s.enabled && !s.running) toast("悬浮球启动失败，请重启应用后再试", { warn: true });
+        } catch (_) {}
+      }, 1500);
+    }
+  } catch (e) {
+    toast("操作失败：" + (e.message || e), { warn: true });
+  }
+};
+
 $("#aiMainToggle").onclick = async () => {
   const on = !(aiModeVals.ai_enabled === "1");
   await api("/api/settings", { method: "POST", body: { ai_enabled: on ? "1" : "0" } });
