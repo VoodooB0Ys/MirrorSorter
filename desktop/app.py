@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.2.6.2a)
+洞鉴虚明 · 基础版 (v0.2.8.0a)
 =========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -14,14 +14,18 @@
     开启 引战/低质 评分过滤 + 推荐理由 + AI 聊天; 未配置时一切照常可用
   - 模式档位: 严格/标准/宽松(引战剔除阈值)
   - 只存「标题+作者+封面+热度+链接」元数据, 不搬运内容
+  - AI 悬浮窗(仅电脑版): 屏幕常悬浮球 → 对话窗提供「验证真实性」(联网取证判真伪)
+    与「生成回怼」(联网找反驳证据, 生成简洁刻薄的回怼)两个选项卡
 """
 import base64
 import collections
 import hashlib
 import html
+import html.parser
 import http.cookiejar
 import json
 import os
+import queue
 import random
 import re
 import shutil
@@ -41,9 +45,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORTS = (8000, 8010, 8020)
 PAGE_LEASE_GRACE_SECONDS = 3
+PAGE_LEASE_EXPIRE_SECONDS = 150   # 租约心跳超时: 兼容后台隐藏页被节流到~1分钟的定时器
 _SERVER = None
 _SHUTDOWN_REQUESTED = threading.Event()
 _PAGE_LEASES = set()
+_PAGE_LEASE_LAST = {}    # token -> 最后一次存活心跳时间(看门狗据此识别"没发出leaving的死亡页面")
 _PAGE_LEASE_LOCK = threading.Lock()
 _PAGE_LEASE_GENERATION = 0
 CACHE_TTL = 300          # B站数据缓存 5 分钟
@@ -239,6 +245,13 @@ DEFAULTS = {
     "explore_boost_ts": "0",  # 探索模式(聊天指令): 生效截止时间戳(0=未启用)
     "scorer_v": "0",          # 评分器版本(升级新维度时一次性标记)
     "disclaimer_version": "", # 用户已确认的免责声明版本
+    "float_ball": "0",        # AI 悬浮窗(仅电脑版): 1=屏幕常驻悬浮球, 点击展开 AI 验证/回怼对话面板
+    "float_ball_accent": "",  # 悬浮球强调色(主界面切换强调色时推送; 空=默认粉)
+    "float_ball_light": "0",  # 悬浮球浅色主题(跟随主界面深浅主题)
+    "assist_think": "标准",   # 悬浮窗思考档位: 快/标准/深挖(输出额度+推理提示)
+    "assist_savage": "毒舌",  # 悬浮窗刻薄程度: 温和/毒舌/阴阳(回怼语气)
+    "assist_len": "中",       # 悬浮窗回复字数: 短/中/长(可粘贴回复的长度档)
+    "assist_fallacy": "1",    # 悬浮窗谬误分析增强: 1=验证/回怼时自动点名对方话术中的逻辑谬误
 }
 
 
@@ -2963,9 +2976,18 @@ def ai_on():
     return sget("ai_enabled") != "0" and ai_ok()
 
 
+_COST_TL = threading.local()   # 当前请求累计的 token 用量(供 /api/ai/assist 回报本次花费)
+
+
 def record_usage(usage):
     if not usage:
         return
+    try:   # 线程内累计: 悬浮窗请求结束时把本次花费回传给前端显示
+        _COST_TL.in_tokens = getattr(_COST_TL, "in_tokens", 0) + usage.get("prompt_tokens", 0)
+        _COST_TL.out_tokens = getattr(_COST_TL, "out_tokens", 0) + usage.get("completion_tokens", 0)
+        _COST_TL.calls = getattr(_COST_TL, "calls", 0) + 1
+    except Exception:
+        pass
     try:
         with _db_lock:
             # IFNULL: 行可能由 bump_stats 先建(NULL), 直接相加会永远 NULL
@@ -2988,9 +3010,9 @@ def llm_body(messages, max_tokens, temperature=0.3):
     }).encode("utf-8")
 
 
-def call_llm(messages, max_tokens=1200):
+def call_llm(messages, max_tokens=1200, temperature=0.3):
     """调用 OpenAI 兼容接口, 返回 (content, usage) 或抛异常。"""
-    body = llm_body(messages, max_tokens)
+    body = llm_body(messages, max_tokens, temperature)
     req = urllib.request.Request(
         sget("ai_base").rstrip("/") + "/chat/completions", data=body,
         headers={"Content-Type": "application/json",
@@ -3040,6 +3062,717 @@ def llm_stream(messages, max_tokens=1200, on_reasoning=None):
             if c:
                 yield c
     record_usage(usage)
+
+
+# ---------------------------------------------------------------- 联网证据: 事实核查 / 回怼 (AI 悬浮窗)
+
+_ASSIST_MAX_TEXT = 2000    # 待核查/回怼文本长度上限(防超长粘贴撑爆请求)
+_SEARCH_TTL = 1800         # 搜索结果缓存 30 分钟(同一问题反复查不重复出网)
+_SEARCH_CACHE = {}         # query -> (ts, results)
+_EVIDENCE_X = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ev")   # 网页正文抓取池
+
+_UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+# 域名可信度分级: high=权威(政府/教育/主流媒体/学术), mid=可靠(门户/百科), low=论坛自媒体(仅参考)
+_CRED_HIGH = (".gov.cn", ".gov", ".edu.cn", ".edu", "who.int", "un.org",
+              "xinhuanet.com", "people.com.cn", "cctv.com", "thepaper.cn",
+              "caixin.com", "chinanews.com", "gmw.cn", "ce.cn", "reuters.com",
+              "apnews.com", "nature.com", "science.org", "wikipedia.org",
+              "britannica.com", "bbc.com", "gov.uk")
+_CRED_MID = ("baike.baidu.com", "zhihu.com", "163.com", "sina.com.cn",
+             "sohu.com", "qq.com", "ifeng.com", "bjnews.com.cn",
+             "nationalgeographic.com", "scientificamerican.com", "cnki.net")
+_CRED_LOW = ("baijiahao.baidu.com", "tieba.baidu.com", "weibo.com", "weibo.cn",
+             "zhidao.baidu.com", "douyin.com", "toutiao.com", "bilibili.com",
+             "xiaohongshu.com", "facebook.com", "twitter.com", "x.com", "reddit.com",
+             "360kuai.com", "k.sina.com.cn")   # 后两个: 内容农场/自媒体转载池
+_CRED_LABEL = {"high": "权威", "mid": "可靠", "low": "参考"}
+
+# 营销号标题特征: 命中即降级为「参考」
+_SPAM_TITLE_RE = re.compile(
+    r"震惊|惊呆|吓死|速看|删前|转疯|99%的人|太可怕|细思极恐|看完惊|"
+    r"网友.{0,4}亮了|太意外|紧急提醒|赶紧看|必看|惊魂|吓坏了")
+
+
+def domain_cred(url):
+    """域名可信度: 返回 high/mid/low。"""
+    host = urllib.parse.urlparse(url).netloc.lower()
+    if not host:
+        return "low"
+    for pool, val in ((_CRED_HIGH, "high"), (_CRED_MID, "mid"), (_CRED_LOW, "low")):
+        for d in pool:
+            if host == d or host.endswith("." + d):
+                return val
+    return "mid"
+
+
+def _http_get_text(url, timeout=10):
+    """带浏览器 UA 的 GET, 返回解码后的文本(GBK/UTF-8 自适应)。只读前 600KB。"""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": _UA_BROWSER,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read(600000)
+    head = raw[:2048].decode("ascii", "replace").lower()
+    enc = "gb18030" if ("gb2312" in head or "gbk" in head or "gb18030" in head) else "utf-8"
+    return raw.decode(enc, "replace")
+
+
+def _strip_tags(fragment):
+    return html.unescape(re.sub(r"<[^>]+>", "", fragment)).strip()
+
+
+def search_soe(query, n=6):
+    """360 搜索(国内网络最稳, 中文查询不截断)。结果带 data-mdurl=真实链接, 免解跳转。"""
+    try:
+        page = _http_get_text("https://www.so.com/s?" + urllib.parse.urlencode(
+            {"q": query, "rn": str(n)}), timeout=8)
+    except Exception:
+        return []
+    out = []
+    anchors = [(m.start(), m.end(), m.group(0)) for m in
+               re.finditer(r"<h3[^>]*>\s*<a[^>]*>.*?</a>\s*</h3>", page, re.S)]
+    for pos, end, tag in anchors:
+        md = re.search(r'data-mdurl="([^"]+)"', tag)
+        hr = re.search(r'href="([^"]+)"', tag)
+        u = html.unescape((md.group(1) if md else (hr.group(1) if hr else ""))).strip()
+        if not u.startswith("http") or "so.com/link" in u:
+            continue   # 无真实链接的跳转链/广告位不收
+        ti = re.search(r"<a[^>]*>(.*?)</a>", tag, re.S)
+        if not ti:
+            continue
+        nxt = next((p for p, _e, _t in anchors if p > pos), len(page))
+        seg = page[end:nxt]
+        ab = re.search(r'class="[^"]*res-desc[^"]*"[^>]*>(.*?)(?:</div>|</p>|</span>)', seg, re.S)
+        out.append({"title": _strip_tags(ti.group(1)), "url": u,
+                    "snippet": _strip_tags(ab.group(1))[:200] if ab else ""})
+        if len(out) >= n:
+            break
+    return out
+
+
+def search_bing(query, n=6):
+    """Bing 网页搜索(HTML 解析, 免 key)。失败/被风控返回 []。"""
+    try:
+        page = _http_get_text("https://www.bing.com/search?" + urllib.parse.urlencode(
+            {"q": query, "count": str(n), "mkt": "zh-CN"}), timeout=8)
+    except Exception:
+        return []
+    out = []
+    for m in re.finditer(r'<li class="b_algo"[^>]*>(.*?)</li>', page, re.S):
+        block = m.group(1)
+        a = (re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+             or re.search(r'<a[^>]+href="(http[^"]+)"[^>]*>(.*?)</a>', block, re.S))
+        if not a:
+            continue
+        u = html.unescape(a.group(1)).strip()
+        if not u.startswith("http"):
+            continue   # 相对链接/内站跳转不收
+        p = re.search(r"<p[^>]*>(.*?)</p>", block, re.S)
+        out.append({"title": _strip_tags(a.group(2)), "url": u,
+                    "snippet": _strip_tags(p.group(1)) if p else ""})
+        if len(out) >= n:
+            break
+    return out
+
+
+def search_ddg(query, n=6):
+    """DuckDuckGo Lite 兜底搜索(Bing 被风控时用)。失败返回 []。"""
+    try:
+        page = _http_get_text("https://lite.duckduckgo.com/lite/?" +
+                              urllib.parse.urlencode({"q": query}), timeout=8)
+    except Exception:
+        return []
+    out = []
+    anchors = [(m.start(), m.end(), html.unescape(m.group(1)), m.group(2))
+               for m in re.finditer(r'<a[^>]+href="(http[^"]+)"[^>]*>(.*?)</a>', page, re.S)]
+    snips = [(m.start(), _strip_tags(m.group(1)))
+             for m in re.finditer(r'class="result-snippet"[^>]*>(.*?)</td>', page, re.S)]
+    for pos, _end, u, title_html in anchors:
+        if "duckduckgo.com" in u:   # 站内跳转: 解包真实目标
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
+            u = (q.get("uddg") or [""])[0]
+            if not u:
+                continue
+        if not u.startswith("http"):
+            continue
+        nxt = next((a_pos for a_pos, *_ in anchors if a_pos > pos), len(page))
+        snip = next((t for s_pos, t in snips if pos < s_pos < nxt), "")
+        out.append({"title": _strip_tags(title_html), "url": u, "snippet": snip})
+        if len(out) >= n:
+            break
+    return out
+
+
+def web_search(query, n=8):
+    """360 → Bing → DDG 三级兜底(凑不满 3 条才降级下一家); 合并去重 + 30 分钟缓存。
+    360: 国内网络中文最稳; Bing: 海外/英文; DDG: 最后保险(部分网络不可达)。"""
+    key = query.strip()[:120]
+    now = time.time()
+    hit = _SEARCH_CACHE.get(key)
+    if hit and now - hit[0] < _SEARCH_TTL:
+        return [dict(r) for r in hit[1]]
+
+    def merge(results, more):
+        got = {urllib.parse.urlparse(r["url"]).netloc + urllib.parse.urlparse(r["url"]).path
+               for r in results}
+        for r in more:
+            u = urllib.parse.urlparse(r["url"])
+            k = u.netloc + u.path
+            if k not in got:
+                got.add(k)
+                results.append(r)
+        return results
+
+    results = search_soe(query, n)
+    if len(results) < 3:
+        results = merge(results, search_bing(query, n))
+    if len(results) < 3:
+        results = merge(results, search_ddg(query, n))
+    results = [r for r in results
+               if r["url"].startswith("http") and "duckduckgo.com" not in r["url"]][:n]
+    if len(_SEARCH_CACHE) > 64:   # 防膨胀: 超限清掉最旧一半
+        olds = sorted(_SEARCH_CACHE, key=lambda k: _SEARCH_CACHE[k][0])[:32]
+        for k in olds:
+            _SEARCH_CACHE.pop(k, None)
+    _SEARCH_CACHE[key] = (now, results)
+    return [dict(r) for r in results]
+
+
+class _TextExtract(html.parser.HTMLParser):
+    """网页正文提取: 跳过 script/style/nav 等噪音标签, 收集可见文本与 <title>。"""
+    SKIP = {"script", "style", "noscript", "nav", "footer", "header", "aside", "svg"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts, self.title = [], ""
+        self._skip = self._in_title = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self._skip += 1
+        elif tag == "title":
+            self._in_title = 1
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self._skip:
+            self._skip -= 1
+        elif tag == "title":
+            self._in_title = 0
+
+    def handle_data(self, data):
+        t = data.strip()
+        if not t:
+            return
+        if self._in_title:
+            self.title = (self.title + " " + t).strip()
+        elif not self._skip:
+            self.parts.append(t)
+
+
+def fetch_page_text(url, max_chars=3200):
+    """抓网页正文纯文本(容错), 非 HTML/失败返回 ""。"""
+    if not url.startswith(("http://", "https://")):
+        return ""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": _UA_BROWSER,
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if ctype and not any(x in ctype for x in ("html", "xml", "text/plain")):
+                return ""
+            raw = resp.read(500000)
+        head = raw[:2048].decode("ascii", "replace").lower()
+        enc = "gb18030" if ("gb2312" in head or "gbk" in head or "gb18030" in head) else "utf-8"
+        page = raw.decode(enc, "replace")
+    except Exception:
+        return ""
+    p = _TextExtract()
+    try:
+        p.feed(page)
+    except Exception:
+        pass
+    return re.sub(r"\s{2,}", " ", " ".join(p.parts)).strip()[:max_chars]
+
+
+def gather_evidence(claim, extra_queries=(), per_query=6, want_pages=4, max_evidence=10):
+    """围绕说法联网搜索并抓正文, 证据按可信度排序(权威在前)。
+    全程容错: 搜不到/抓不到只返回已得部分, 完全失败返回 []。"""
+    queries = [claim.strip()[:64]]
+    for q in extra_queries:
+        q = (q or "").strip()
+        if q and q not in queries:
+            queries.append(q[:64])
+    results, seen = [], set()
+    for q in queries:
+        for r in web_search(q, per_query):
+            u = urllib.parse.urlparse(r["url"])
+            k = u.netloc + u.path
+            if k in seen:
+                continue
+            seen.add(k)
+            r["_cred"] = domain_cred(r["url"])
+            r["_cred_label"] = _CRED_LABEL[r["_cred"]]
+            results.append(r)
+    if not results:
+        return []
+    rank = {"high": 0, "mid": 1, "low": 2}
+    for r in results:
+        if _SPAM_TITLE_RE.search(r["title"] + " " + r.get("snippet", "")):
+            r["_cred"], r["_cred_label"] = "low", "参考"   # 营销号腔标题 → 降级
+    results.sort(key=lambda r: rank.get(r["_cred"], 3))
+    solid = [r for r in results if r["_cred"] != "low"]
+    if len(solid) >= 3:
+        results = solid   # 权威/可靠来源够用时, 低可信(含营销号)整个剔除
+    results = results[:max_evidence]
+    # 并发抓正文: 优先权威/可靠来源; 全是低可信时也抓前 2 条(有总比没有强)
+    todo = [r for r in results if r["_cred"] != "low"][:want_pages] or results[:2]
+
+    def _grab(r):
+        r["page"] = fetch_page_text(r["url"])
+
+    list(_EVIDENCE_X.map(_grab, todo))
+    return results
+
+
+def evidence_block(evidence):
+    """把证据排成给 LLM 看的文本块(带编号, 供回复引用)。"""
+    lines = []
+    for i, r in enumerate(evidence, 1):
+        r["id"] = "E%d" % i
+        site = urllib.parse.urlparse(r["url"]).netloc
+        seg = "[%s] (%s·%s) %s" % (r["id"], r["_cred_label"], site, r["title"])
+        if r.get("snippet"):
+            seg += "\n摘要: " + r["snippet"][:160]
+        if r.get("page"):
+            seg += "\n正文摘录: " + r["page"][:1200]
+        lines.append(seg)
+    return "\n\n".join(lines)
+
+
+def llm_json(content):
+    """从 LLM 回复中提取第一个 JSON 对象(容忍代码围栏/前后废话)。失败抛 ValueError。"""
+    c = (content or "").strip()
+    m = re.search(r"\{", c)
+    if not m:
+        raise ValueError("回复中没有 JSON")
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(c[m.start():])
+    except Exception as e:
+        raise ValueError("JSON 解析失败: %s" % e)
+    if not isinstance(obj, dict):
+        raise ValueError("JSON 不是对象")
+    return obj
+
+
+# ---------------- 对线话术模板库(回怼润色参考) ----------------
+
+_BUILTIN_TALK = [
+    "就这？研究了半天就得出这结论？",
+    "按你这逻辑，那不是更说不过去？",
+    "数字都摆在这儿了，建议背完再来对线。",
+    "不愧是你，这种角度都能圆回来。",
+    "先查查资料再发言，不难。",
+    "这话早就被辟谣了，二手传播还这么理直气壮。",
+    "懂了，你比专业机构还专业。",
+    "您这逻辑，建议申请专利。",
+    "一看就是没查过资料，全凭一张嘴。",
+    "行行行，你赢了，事实算什么。",
+    "造谣一张嘴，辟谣跑断腿，说的就是你这种。",
+    "自信是好事，但盲信数据会打脸。",
+    "拿个例当规律，这理解能力我服气。",
+    "别人的科普你看不进，你自己的脑补倒是全信。",
+    "结论先行再找理由，这叫预设立场。",
+    "建议把这段话裱起来，当反面教材。",
+    "绷不住，这也能有人信。",
+    "就离谱，这逻辑自己就闭环了。",
+    "你开心就好，反正确实没人拦着你。",
+    "这结论是怎么蹦出来的，给我也整一个。",
+    "参照系不同结论就是不同，你拿地球当参照物，太阳不也绕着地球转。",
+]
+
+_TALK_CACHE = {"ts": 0.0, "templates": []}
+_TALK_TTL = 86400   # 话术模板联网采集结果缓存 24 小时
+
+
+def fetch_talk_templates():
+    """联网采集对线话术模板(从讨论页正文里抽 8~60 字的短句), 24h 缓存。
+    失败/采不到返回 [](回退用内置库)。"""
+    now = time.time()
+    if _TALK_CACHE["templates"] and now - _TALK_CACHE["ts"] < _TALK_TTL:
+        return _TALK_CACHE["templates"]
+    pool = []
+    for q in ("网络对线 阴阳怪气 话术模板", "怼人语录 高赞 简短", "对线语录 回复 模板"):
+        try:
+            results = web_search(q, 6)
+        except Exception:
+            results = []
+        for r in results:
+            page = fetch_page_text(r["url"], max_chars=4000)
+            if not page:
+                continue
+            for seg in re.split(r"[。！？\n]", page):
+                seg = seg.strip(" \t·-—…「」【】“”\"'、,，;；")
+                if 8 <= len(seg) <= 60 and not re.search(r"http|www\.|广告|关注|订阅|下载|APP", seg):
+                    if seg not in pool:
+                        pool.append(seg)
+            if len(pool) >= 48:
+                break
+        if len(pool) >= 48:
+            break
+    if pool:
+        _TALK_CACHE.update(ts=now, templates=pool[:60])
+        return pool[:60]
+    return []
+
+
+def decompose_claim(text):
+    """把言论拆成可验证的事实论点, 每个论点配一个搜索词(逐个击破的基础)。
+    短句(≤12字)只有一层意思: 不拆不脑补, 直接按原文单论点处理; 长句才走 LLM 拆解。"""
+    t = text.strip()
+    if len(t) <= 12:
+        return [{"point": t[:60], "query": ""}]
+    if not ai_on():
+        return []
+    try:
+        content, _ = call_llm([
+            {"role": "system", "content": "你是论点拆解器, 只输出JSON对象, 不要任何解释。"},
+            {"role": "user", "content":
+                "把下面这段言论拆成2-4个独立的事实论点(剥掉修辞和情绪, 只留可验证的事实主张, "
+                "按原意保留错误主张不要纠正), 并给每个论点配一个适合搜索引擎查证的中文查询词:\n%s\n\n"
+                "硬性要求: 论点必须是对原话的直接拆分, 严禁添加原话里没有的主张、"
+                "严禁脑补对方的其他观点; 原话只有一个主张就只输出1个论点。\n"
+                "只输出JSON: {\"claims\": [{\"point\": \"事实论点(简短陈述句)\", \"query\": \"搜索词(不超过20字)\"}]}"
+                % text[:_ASSIST_MAX_TEXT]}],
+            max_tokens=600, temperature=0.2)
+        res = llm_json(content)
+        out = []
+        for c in (res.get("claims") or [])[:4]:
+            p = str(c.get("point") or "").strip()[:120]
+            q = str(c.get("query") or "").strip()[:40]
+            if p:
+                out.append({"point": p, "query": q})
+        return out
+    except Exception:
+        return []   # 拆解失败不致命: 后续按原文整体检索
+
+
+def assist_plan(text):
+    """论点拆解 + 汇总搜索词(每论点1个; 不足2个时补一条辟谣向兜底)。返回 (claims, queries)。"""
+    claims = decompose_claim(text)
+    queries = [c["query"] for c in claims if c.get("query")]
+    if len(queries) < 2:
+        queries.append(text.strip()[:30] + " 辟谣 真相")
+    return claims, queries[:4]
+
+
+def _norm_evidence(evidence, ids=None):
+    """规整成前端要展示的证据卡: ids 给定则只留被引用的(一个没引则全留)。"""
+    out = []
+    for i, r in enumerate(evidence, 1):
+        if ids and "E%d" % i not in ids:
+            continue
+        out.append({"id": "E%d" % i, "title": r["title"], "url": r["url"],
+                    "site": urllib.parse.urlparse(r["url"]).netloc,
+                    "cred": r["_cred"], "cred_label": r["_cred_label"],
+                    "snippet": (r.get("snippet") or "")[:220]})
+    return out
+
+
+def _assist_llm_json(system, user, max_tokens, temperature):
+    """要求 LLM 按 JSON 回答: 首次解析失败(常见于推理模型把输出额度花在思考上导致
+    正文截断)→ 加大额度并强调格式重试一次; 仍失败抛 ValueError, 由调用方走纯文本兜底。"""
+    last = None
+    for i, mt in enumerate((max_tokens, max_tokens + 1000)):
+        msg = user if i == 0 else user + "\n\n再次强调: 只输出JSON对象本身, 不要任何解释文字, 不要代码块围栏。"
+        try:
+            content, _ = call_llm([{"role": "system", "content": system},
+                                   {"role": "user", "content": msg}],
+                                  max_tokens=mt, temperature=temperature)
+            return llm_json(content)
+        except ValueError as e:
+            last = e
+    raise last
+
+
+def _verify_from_text(content, evidence):
+    """纯文本兜底解析核查结果: 首行「结论：真实/虚假/存疑（置信度NN%）」, 其后 - 开头理由行。"""
+    lines = [l.strip() for l in (content or "").splitlines() if l.strip()]
+    first = lines[0] if lines else ""
+    if "虚假" in first[:24] or "不实" in first[:24]:
+        verdict = "false"
+    elif "真实" in first[:24] or "属实" in first[:24]:
+        verdict = "true"
+    else:
+        verdict = "uncertain"
+    m = re.search(r"(\d{1,3})\s*%", first)
+    try:
+        conf = max(0, min(100, int(m.group(1))))
+    except Exception:
+        conf = 60
+    reasons = []
+    for l in lines[1:]:
+        l = re.sub(r"^[-•·*\d.、)\s]+", "", l).strip()
+        if l and not l.startswith(("【", "证据")):
+            reasons.append(l[:300])
+        if len(reasons) >= 4:
+            break
+    return {"verdict": verdict, "confidence": conf,
+            "summary": re.sub(r"[（(]?置信度\d{1,3}%[）)]?", "", first).strip()[:200],
+            "reasons": reasons, "evidence_used": [], "offline": not evidence}
+
+
+def _rebut_from_text(content, evidence):
+    """纯文本兜底解析回怼: 每行一条可粘贴回复。"""
+    lines = [re.sub(r"^[-•·*\d.、)\s]+", "", l).strip()[:100]
+             for l in (content or "").splitlines() if l.strip()]
+    refs = _norm_evidence(evidence)
+    return {"points": [{"point": "", "reply": t, "basis": "", "evidence": refs[:2]}
+                       for t in lines if len(t) >= 4][:4],
+            "finale": "", "stance_note": "", "offline": not evidence}
+
+
+# ---------------- 反八股正则: 识别/清洗回复里的 AI 腔(网上常见 AI 味检测式样) ----------------
+
+_AIFLAVOR_SUB = [   # (正则, 替换): 套话删除或换成口语
+    (r"^(首先|其次|再者|再次|最后)[，,]\s*", ""),
+    (r"值得注意的是[，,]?\s*", ""), (r"需要注意的是[，,]?\s*", ""),
+    (r"不得不说[，,]?\s*", ""), (r"不可否认[，,]?\s*", ""),
+    (r"毫无疑问[，,]?\s*", ""), (r"显而易见[，,]?\s*", "明摆着，"),
+    (r"众所周知[，,]?\s*", "谁都"),
+    (r"总的来说[，,]?\s*", "说白了，"), (r"总而言之[，,]?\s*", "说到底，"),
+    (r"综上所述[，,]?\s*", "说到底，"), (r"归根结底[，,]?\s*", "说到底，"),
+    (r"简而言之[，,]?\s*", "说白了，"), (r"换句话说[，,]?\s*", "说白了，"),
+    (r"事实上[，,]?\s*", "其实"), (r"某种程度上[，,]?\s*", "多少"),
+    (r"在这个[^，。]{0,10}的时代[，,]?\s*", ""), (r"从[^，。]{0,8}角度(来看|而言)[，,]?\s*", ""),
+    (r"——+", "，"), (r"─+", "，"),
+]
+_AIFLAVOR_DETECT = re.compile(
+    r"首先|其次|再者|值得注意的是|需要注意的是|不得不说|不可否认|毫无疑问|显而易见|"
+    r"总的来说|总而言之|综上所述|归根结底|简而言之|换句话说|事实上|某种程度上|"
+    r"众所周知|在这个[^，。]{0,10}的时代|从[^，。]{0,8}角度|一方面|另一方面|毋庸置疑|"
+    r"深度剖析|一针见血|让我们|普罗大众|这不仅仅是")
+
+
+def _deflavor(text):
+    """反八股清洗: 套话替换/删除 + 引号剥离(真人打评论不加引号)。"""
+    for pat, rep in _AIFLAVOR_SUB:
+        text = re.sub(pat, rep, text)
+    return re.sub(r"[「」『』“”‘’\"']", "", text).strip()
+
+
+def _claims_block(claims):
+    """把拆解出的论点排成提示词清单。"""
+    return "\n".join("%d. %s" % (i, c["point"]) for i, c in enumerate(claims, 1)) if claims else ""
+
+
+def assist_result(mode, text, evidence, claims=()):
+    """基于已收集的证据+论点拆解调 LLM 生成结构化结果, 返回 (result, 证据卡列表)。
+    思考/刻薄/字数档位从设置读取(面板 ⚙ 调节, 服务端持久化)。"""
+    cb = _claims_block(claims)
+    think = sget("assist_think")
+    savage = sget("assist_savage")
+    rlen = sget("assist_len")
+    mt_mul = {"快": 0.6, "标准": 1.0, "深挖": 1.5}.get(think, 1.0)
+    think_line = {"快": "\n(用户选了快速模式: 直接给结论, 不要展开推理过程。)",
+                  "深挖": "\n(用户选了深挖模式: 多角度交叉验证每条证据, 谨慎权衡后再下结论。)"}.get(think, "")
+    savage_line = {"温和": "语气克制理性, 平静指出错误即可, 不讽刺。",
+                   "阴阳": "大量使用反讽与阴阳怪气(假装夸赞、捧杀式讽刺), 刻薄值拉满。"}.get(
+        savage, "犀利刻薄带讽刺。")
+    len_line = {"短": "每条不超过25字, 一句话。",
+                "中": "每条50字左右, 1~2句话。",
+                "长": "每条严格90字左右, 2~3句话, 至少把一个证据里的具体数字或名称写进句子, 宁长勿短。"
+                }.get(rlen, "每条50字左右, 1~2句话。")
+    fallacy_on = sget("assist_fallacy") == "1"
+    fallacy_note = ("若说法存在明显逻辑谬误(偷换概念/假两难/以偏概全/诉诸权威/滑坡谬误/稻草人等), "
+                    "在 reasons 里顺口点名谬误, 并把谬误名写全 fallacies 字段。" if fallacy_on
+                    else "fallacies 字段恒为空数组。")
+    if mode == "verify":
+        system = ("你是严谨的事实核查员。只依据给出的网络证据判断说法真伪, 不臆测; "
+                  "证据不足或互相矛盾时必须判存疑。只输出一个JSON对象, 不要输出任何其它文字。")
+        cseg = ("【说法拆解出的分论点】\n%s\n\n" % cb) if cb else ""
+        ask = ("判断该说法整体真伪, 并对每个分论点分别给出判定。只输出JSON: "
+               "{\"verdict\": \"true|false|uncertain\", \"confidence\": 0到100的整数(判定置信度), "
+               "\"summary\": \"一句话总结论\", \"reasons\": [\"总体理由(引用证据编号如[E1])\"共2到4条], "
+               "\"claims\": [{\"point\": \"分论点原文\", \"check\": \"true|false|uncertain\", "
+               "\"note\": \"一句话判定依据(引用证据编号)\"}], "
+               "\"fallacies\": [\"谬误名\"], "
+               "\"evidence_used\": [\"E1\"等实际使用的证据编号]}。"
+               "注意: 判true就给证明其为真的理由, 判false就给证明其为假的理由, "
+               "理由必须能在证据中找到依据; 分论点没有对应证据时判 uncertain。" + fallacy_note)
+        if evidence:
+            user = ("【待核查说法】\n%s\n\n%s【网络证据】(可信度: 权威>可靠>参考; "
+                    "参考级为自媒体/论坛, 不得作为结论的唯一依据)\n%s\n\n%s"
+                    % (text[:_ASSIST_MAX_TEXT], cseg, evidence_block(evidence), ask))
+        else:
+            user = ("【待核查说法】\n%s\n\n%s(网络搜索暂不可用, 请基于你已有的知识谨慎判断, "
+                    "证据不足就判 uncertain)\n只输出JSON: {\"verdict\": \"true|false|uncertain\", "
+                    "\"confidence\": 0到100的整数, \"summary\": \"一句话结论\", "
+                    "\"reasons\": [\"理由\"共2到4条], "
+                    "\"claims\": [{\"point\": \"分论点\", \"check\": \"true|false|uncertain\", \"note\": \"一句话\"}], "
+                    "\"evidence_used\": []}" % (text[:_ASSIST_MAX_TEXT], cseg))
+        try:
+            res = _assist_llm_json(system, user + think_line, int(2000 * mt_mul), 0.2)
+        except ValueError:
+            # JSON 两次都没按格式来 → 纯文本兜底(保证总有结果)
+            fb = ("【待核查说法】\n%s\n\n%s\n\n改用纯文本回答: 第一行必须是「结论：真实」「结论：虚假」"
+                  "或「结论：存疑」，并附（置信度NN%%）与一句话说明; 随后用2-4行、每行以-开头给出理由"
+                  "(不要贴链接)。不要输出JSON。"
+                  % (text[:_ASSIST_MAX_TEXT],
+                     ("【网络证据】\n" + evidence_block(evidence)) if evidence
+                     else "(网络搜索暂不可用, 请谨慎判断)"))
+            content, _ = call_llm([{"role": "system", "content": system},
+                                   {"role": "user", "content": fb}],
+                                  max_tokens=1000, temperature=0.2)
+            res = _verify_from_text(content, evidence)
+        verdict = res.get("verdict")
+        res["verdict"] = verdict if verdict in ("true", "false", "uncertain") else "uncertain"
+        try:
+            res["confidence"] = max(0, min(100, int(res.get("confidence") or 60)))
+        except Exception:
+            res["confidence"] = 60
+        res["summary"] = str(res.get("summary") or "").strip()[:200]
+        res["reasons"] = [str(x).strip()[:300] for x in (res.get("reasons") or []) if str(x).strip()][:5]
+        claims_out = []
+        for c in (res.get("claims") or [])[:4]:
+            chk = c.get("check")
+            claims_out.append({"point": str(c.get("point") or "").strip()[:120],
+                               "check": chk if chk in ("true", "false", "uncertain") else "uncertain",
+                               "note": str(c.get("note") or "").strip()[:200]})
+        res["claims"] = claims_out
+        res["fallacies"] = ([str(x).strip()[:20] for x in (res.get("fallacies") or [])
+                             if str(x).strip()][:4] if fallacy_on else [])
+        refs = _norm_evidence(evidence, set(res.get("evidence_used") or []) or None)
+        res["evidence_used"] = [e["id"] for e in refs]
+        res["offline"] = not evidence
+        return res, refs
+    # rebut: 逐个击破, 但产出是「能直接粘贴当评论的回复」, 不是分析文
+    system = ("你是评论区抬杠回复生成器: 产出能直接粘贴到评论区当回复的文字。口语、有信息量; "
+              "语气要求: %s 禁止脏话、歧视、攻击外貌与家人、编造数据。"
+              "只输出一个JSON对象, 不要输出任何其它文字。" % savage_line)
+    cseg = ("【言论拆解出的论点】\n%s\n\n" % cb) if cb else ""
+    fallacy_line = ("若论点有明显逻辑谬误: 整版最多给 1 条 reply 点破谬误名(口语带过, 如:这不就假两难吗), "
+                    "该条 fallacy 字段写谬误名, 其余条目一律留空字符串——条条点谬误太像AI。\n") if fallacy_on else ""
+    talk_pool = fetch_talk_templates()
+    sampled = (random.sample(talk_pool, min(8, len(talk_pool))) if talk_pool else []) + \
+        random.sample(_BUILTIN_TALK, 5)
+    random.shuffle(sampled)
+    talk_block = ""
+    if sampled:
+        talk_block = ("【参考对线模板】(只借鉴句式和语气, 禁止照抄原句, 事实必须来自上面的证据)\n"
+                      + "\n".join("- " + t for t in sampled) + "\n\n")
+    ask = ("逐个击破对方每个论点, 每个论点给一条能直接当评论发出去的回复:\n"
+           "- reply 只打对方原话: 从说法本身的漏洞入手(绝对化表述/隐含前提/参照系/适用条件/以偏概全), "
+           "别攻击对方没出示过的证据, 别脑补对方没说过的观点; 你搜到的证据是自己的弹药, 不是对方的罪证\n"
+           "- reply: %s像评论区真人老哥的口吻, 不是写作文; 按参考对线模板润色, 每条换一条路线"
+           "(反问/只摆事实/阴阳怪气/短平快戳一点各来一条), 句子长短要错落\n"
+           "- 去AI味(最重要): 回复里禁止出现任何引号(「」“”‘’统统不要)和书名号——真人打字懒得加引号, "
+           "提到某个词就直接说出来; 套话黑名单(整版合计最多出现1次): 标准的、典型的、压根不是而是、"
+           "谁主张谁举证、建议你、别拿当; 少用顿号列举和破折号长链; "
+           "禁止说教式收尾(建议你/要学会/记住); 允许口语碎片(就离谱/绷不住/这也能信), 别堆烂梗\n"
+           "- 把具体事实(数字/名称/公开常识)自然融进句子里, 别列清单; "
+           "绝对不要出现[E1]这类证据编号——读评论的人看不到编号\n"
+           "- basis: 一句话写这条回复的事实依据(引用证据编号如[E1]), 只给用户自己核实, 不会出现在回复里\n"
+           "- 证据和论点对不上时不要硬扯该证据, 依据写「公开常识/数据」即可\n"
+           "- 戳的是具体错误, 不是纯骂街\n" + fallacy_line +
+           "- 如果这条言论根本没有可回怼的点(正常反馈/客观陈述/感谢/闲聊), 不要硬造: "
+           "只输出 {\"no_target\": true, \"reason\": \"为什么没有可回怼点(一句话)\"}\n"
+           "否则最后给一句 finale: 同样可直接粘贴的总收尾, 不超过30字, 别和正文用同一个句式, 同样不要引号。%s\n"
+           "只输出JSON: {\"points\": [{\"point\": \"对方论点\", \"reply\": \"可粘贴的回复\", "
+           "\"basis\": \"依据(引用[E1])\", \"fallacy\": \"谬误名或空字符串\", "
+           "\"evidence_used\": [\"E1\"]}], "
+           "\"finale\": \"总收尾\", \"stance_note\": \"一句话说明证据整体倾向\"}"
+           ) % (len_line, think_line)
+    if evidence:
+        user = ("【需要回怼的言论】\n%s\n\n%s【网络证据】(可信度: 权威>可靠>参考; "
+                "参考级为自媒体/论坛, 不得作为结论的唯一依据)\n%s\n\n%s%s"
+                % (text[:_ASSIST_MAX_TEXT], cseg, evidence_block(evidence), talk_block, ask))
+    else:
+        user = ("【需要回怼的言论】\n%s\n\n%s%s(网络搜索暂不可用, 基于公开常识逐点回怼)\n%s"
+                % (text[:_ASSIST_MAX_TEXT], cseg, talk_block, ask))
+    try:
+        res = _assist_llm_json(system, user, int(1800 * mt_mul), 0.8)
+    except ValueError:
+        fb = ("【需要回怼的言论】\n%s\n\n%s\n\n改用纯文本回答: 对每个论点输出一条可直接粘贴的评论回复, "
+              "每条1~2句、不超过50字、口语化, 不要编号、不要解释、不要JSON。"
+              % (text[:_ASSIST_MAX_TEXT],
+                 ("【网络证据】\n" + evidence_block(evidence)) if evidence
+                 else "(网络搜索暂不可用, 基于已有知识回怼)"))
+        content, _ = call_llm([{"role": "system", "content": system},
+                               {"role": "user", "content": fb}],
+                              max_tokens=1000, temperature=0.8)
+        res = _rebut_from_text(content, evidence)
+    if res.get("no_target"):   # 模型判定无可回怼: 立即止损, 不再触发任何重试
+        return ({"no_target": True,
+                 "reason": str(res.get("reason") or "这条是正常反馈或客观陈述, 没有可回怼的点").strip()[:200],
+                 "points": [], "finale": "", "stance_note": "", "offline": not evidence},
+                _norm_evidence(evidence))
+
+    def _norm_points(obj):
+        pts = []
+        for p in (obj.get("points") or [])[:5]:
+            reply = str(p.get("reply") or p.get("rebuttal") or p.get("text") or "").strip()[:100]
+            reply = re.sub(r"[「」『』“”‘’\"']", "", reply)   # 真人打评论不加引号, 模型不听话就硬删
+            if not reply:
+                continue
+            ids = set(p.get("evidence_used") or [])
+            pts.append({"point": str(p.get("point") or "").strip()[:120],
+                        "reply": reply,
+                        "basis": str(p.get("basis") or "").strip()[:200],
+                        "fallacy": str(p.get("fallacy") or "").strip()[:20],
+                        "evidence": _norm_evidence(evidence, ids or None)})
+        return pts
+
+    points = _norm_points(res)
+    # 字数档位硬约束: 选了「长」但产出还是一句话 → 带反馈重试一次, 取更长的那版
+    if rlen == "长" and points:
+        avg = sum(len(p["reply"]) for p in points) / len(points)
+        if avg < 45:
+            try:
+                res2 = _assist_llm_json(
+                    system, user + "\n\n你刚才写的回复太短了。重新生成: 每条 reply 严格90字左右、"
+                    "2~3句话, 必须把证据里的具体数字/名称/公开常识写进句子再收尾, 宁长勿短。"
+                    "只输出JSON, 结构不变。", int(2400 * mt_mul), 0.8)
+                pts2 = _norm_points(res2)
+                if pts2 and sum(len(p["reply"]) for p in pts2) / len(pts2) > avg:
+                    points = pts2
+            except ValueError:
+                pass   # 重试失败就保留原结果
+    # 反八股正则: 先替换式清洗, AI腔命中过多(≥2)再带命中清单重写一次
+    hits = 0
+    for p in points:
+        p["reply"] = _deflavor(p["reply"])
+        p["basis"] = _deflavor(p["basis"])
+        hits += len(_AIFLAVOR_DETECT.findall(p["reply"]))
+    if hits >= 2:
+        bad = "、".join(sorted({m for p in points for m in _AIFLAVOR_DETECT.findall(p["reply"])}))[:80]
+        try:
+            res2 = _assist_llm_json(
+                system, user + "\n\n你刚才那版AI八股味太重, 出现了这些腔调: %s。"
+                "重写一版: 像真人随手打的评论, 句式参差、用词具体, 套话黑名单见前文, 字数要求不变。"
+                "只输出JSON, 结构不变。" % bad, int(2000 * mt_mul), 0.8)
+            pts2 = _norm_points(res2)
+            hits2 = 0
+            for p in pts2:
+                p["reply"] = _deflavor(p["reply"])
+                p["basis"] = _deflavor(p["basis"])
+                hits2 += len(_AIFLAVOR_DETECT.findall(p["reply"]))
+            if pts2 and hits2 < hits:
+                points = pts2   # 重写更干净才采纳
+        except ValueError:
+            pass
+    # 论点回填: 模型偷懒没写 point 时, 用拆解出的分论点补上
+    for i, p in enumerate(points):
+        if not p["point"] and i < len(claims):
+            p["point"] = claims[i]["point"]
+    refs = _norm_evidence(evidence)
+    finale = _deflavor(str(res.get("finale") or "")).strip()[:100]
+    return ({"points": points, "finale": finale,
+             "stance_note": str(res.get("stance_note") or "").strip()[:200],
+             "offline": not evidence}, refs)
 
 
 def user_context():
@@ -6647,8 +7380,43 @@ def _page_lease_shutdown_check(generation):
             return
         _SHUTDOWN_REQUESTED.set()
         server = _SERVER
+    float_ball_stop()   # 页面已全部离开: 先收悬浮球(防孤儿进程), 再关停服务
     if server:
         server.shutdown()
+
+
+def _lease_watchdog():
+    """兜底看门狗: 页面异常退出(浏览器崩溃/直接杀进程)发不出 leaving, 租约会永久滞留,
+    服务和悬浮球就都不退。连续两轮(间隔5s)所有租约的存活心跳都超时(宽限150s,
+    兼容后台隐藏页定时器被节流到~1分钟) → 判定页面已消失: 先收球, 再走同一关停出口。"""
+    global _PAGE_LEASE_GENERATION
+    stale_rounds = 0
+    while not _SHUTDOWN_REQUESTED.is_set():
+        time.sleep(5)
+        now = time.time()
+        with _PAGE_LEASE_LOCK:
+            if _SHUTDOWN_REQUESTED.is_set():
+                return
+            expired = bool(_PAGE_LEASES) and all(
+                now - _PAGE_LEASE_LAST.get(t, 0) > PAGE_LEASE_EXPIRE_SECONDS
+                for t in _PAGE_LEASES)
+        stale_rounds = stale_rounds + 1 if expired else 0
+        if stale_rounds < 2:
+            continue   # 复检一轮: 唤醒/节流恢复时页面心跳会立刻续上
+        with _PAGE_LEASE_LOCK:
+            if _SHUTDOWN_REQUESTED.is_set() or any(
+                    now - _PAGE_LEASE_LAST.get(t, 0) <= PAGE_LEASE_EXPIRE_SECONDS
+                    for t in _PAGE_LEASES):
+                continue   # 复检: 期间有页面回来
+            _PAGE_LEASES.clear()
+            _PAGE_LEASE_LAST.clear()
+            _PAGE_LEASE_GENERATION += 1
+            generation = _PAGE_LEASE_GENERATION
+            server = _SERVER
+        float_ball_stop()
+        if server:
+            server.shutdown()
+        return
 
 
 def page_lease_alive(token):
@@ -6656,6 +7424,7 @@ def page_lease_alive(token):
         if _SHUTDOWN_REQUESTED.is_set():
             return False
         _PAGE_LEASES.add(token)
+        _PAGE_LEASE_LAST[token] = time.time()
     return True
 
 
@@ -6665,6 +7434,7 @@ def page_lease_leaving(token):
         if _SHUTDOWN_REQUESTED.is_set():
             return False
         _PAGE_LEASES.discard(token)
+        _PAGE_LEASE_LAST.pop(token, None)
         _PAGE_LEASE_GENERATION += 1
         generation = _PAGE_LEASE_GENERATION
     timer = threading.Timer(PAGE_LEASE_GRACE_SECONDS, _page_lease_shutdown_check, args=(generation,))
@@ -6691,8 +7461,122 @@ def item_by_key(key):
     return json.loads(row[0]) if row else None
 
 
+# ---------------------------------------------------------------- AI 悬浮窗(仅电脑版)
+
+_BALL_LOCK = threading.Lock()
+_BALL_PROC = None   # 悬浮球子进程(独立进程承载 tkinter, 避免在服务线程里跑 GUI)
+
+_BALL_TRANSPARENT = "#010101"   # 悬浮球画布透明键色(近黑, 避开真实配色)
+_BALL_ACCENT = "#fb7299"        # 默认强调色(主界面切换强调色时会推送覆盖)
+
+
+def _ball_pos_path():
+    return os.path.join(DATA_DIR, "float_ball.json")
+
+
+def float_ball_supported():
+    """悬浮窗仅 Windows 桌面可用(需要 tkinter; Android 的 Chaquopy 没有 tkinter)。"""
+    if os.name != "nt":
+        return False
+    try:
+        import tkinter   # noqa: F401  仅探测可用性, 不建窗口
+    except Exception:
+        return False
+    return True
+
+
+def float_ball_running():
+    with _BALL_LOCK:
+        return bool(_BALL_PROC and _BALL_PROC.poll() is None)
+
+
+def float_ball_spawn(port):
+    """拉起悬浮球进程(幂等)。frozen 单文件 exe 直接再入自身。返回是否成功。"""
+    global _BALL_PROC
+    if not float_ball_supported():
+        return False
+    with _BALL_LOCK:
+        if _BALL_PROC and _BALL_PROC.poll() is None:
+            return True
+        cmd = [sys.executable]
+        if not getattr(sys, "frozen", False):
+            cmd.append(os.path.abspath(__file__))
+        cmd += ["--float-ball", str(port)]
+        try:
+            _BALL_PROC = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=0x08000000 if os.name == "nt" else 0)   # CREATE_NO_WINDOW 防闪黑框
+        except Exception:
+            _BALL_PROC = None
+            return False
+        return True
+
+
+def float_ball_stop():
+    """终止悬浮球进程(若在跑)。"""
+    global _BALL_PROC
+    with _BALL_LOCK:
+        p, _BALL_PROC = _BALL_PROC, None
+    if p and p.poll() is None:
+        try:
+            p.terminate()
+            p.wait(timeout=3)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
+def _kill_stale_ball():
+    """清理上次未正常退出遗留的孤儿悬浮球: 按 float_ball.json 里的 pid 定位。
+    tasklist 校验进程映像名(必须是 python 或本应用 exe), 防止 pid 被复用时误杀无辜进程。"""
+    if os.name != "nt":
+        return
+    try:
+        with open(_ball_pos_path(), encoding="utf-8") as f:
+            pid = int(json.load(f).get("pid") or 0)
+    except Exception:
+        return
+    if pid <= 0 or pid == os.getpid():
+        return
+    try:
+        flags = 0x08000000 if os.name == "nt" else 0   # CREATE_NO_WINDOW
+        out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"],
+                             capture_output=True, text=True, timeout=10,
+                             creationflags=flags).stdout or ""
+        img = out.strip().split(",")[0].strip('"') if out.strip() else ""
+        if "python" not in img.lower() and "洞鉴虚明" not in img:
+            return   # pid 已被其他程序复用 → 不动它
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True,
+                       timeout=10, creationflags=flags)
+    except Exception:
+        pass
+
+
+def _server_port():
+    try:
+        return _SERVER.server_address[1]
+    except Exception:
+        return 8000
+
+
 # 前端图标贴图(web/icons/*.svg 与 web/icons/png/*.png)的静态白名单: 只放行这两种形状的路径, 杜绝目录穿越
 _ICON_PATH_RE = re.compile(r"^/icons/(?:png/[a-z]+-(?:24|48|96|192)\.png|[a-z]+\.svg)$")
+
+
+def _assist_usage_snapshot():
+    """本次请求累计的 token 用量与花费(按设置里的单价)。"""
+    try:
+        p_in = float(sget("price_in") or 0)
+        p_out = float(sget("price_out") or 0)
+    except Exception:
+        p_in = p_out = 0.0
+    it = getattr(_COST_TL, "in_tokens", 0)
+    ot = getattr(_COST_TL, "out_tokens", 0)
+    return {"calls": getattr(_COST_TL, "calls", 0), "in_tokens": it, "out_tokens": ot,
+            "cost": round(it / 1e6 * p_in + ot / 1e6 * p_out, 4)}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -7097,6 +7981,16 @@ class Handler(BaseHTTPRequestHandler):
                                                         "ai_interest_min", "ai_batch", "ai_cache_hours",
                                                         "ai_enabled", "disclaimer_version")}
                                   | {"ai_ok": ai_ok(), "ai_on": ai_on()})
+        if path == "/api/floatball":
+            return self.send_json({"ok": True, "supported": float_ball_supported(),
+                                   "enabled": sget("float_ball") == "1",
+                                   "running": float_ball_running(),
+                                   "accent": sget("float_ball_accent") or "#fb7299",
+                                   "light": sget("float_ball_light") == "1",
+                                   "prefs": {"think": sget("assist_think"),
+                                             "savage": sget("assist_savage"),
+                                             "len": sget("assist_len"),
+                                             "fallacy": "开" if sget("assist_fallacy") == "1" else "关"}})
         self.send_error(404)
 
     def do_POST(self):
@@ -7416,6 +8310,85 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/conv/delete":
             conv_delete(body.get("id"))
             return self.send_json({"ok": True})
+
+        if path == "/api/floatball":
+            theme = body.get("theme")
+            if isinstance(theme, dict):
+                # 主界面把当前强调色/深浅主题推给悬浮球(切换颜色时也走这里, 不影响开关)
+                acc = str(theme.get("accent") or "").strip()
+                if re.match(r"^#[0-9a-fA-F]{6}$", acc):
+                    sset("float_ball_accent", acc)
+                sset("float_ball_light", "1" if theme.get("light") else "0")
+            prefs_in = body.get("prefs")
+            if isinstance(prefs_in, dict):
+                # 悬浮窗调节档位: 白名单校验, 非法值不落库
+                if prefs_in.get("think") in ("快", "标准", "深挖"):
+                    sset("assist_think", prefs_in["think"])
+                if prefs_in.get("savage") in ("温和", "毒舌", "阴阳"):
+                    sset("assist_savage", prefs_in["savage"])
+                if prefs_in.get("len") in ("短", "中", "长"):
+                    sset("assist_len", prefs_in["len"])
+                if prefs_in.get("fallacy") in ("开", "关"):
+                    sset("assist_fallacy", "1" if prefs_in["fallacy"] == "开" else "0")
+            if "enabled" in body:
+                enabled = bool(body.get("enabled"))
+                sset("float_ball", "1" if enabled else "0")
+                if enabled:
+                    float_ball_spawn(_server_port())
+                else:
+                    float_ball_stop()
+            return self.send_json({"ok": True, "supported": float_ball_supported(),
+                                   "running": float_ball_running(),
+                                   "accent": sget("float_ball_accent") or "#fb7299",
+                                   "light": sget("float_ball_light") == "1",
+                                   "prefs": {"think": sget("assist_think"),
+                                             "savage": sget("assist_savage"),
+                                             "len": sget("assist_len"),
+                                             "fallacy": "开" if sget("assist_fallacy") == "1" else "关"}})
+
+        if path == "/api/ai/assist":
+            # AI 悬浮窗对话窗: 验证真实性/生成回怼(联网取证 + LLM 结构化输出)
+            mode = body.get("mode") or "verify"
+            text = (body.get("text") or "").strip()
+            if mode not in ("verify", "rebut"):
+                return self.send_json({"ok": False, "error": "未知模式"}, 400)
+            if not text:
+                return self.send_json({"ok": False, "error": "内容不能为空"}, 400)
+            if not ai_on():
+                return self.send_json({"ok": False,
+                                       "error": "AI 未配置或已关闭, 请先在主界面设置里配置 API Key"}, 403)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+
+            def sse(event, data):
+                self.wfile.write(("event: %s\ndata: %s\n\n" % (
+                    event, json.dumps(data, ensure_ascii=False))).encode("utf-8"))
+                self.wfile.flush()
+
+            t0 = time.time()
+            _COST_TL.in_tokens = _COST_TL.out_tokens = _COST_TL.calls = 0   # 本次请求用量清零
+            try:
+                sse("phase", {"stage": "search", "label": "正在拆解论点、联网搜集证据与话术模板…"})
+                claims, queries = assist_plan(text)
+                if not queries:
+                    queries = [text.strip()[:64]]   # 拆解失败: 按原文整体检索
+                evidence = gather_evidence(text, queries)
+                hint = ("逐点取证完成" if claims else "取证完成") if evidence else "未搜到网络证据"
+                sse("phase", {"stage": "think",
+                              "label": ("已核对 %d 个来源(%s), AI %s中…" %
+                                        (len(evidence), hint,
+                                         "逐个击破" if mode == "rebut" else "分析"))
+                              if evidence else "未搜到网络证据, AI 仅凭已有知识分析…"})
+                res, refs = assist_result(mode, text, evidence, claims)
+                sse("done", {"ok": True, "mode": mode, "result": res, "evidence": refs,
+                             "usage": _assist_usage_snapshot(),
+                             "elapsed": round(time.time() - t0, 1)})
+            except Exception as e:
+                sse("done", {"ok": False, "mode": mode,
+                             "error": "AI 这次没能给出有效回复(%s)，请再试一次" % str(e)[:80]})
+            return
 
         if path == "/api/chat":
             msg = (body.get("message") or "").strip()
@@ -7764,6 +8737,652 @@ MOCK_ITEMS = [
 ]
 
 
+# ---------------- 悬浮球进程入口 (--float-ball <port>, 独立进程承载 tkinter GUI) ----------------
+
+_BALL_PANEL_W, _BALL_PANEL_H = 380, 520   # 展开后的对话面板逻辑尺寸(按 DPI 缩放)
+_FONT = "Microsoft YaHei"
+_VERDICT_STYLE = {"true": ("真实 ✓", "#67c23a"), "false": ("虚假 ✕", "#f56c6c"),
+                  "uncertain": ("存疑 ?", "#e6a23c")}
+
+_EVQ = queue.Queue()   # 聊天工作线程 → tkinter 主线程 的事件队列
+
+
+def _ball_palette(accent, light):
+    """面板配色: 跟随主界面强调色/深浅主题(主界面切换时经 /api/floatball 推送到这里)。"""
+    if light:
+        return {"bg": "#f2f4f9", "card": "#ffffff", "txt": "#20242f", "sub": "#5d6675",
+                "line": "#dfe3ec", "input": "#f4f6fa", "accent": accent}
+    return {"bg": "#161920", "card": "#1a1d24", "txt": "#e8eaf0", "sub": "#8a91a0",
+            "line": "#2a2e38", "input": "#0d0f14", "accent": accent}
+
+
+def _ball_theme(port):
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/api/floatball" % port, timeout=3) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        acc = d.get("accent") or _BALL_ACCENT
+        if not re.match(r"^#[0-9a-fA-F]{6}$", acc):
+            acc = _BALL_ACCENT
+        return _ball_palette(acc, d.get("light") is True)
+    except Exception:
+        return _ball_palette(_BALL_ACCENT, False)
+
+
+def _ball_worker(port, mode, text, holder):
+    """后台线程: 调 /api/ai/assist 并解析 SSE, 事件投递给 tkinter 主线程(tkinter 非线程安全)。"""
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/api/ai/assist" % port,
+            data=json.dumps({"mode": mode, "text": text}).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            if "json" in (resp.headers.get("Content-Type") or ""):
+                # AI 未配置等场景: 后端回普通 JSON 而非 SSE
+                try:
+                    d = json.loads(resp.read().decode("utf-8"))
+                    _EVQ.put(("error", holder, d.get("error") or "请求失败"))
+                except Exception:
+                    _EVQ.put(("error", holder, "请求失败"))
+                return
+            buf = ""
+            for raw in resp:
+                buf += raw.decode("utf-8", "replace")
+                while "\n\n" in buf:
+                    chunk, buf = buf.split("\n\n", 1)
+                    ev, data = None, {}
+                    for ln in chunk.split("\n"):
+                        if ln.startswith("event:"):
+                            ev = ln[6:].strip()
+                        elif ln.startswith("data:"):
+                            try:
+                                data = json.loads(ln[5:].strip())
+                            except Exception:
+                                pass
+                    if ev == "phase":
+                        _EVQ.put(("phase", holder, data.get("label") or ""))
+                    elif ev == "done":
+                        _EVQ.put(("done", holder, data))
+    except Exception as e:
+        _EVQ.put(("error", holder, str(e)[:160]))
+
+
+def run_float_ball(port):
+    """悬浮球主循环: 置顶小球单击后**原地展开**成 AI 对话面板(聊天流+输入框), 可再收回成球。
+    可拖拽(位置记忆), 服务失联自动销毁。测试钩子: --ball-autoclose <毫秒>。"""
+    import tkinter as tk
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # 高分屏不糊
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+    root = tk.Tk()
+    root.title("洞鉴虚明 AI")
+    root.overrideredirect(True)          # 无边框(球与面板都是)
+    for attr, val in (("-topmost", True), ("-alpha", 0.97),
+                      ("-transparentcolor", _BALL_TRANSPARENT)):
+        try:
+            root.attributes(attr, val)
+        except Exception:
+            pass
+    try:
+        scale = max(1.0, root.winfo_fpixels("1i") / 96.0)   # 像素尺寸按 DPI 缩放(字体是磅值会自动缩放)
+    except Exception:
+        scale = 1.0
+    BALL = int(56 * scale)
+    PW, PH = int(_BALL_PANEL_W * scale), int(_BALL_PANEL_H * scale)
+    C = _ball_theme(port)   # 当前配色(展开时刷新)
+
+    # ---------------- 容器: 球(圆形画布) ⇄ 面板(聊天) 共用同一个置顶窗口 ----------------
+    container = tk.Frame(root, bg=_BALL_TRANSPARENT, highlightthickness=0, bd=0)
+    container.pack(fill="both", expand=True)
+    ballcv = tk.Canvas(container, width=BALL, height=BALL, bg=_BALL_TRANSPARENT,
+                       highlightthickness=0)
+    oval = ballcv.create_oval(3, 3, BALL - 3, BALL - 3, fill=C["accent"],
+                              outline=C["accent"], width=2)
+    ballcv.create_text(BALL // 2, BALL // 2, text="AI", fill="#ffffff",
+                       font=(_FONT, 14, "bold"))
+    ballcv.pack(fill="both", expand=True)   # 初始形态=球(不打包的话整个窗口全透明, 球"隐身")
+
+    panel = tk.Frame(container, bg=C["bg"])
+    header = tk.Frame(panel, bg=C["card"], height=34)
+    header.pack(fill="x")
+    header.pack_propagate(False)
+    dot = tk.Label(header, text="●", bg=C["card"], fg=C["accent"], font=(_FONT, 9))
+    dot.pack(side="left", padx=(10, 4))
+    title = tk.Label(header, text="AI 助手 · 拖动移动", bg=C["card"],
+                     fg=C["txt"], font=(_FONT, 10, "bold"))
+    title.pack(side="left")
+    collapse_btn = tk.Label(header, text="─ 收起", bg=C["card"], fg=C["sub"],
+                            font=(_FONT, 9), cursor="hand2", padx=8)
+    collapse_btn.pack(side="right", fill="y")
+    prefs_btn = tk.Label(header, text="⚙", bg=C["card"], fg=C["sub"],
+                         font=(_FONT, 10), cursor="hand2", padx=7)
+    prefs_btn.pack(side="right", fill="y")
+    new_btn = tk.Label(header, text="新对话", bg=C["card"], fg=C["sub"],
+                       font=(_FONT, 9), cursor="hand2", padx=7)
+    new_btn.pack(side="right", fill="y")
+
+    modebar = tk.Frame(panel, bg=C["bg"])
+    modebar.pack(fill="x", padx=8, pady=(6, 2))
+    mode = {"cur": "verify"}
+    mode_btns = {}
+    for _key, _label in (("verify", "🔍 验证真实性"), ("rebut", "⚔️ 生成回怼")):
+        b = tk.Label(modebar, text=_label, bg=C["card"] if _key != "verify" else C["accent"],
+                     fg=C["sub"] if _key != "verify" else "#ffffff", cursor="hand2",
+                     font=(_FONT, 9), padx=6, pady=4)
+        b.pack(side="left", fill="x", expand=True, padx=3)
+        mode_btns[_key] = b
+
+    def style_modes(_e=None):
+        for k, w in mode_btns.items():
+            on = k == mode["cur"]
+            w.config(bg=C["accent"] if on else C["card"],
+                     fg="#ffffff" if on else C["sub"])
+
+    def switch_mode(e, k):
+        mode["cur"] = k
+        style_modes()
+    for k, w in mode_btns.items():
+        w.bind("<Button-1>", lambda e, k=k: switch_mode(e, k))
+
+    # ---- 调节抽屉(⚙): 思考/刻薄/字数/谬误分析 档位, 点选即存服务端 ----
+    prefs = {"think": "标准", "savage": "毒舌", "len": "中", "fallacy": "开"}
+    prefbar = tk.Frame(panel, bg=C["bg"])
+    pref_segs = {}
+
+    def _seg_row(label, options, key):
+        row = tk.Frame(prefbar, bg=C["bg"])
+        tk.Label(row, text=label, bg=C["bg"], fg=C["sub"], font=(_FONT, 8)).pack(side="left")
+        for opt in options:
+            b = tk.Label(row, text=opt, bg=C["card"], fg=C["sub"], cursor="hand2",
+                         font=(_FONT, 8), padx=5, pady=2)
+            b.pack(side="left", padx=(3, 0))
+            pref_segs[(key, opt)] = b
+            b.bind("<Button-1>", lambda e, k=key, o=opt: set_pref(k, o))
+        row.pack(fill="x", padx=6, pady=2)
+
+    _seg_row("🧠 思考", ("快", "标准", "深挖"), "think")
+    _seg_row("😈 刻薄", ("温和", "毒舌", "阴阳"), "savage")
+    _seg_row("📏 字数", ("短", "中", "长"), "len")
+    _seg_row("🧩 谬误分析", ("开", "关"), "fallacy")
+
+    def style_prefs():
+        for (k, opt), w in pref_segs.items():
+            on = prefs.get(k) == opt
+            w.config(bg=C["accent"] if on else C["card"],
+                     fg="#ffffff" if on else C["sub"])
+
+    def set_pref(k, o):
+        prefs[k] = o
+        style_prefs()
+
+        def _push():
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    "http://127.0.0.1:%d/api/floatball" % port,
+                    data=json.dumps({"prefs": dict(prefs)}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}), timeout=5)
+            except Exception:
+                pass
+        threading.Thread(target=_push, daemon=True).start()
+
+    def toggle_prefs(_e=None):
+        if prefbar.winfo_ismapped():
+            prefbar.pack_forget()
+        else:
+            prefbar.pack(fill="x", before=mid, pady=(0, 2))
+
+    # ---- 消息流(主体) + 输入行 ----
+    # 打包顺序很关键: 输入行先以 side=bottom 占住底边, 消息区再 expand 吃剩余空间
+    # (Canvas 默认自请求尺寸过大, 若消息区先打包, 输入行会被挤出窗口看不见)
+    mid = tk.Frame(panel, bg=C["bg"])
+    canvas = tk.Canvas(mid, width=int(120 * scale), height=int(60 * scale),
+                       bg=C["bg"], highlightthickness=0, bd=0)
+    sb = tk.Scrollbar(mid, orient="vertical", command=canvas.yview, width=10)
+    canvas.configure(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    inner = tk.Frame(canvas, bg=C["bg"])
+    _win = canvas.create_window((0, 0), anchor="nw", window=inner)
+    inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind("<Configure>", lambda e: canvas.itemconfig(_win, width=e.width))
+
+    def _wheel(e):
+        canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+    canvas.bind_all("<MouseWheel>", _wheel)
+
+    hintbox = {}
+
+    def show_hint():
+        hintbox["w"] = tk.Label(inner, text="粘贴内容开始\n「验证」「回怼」「谬误」",
+                                bg=C["bg"], fg=C["sub"], justify="center", font=(_FONT, 9))
+        hintbox["w"].pack(pady=(110, 0), fill="x")
+    show_hint()
+
+    inputrow = tk.Frame(panel, bg=C["bg"])
+    # width=4 防默认80字符请求宽度挤掉发送按钮; 发送按钮先打包占住右侧
+    inp = tk.Text(inputrow, height=2, width=4, wrap="word", bg=C["input"], fg=C["txt"],
+                  insertbackground=C["txt"], relief="flat",
+                  font=(_FONT, 9), padx=8, pady=5)
+    sendbtn = tk.Label(inputrow, text="发送", bg=C["accent"], fg="#ffffff", cursor="hand2",
+                       font=(_FONT, 9, "bold"), padx=14)
+    sendbtn.pack(side="right", fill="y", padx=(6, 0))
+    inp.pack(side="left", fill="both", expand=True)
+    inputrow.pack(side="bottom", fill="x", padx=8, pady=(2, 8))
+    mid.pack(fill="both", expand=True, padx=8, pady=2)
+
+    st = {"view": "ball", "down": False, "moved": False,
+          "ox": 0, "oy": 0, "wx": 0, "wy": 0, "t0": 0.0}
+    sending = {"on": False}
+    gen = {"n": 0}   # 会话代数: 🆕清空后旧请求的事件全部作废
+
+    def scroll_end():
+        inner.update_idletasks()
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        canvas.yview_moveto(1.0)
+
+    def save_pos(x, y):
+        try:
+            with open(_ball_pos_path(), "w", encoding="utf-8") as f:
+                json.dump({"x": int(x), "y": int(y), "pid": os.getpid()}, f)
+        except Exception:
+            pass
+
+    def apply_palette():
+        in_panel = st["view"] == "panel"
+        container.config(bg=C["bg"] if in_panel else _BALL_TRANSPARENT,
+                         highlightthickness=1 if in_panel else 0,
+                         highlightbackground=C["line"])
+        ballcv.itemconfig(oval, fill=C["accent"], outline=C["accent"])
+        for w, key in ((panel, "bg"), (header, "card"), (dot, "card"), (title, "card"),
+                       (modebar, "bg"), (mid, "bg"), (canvas, "bg"), (inner, "bg"),
+                       (inputrow, "bg")):
+            w.config(bg=C[key])
+        title.config(bg=C["card"], fg=C["txt"])
+        collapse_btn.config(bg=C["card"], fg=C["sub"])
+        sb.config(troughcolor=C["bg"], activebackground=C["accent"])
+        if hintbox.get("w"):
+            hintbox["w"].config(bg=C["bg"], fg=C["sub"])
+        inp.config(bg=C["input"], fg=C["txt"], insertbackground=C["txt"])
+        sendbtn.config(bg=C["accent"], fg="#ffffff")
+        prefs_btn.config(bg=C["card"], fg=C["sub"])
+        new_btn.config(bg=C["card"], fg=C["sub"])
+        prefbar.config(bg=C["bg"])
+        style_prefs()
+        style_modes()
+
+    # ---------------- 聊天气泡与结果渲染 ----------------
+    def user_bubble(text, tag_text):
+        if hintbox.get("w"):
+            hintbox["w"].destroy()
+            hintbox["w"] = None
+        wrap = tk.Frame(inner, bg=C["bg"])
+        wrap.pack(anchor="e", padx=4, pady=3)
+        tk.Label(wrap, text=tag_text, bg=C["bg"], fg=C["sub"], font=(_FONT, 7),
+                 anchor="e").pack(anchor="e")
+        tk.Label(wrap, text=text, wraplength=int(250 * scale), justify="left",
+                 bg=C["accent"], fg="#ffffff", font=(_FONT, 9), padx=10, pady=6).pack(anchor="e")
+        scroll_end()
+
+    def ai_bubble():
+        wrap = tk.Frame(inner, bg=C["bg"])
+        wrap.pack(anchor="w", padx=4, pady=3, fill="x")
+        card = tk.Frame(wrap, bg=C["card"])
+        card.pack(anchor="w", fill="x")
+        status = tk.Label(card, text="…", wraplength=int(280 * scale), justify="left",
+                          bg=C["card"], fg=C["sub"], font=(_FONT, 9), padx=10, pady=8,
+                          anchor="nw")
+        status.pack(anchor="w", fill="x")
+        scroll_end()
+        return {"card": card, "status": status}
+
+    def link_label(parent, text, url):
+        lb = tk.Label(parent, text=text, wraplength=int(280 * scale), justify="left",
+                      bg=C["card"], fg=C["accent"], font=(_FONT, 8), cursor="hand2", anchor="nw")
+        lb.pack(anchor="w")
+        lb.bind("<Button-1>", lambda e: webbrowser.open(url))
+
+    def render_verify(card, status, res, evidence):
+        status.destroy()
+        head = tk.Frame(card, bg=C["card"])
+        head.pack(fill="x", padx=10, pady=(8, 2))
+        vlabel, vcolor = _VERDICT_STYLE.get(res.get("verdict"), _VERDICT_STYLE["uncertain"])
+        tk.Label(head, text=vlabel, bg=vcolor, fg="#ffffff",
+                 font=(_FONT, 9, "bold"), padx=8).pack(side="left")
+        tk.Label(head, text="  置信度 %d%%" % res.get("confidence", 60), bg=C["card"],
+                 fg=C["sub"], font=(_FONT, 8)).pack(side="left")
+        if res.get("summary"):
+            tk.Label(card, text=res["summary"], wraplength=int(280 * scale), justify="left",
+                     bg=C["card"], fg=C["txt"], font=(_FONT, 9, "bold"),
+                     padx=10, anchor="nw").pack(fill="x")
+        for r in res.get("reasons") or []:
+            tk.Label(card, text="· " + r, wraplength=int(280 * scale), justify="left",
+                     bg=C["card"], fg=C["txt"], font=(_FONT, 8), padx=10,
+                     anchor="nw").pack(fill="x")
+        if res.get("fallacies"):
+            tk.Label(card, text="🧩 识别谬误: " + "、".join(res["fallacies"]),
+                     wraplength=int(280 * scale), justify="left", bg=C["card"], fg=C["accent"],
+                     font=(_FONT, 8), padx=10, anchor="nw").pack(fill="x")
+        chk_style = {"true": ("✓", "#67c23a"), "false": ("✗", "#f56c6c"),
+                     "uncertain": ("?", "#e6a23c")}
+        cl = res.get("claims") or []
+        if cl:
+            tk.Label(card, text="分论点判定", bg=C["card"], fg=C["sub"],
+                     font=(_FONT, 8), padx=10).pack(anchor="w", pady=(5, 0))
+            for c in cl:
+                mark, mcolor = chk_style.get(c.get("check"), chk_style["uncertain"])
+                row = tk.Frame(card, bg=C["card"])
+                row.pack(fill="x", padx=10)
+                tk.Label(row, text=mark, bg=C["card"], fg=mcolor,
+                         font=(_FONT, 9, "bold")).pack(side="left")
+                txt = c.get("point", "") + ("：" + c["note"] if c.get("note") else "")
+                tk.Label(row, text=txt, wraplength=int(255 * scale), justify="left",
+                         bg=C["card"], fg=C["txt"], font=(_FONT, 8),
+                         anchor="nw").pack(side="left", fill="x", expand=True)
+        if res.get("offline"):
+            tk.Label(card, text="⚠ 未搜到网络证据, 仅凭模型知识", bg=C["card"], fg="#e6a23c",
+                     font=(_FONT, 8), padx=10).pack(anchor="w", pady=(3, 0))
+        for e in (evidence or [])[:3]:
+            if e.get("url"):
+                link_label(card, "▪ %s · %s(%s)" % (e.get("title", "")[:26],
+                             e.get("cred_label", ""), e.get("site", "")), e["url"])
+        tk.Label(card, bg=C["card"]).pack(pady=2)
+        scroll_end()
+
+    def render_rebut(card, status, res, evidence):
+        status.destroy()
+        points = res.get("points") or []
+        if not points:
+            tk.Label(card, text="这条里没找到可回怼的点——对方可能就是正常陈述", bg=C["card"], fg=C["sub"],
+                     font=(_FONT, 9), padx=10, pady=8).pack(anchor="w")
+            return
+        for p in points:
+            head = "对方论点: " + p.get("point", "")
+            if p.get("fallacy"):
+                head += "　🧩" + p["fallacy"]
+            tk.Label(card, text=head, wraplength=int(280 * scale),
+                     justify="left", bg=C["card"], fg=C["sub"], font=(_FONT, 8),
+                     padx=10, anchor="nw").pack(fill="x", pady=(6, 0))
+            row = tk.Frame(card, bg=C["card"])
+            row.pack(fill="x", padx=10, pady=(2, 0))
+            tk.Label(row, text=p.get("reply", ""), wraplength=int(230 * scale),
+                     justify="left", bg=C["card"], fg=C["txt"], font=(_FONT, 10),
+                     anchor="nw").pack(side="left", fill="x", expand=True)
+            cp = tk.Label(row, text="复制", bg=C["card"], fg=C["accent"], cursor="hand2",
+                          font=(_FONT, 8), padx=4)
+            cp.pack(side="right", anchor="n")
+
+            def copy_click(e, txt=p.get("reply", "")):
+                root.clipboard_clear()
+                root.clipboard_append(txt)
+                e.widget.config(text="已复制")
+                root.after(1200, lambda w=e.widget: w.config(text="复制"))
+            cp.bind("<Button-1>", copy_click)
+            if p.get("basis"):
+                tk.Label(card, text="依据: " + p["basis"], wraplength=int(280 * scale),
+                         justify="left", bg=C["card"], fg=C["sub"], font=(_FONT, 8),
+                         padx=10, anchor="nw").pack(fill="x")
+        if res.get("finale"):
+            frow = tk.Frame(card, bg=C["card"])
+            frow.pack(fill="x", padx=10, pady=(6, 0))
+            tk.Label(frow, text="💬 " + res["finale"], wraplength=int(230 * scale),
+                     justify="left", bg=C["card"], fg=C["txt"], font=(_FONT, 9, "bold"),
+                     anchor="nw").pack(side="left", fill="x", expand=True)
+            cf = tk.Label(frow, text="复制", bg=C["card"], fg=C["accent"], cursor="hand2",
+                          font=(_FONT, 8), padx=4)
+            cf.pack(side="right", anchor="n")
+
+            def copy_finale(e, txt=res["finale"]):
+                root.clipboard_clear()
+                root.clipboard_append(txt)
+                e.widget.config(text="已复制")
+                root.after(1200, lambda w=e.widget: w.config(text="复制"))
+            cf.bind("<Button-1>", copy_finale)
+        if res.get("offline"):
+            tk.Label(card, text="⚠ 未搜到网络证据, 仅凭模型知识", bg=C["card"], fg="#e6a23c",
+                     font=(_FONT, 8), padx=10).pack(anchor="w", pady=(3, 0))
+        for e in (evidence or [])[:4]:
+            if e.get("url"):
+                link_label(card, "▪ %s · %s(%s)" % (e.get("title", "")[:26],
+                             e.get("cred_label", ""), e.get("site", "")), e["url"])
+        tk.Label(card, bg=C["card"]).pack(pady=2)
+        scroll_end()
+
+    # ---------------- 发送 / 工作线程事件轮询 ----------------
+    def send(_e=None):
+        if sending["on"]:
+            return
+        text = inp.get("1.0", "end").strip()
+        if not text:
+            return
+        inp.delete("1.0", "end")
+        cur = mode["cur"]
+        user_bubble(text, {"verify": "查证", "rebut": "回怼"}[cur])
+        holder = ai_bubble()
+        holder["gen"] = gen["n"]
+        holder["status"].config(text="🔍 正在拆解论点、联网搜索证据…")
+        sending["on"] = True
+        sendbtn.config(text="…")
+        threading.Thread(target=_ball_worker, args=(port, cur, text, holder),
+                         daemon=True).start()
+    sendbtn.bind("<Button-1>", send)
+    inp.bind("<Control-Return>", lambda e: (send(), "break")[1])
+
+    def new_conversation(_e=None):
+        gen["n"] += 1            # 在途请求的事件全部作废
+        sending["on"] = False
+        sendbtn.config(text="发送")
+        for w in inner.winfo_children():
+            w.destroy()
+        hintbox["w"] = None
+        show_hint()
+        scroll_end()
+    new_btn.bind("<Button-1>", new_conversation)
+    prefs_btn.bind("<Button-1>", toggle_prefs)
+
+    def poll():
+        try:
+            while True:
+                kind, holder, data = _EVQ.get_nowait()
+                if holder.get("gen") != gen["n"]:
+                    continue   # 🆕 清空后的旧请求事件作废
+                if kind == "phase":
+                    holder["status"].config(text=data or "…")
+                    scroll_end()
+                elif kind == "done":
+                    sending["on"] = False
+                    sendbtn.config(text="发送")
+                    d = data or {}
+                    if d.get("ok"):
+                        card, status = holder["card"], holder["status"]
+                        r0 = d.get("result") or {}
+                        if r0.get("no_target"):   # 模型判定无可回怼: 说明原因即可
+                            status.config(text="🤷 " + (r0.get("reason") or "这条没有可回怼的点"))
+                        elif d.get("mode") == "verify":
+                            render_verify(card, status, r0, d.get("evidence") or [])
+                        else:
+                            render_rebut(card, status, r0, d.get("evidence") or [])
+                        u = d.get("usage") or {}
+                        if u.get("calls"):   # 本次花费小字(同样计入主界面每日成本)
+                            tk.Label(card, text="⏱ %ss · %s 次调用 · ¥%s" % (
+                                d.get("elapsed", "?"), u["calls"], u.get("cost", 0)),
+                                bg=C["card"], fg=C["sub"], font=(_FONT, 8), padx=10,
+                                anchor="w").pack(fill="x")
+                    else:
+                        holder["status"].config(text="⚠ " + (d.get("error") or "失败"), fg="#f56c6c")
+                    scroll_end()
+                elif kind == "error":
+                    sending["on"] = False
+                    sendbtn.config(text="发送")
+                    holder["status"].config(text="⚠ " + str(data), fg="#f56c6c")
+                    scroll_end()
+        except queue.Empty:
+            pass
+        root.after(90, poll)
+
+    # ---------------- 球 ⇄ 面板 形态切换(原地展开/收回) ----------------
+    def expand(_e=None):
+        if st["view"] != "ball":
+            return
+        C.update(_ball_theme(port))   # 展开时取最新强调色/主题
+        try:   # 同步最新档位设置(思考/刻薄/字数/谬误分析)
+            with urllib.request.urlopen("http://127.0.0.1:%d/api/floatball" % port, timeout=3) as r:
+                _d = json.loads(r.read().decode("utf-8"))
+            for _k in ("think", "savage", "len", "fallacy"):
+                if (_d.get("prefs") or {}).get(_k):
+                    prefs[_k] = _d["prefs"][_k]
+        except Exception:
+            pass
+        style_prefs()
+        apply_palette()
+        bx, by = root.winfo_x(), root.winfo_y()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        tx = bx + BALL - PW   # 面板右上角贴着球 → 默认往左展开
+        if tx < 4:
+            tx = min(bx, sw - PW - 4)   # 左边放不下 → 往右展开
+        tx = max(4, tx)
+        ty = max(4, min(by - 40, sh - PH - 4))
+        ballcv.pack_forget()
+        panel.pack(fill="both", expand=True)
+        for i in (1, 2, 3):   # 快速展开动画
+            t = i / 3.0
+            root.geometry("%dx%d+%d+%d" % (int(BALL + (PW - BALL) * t),
+                                           int(BALL + (PH - BALL) * t),
+                                           int(bx + (tx - bx) * t), int(by + (ty - by) * t)))
+            root.update_idletasks()
+            time.sleep(0.02)
+        root.geometry("%dx%d+%d+%d" % (PW, PH, tx, ty))
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        st["view"] = "panel"
+        save_pos(tx, ty)
+        inp.focus_set()
+
+    def collapse(_e=None):
+        if st["view"] != "panel":
+            return
+        x, y = root.winfo_x(), root.winfo_y()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        # 球收回面板右上角(与展开时"面板右上角贴着球"对称), 而不是跳到面板左上角
+        tx = max(4, min(x + PW - BALL, sw - BALL - 4))
+        ty = max(4, min(y + 40, sh - BALL - 4))
+        panel.pack_forget()
+        container.config(bg=_BALL_TRANSPARENT, highlightthickness=0)
+        ballcv.pack(fill="both", expand=True)
+        for i in (1, 2, 3):   # 收回动画: 右缘不动, 向右收缩成球
+            t = i / 3.0
+            root.geometry("%dx%d+%d+%d" % (int(PW - (PW - BALL) * t), int(PH - (PH - BALL) * t),
+                                           int(x + (tx - x) * t), int(y + (ty - y) * t)))
+            root.update_idletasks()
+            time.sleep(0.02)
+        root.geometry("%dx%d+%d+%d" % (BALL, BALL, tx, ty))
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        st["view"] = "ball"
+        save_pos(tx, ty)
+    collapse_btn.bind("<Button-1>", lambda e: collapse())
+
+    # ---------------- 拖拽(球面与面板头部通用) ----------------
+    def on_press(e):
+        st.update(down=True, moved=False, ox=e.x_root, oy=e.y_root,
+                  wx=root.winfo_x(), wy=root.winfo_y(), t0=time.time())
+
+    def on_move(e):
+        if not st["down"]:
+            return
+        if abs(e.x_root - st["ox"]) + abs(e.y_root - st["oy"]) > 5:
+            st["moved"] = True
+        nx = max(0, min(st["wx"] + e.x_root - st["ox"],
+                        root.winfo_screenwidth() - root.winfo_width()))
+        ny = max(0, min(st["wy"] + e.y_root - st["oy"],
+                        root.winfo_screenheight() - root.winfo_height()))
+        root.geometry("+%d+%d" % (nx, ny))
+
+    def on_release(_e):
+        if not st["down"]:
+            return
+        st["down"] = False
+        save_pos(root.winfo_x(), root.winfo_y())
+        if st["view"] == "ball" and not st["moved"] and time.time() - st["t0"] < 0.8:
+            expand()   # 原地快速松手 = 单击 → 展开成对话面板
+
+    def on_right(e):
+        menu = tk.Menu(root, tearoff=0)
+        if st["view"] == "ball":
+            menu.add_command(label="打开 AI 助手", command=expand)
+        else:
+            menu.add_command(label="收起为悬浮球", command=collapse)
+        menu.add_separator()
+        menu.add_command(label="退出悬浮球", command=root.destroy)
+        try:
+            menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            menu.grab_release()
+
+    for w in (ballcv, header, dot, title):
+        w.bind("<Button-1>", on_press)
+        w.bind("<B1-Motion>", on_move)
+        w.bind("<ButtonRelease-1>", on_release)
+        w.bind("<Button-3>", on_right)
+    ballcv.config(cursor="hand2")
+
+    # ---------------- 初始位置 / 心跳 / 主循环 ----------------
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    x, y = sw - BALL - 24, int(sh * 0.3)   # 默认停在主屏右侧中上部
+    try:
+        with open(_ball_pos_path(), encoding="utf-8") as f:
+            pos = json.load(f)
+        x, y = int(pos.get("x", x)), int(pos.get("y", y))
+    except Exception:
+        pass
+    x, y = max(0, min(x, sw - BALL)), max(0, min(y, sh - BALL))
+    root.geometry("%dx%d+%d+%d" % (BALL, BALL, x, y))
+    try:   # 把自身 pid 写进位置文件: 主程序下次启动按它清理孤儿球(本次启动即写, 不等拖动)
+        with open(_ball_pos_path(), "w", encoding="utf-8") as f:
+            json.dump({"x": int(x), "y": int(y), "pid": os.getpid()}, f)
+    except Exception:
+        pass
+
+    # 心跳: 服务重启/退出后自动销毁(连续 2 次探活失败即退, 防孤儿悬浮球)
+    misses = [0]
+
+    def heartbeat():
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%d/api/ui_version" % port,
+                                        timeout=2) as r:
+                ok = r.status == 200
+        except Exception:
+            ok = False
+        if ok:
+            misses[0] = 0
+        else:
+            misses[0] += 1
+            if misses[0] >= 2:
+                root.destroy()
+                return
+        root.after(4000, heartbeat)
+    root.after(2000, heartbeat)
+    poll()
+    if "--ball-autoclose" in sys.argv:   # 测试钩子: N 毫秒后自动关闭(验证能正常建窗)
+        try:
+            root.after(int(sys.argv[sys.argv.index("--ball-autoclose") + 1]), root.destroy)
+        except (ValueError, IndexError):
+            pass
+    if "--ball-autoexpand" in sys.argv:   # 测试钩子: N 毫秒后自动展开(验证面板布局)
+        try:
+            root.after(int(sys.argv[sys.argv.index("--ball-autoexpand") + 1]), expand)
+        except (ValueError, IndexError):
+            pass
+    root.mainloop()
+
+
 def port_busy(port):
     try:
         with urllib.request.urlopen("http://127.0.0.1:%d/api/feed" % port, timeout=1.5) as r:
@@ -7773,6 +9392,23 @@ def port_busy(port):
 
 
 if __name__ == "__main__":
+    # 悬浮球模式: 本进程只承载 tkinter 小球, 不起服务(必须在任何 DB 初始化之前分流)
+    if "--float-ball" in sys.argv:
+        try:
+            _port = int(sys.argv[sys.argv.index("--float-ball") + 1])
+        except (ValueError, IndexError):
+            _port = 8000
+        try:
+            run_float_ball(_port)
+        except Exception:
+            import traceback
+            try:   # windowed exe 没有 stdout, 错误落盘便于排查
+                with open(os.path.join(DATA_DIR, "float_ball_err.log"), "w",
+                          encoding="utf-8") as _f:
+                    traceback.print_exc(file=_f)
+            except Exception:
+                pass
+        sys.exit(0)
     # 评分器升级(v2: 标题党判低质/挂人开团扣帽子判引战/补小黑盒口径): 只做版本标记,
     # 不整体清评分缓存(全量清缓存会让全扫模式下首屏长时间空白; 新判据随条目自然重评生效)
     if sget("scorer_v") != "3":
@@ -7794,15 +9430,22 @@ if __name__ == "__main__":
         print("端口 8000/8010/8020 均被占用, 无法启动")
         sys.exit(1)
     _SERVER = server
-    print("洞鉴虚明 v0.2.6.2a 已启动: http://127.0.0.1:%d" % port)
+    print("洞鉴虚明 v0.2.8.0a 已启动: http://127.0.0.1:%d" % port)
     print("按 Ctrl+C 停止服务")
+    if os.name == "nt":
+        _kill_stale_ball()   # 上次异常退出遗留的孤儿悬浮球(正常退出已被租约收走)
+        threading.Thread(target=_lease_watchdog, daemon=True,
+                         name="page-lease-watchdog").start()   # 兜底: 页面发不出leaving时收尾
     if AUTO_OPEN:
         webbrowser.open("http://127.0.0.1:%d" % port)
+    if sget("float_ball") == "1" and os.name == "nt":
+        float_ball_spawn(port)   # 上次开着悬浮窗 → 本次启动自动带出
     try:
         server.serve_forever()
     finally:
         server.server_close()
-        for executor in (_FX, _SERIOUS_X, _SCORE_X, _TAG_X):
+        float_ball_stop()   # 服务退出时收球, 不留孤儿
+        for executor in (_FX, _SERIOUS_X, _SCORE_X, _TAG_X, _EVIDENCE_X):
             executor.shutdown(wait=False, cancel_futures=True)
         tb_login_stop()
         _SERVER = None

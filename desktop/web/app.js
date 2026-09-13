@@ -21,6 +21,12 @@ function sendPageLease(action, keepalive = false) {
 sendPageLease("alive");
 window.addEventListener("pageshow", () => sendPageLease("alive"));
 window.addEventListener("pagehide", () => sendPageLease("leaving", true));
+/* 存活心跳: 浏览器被直接杀掉/崩溃时 pagehide 发不出, 服务端租约看门狗按最后心跳判超时收尾。
+   后台隐藏页的定时器会被节流到~1分钟, 间隔取30s、服务端宽限150s */
+setInterval(() => sendPageLease("alive"), 30000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) sendPageLease("alive");
+});
 
 /* UI 自动更新: 记录加载时的前端文件指纹, 服务端文件变化后自动重载, 不再依赖手动 Ctrl+F5 */
 let _uiVersion = null;
