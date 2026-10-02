@@ -315,7 +315,8 @@ def shell_main(e2e_url=None):
     api = ShellApi()
     win = webview.create_window("%s %s" % (APP_NAME, APP_VER), url,
                                 width=MAIN_W, height=MAIN_H, min_size=MAIN_MIN,
-                                background_color=BG_DARK, js_api=api, frameless=True)
+                                background_color=BG_DARK, js_api=api,
+                                frameless=True, easy_drag=False)   # easy_drag=False: 只允许标签栏拖动, 网页区域拖拽不再移动窗口
     api.attach(win, url)
 
     def gui_ready():

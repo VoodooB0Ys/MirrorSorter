@@ -164,14 +164,9 @@ def create_pool(win, on_title, on_newtab, theme_getter=None):
                     form.BackColor = _C.FromArgb(15, 17, 21)   # 控件缝隙不露窗体白底
                     u32 = ctypes.windll.user32
                     hwnd = form.Handle.ToInt32()
-                    GWL_STYLE = -16
-                    u32.SetWindowLongW(hwnd, GWL_STYLE,
-                                       u32.GetWindowLongW(hwnd, GWL_STYLE)
-                                       | 0x00040000 | 0x00010000 | 0x00020000)
-                    u32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
-                                     0x0020 | 0x0001 | 0x0002 | 0x0004)
-                    try:   # THICKFRAME 会让 DWM 画出一条浅色边框线(Win10 不可调色) → 关掉
-                        #       非客户区渲染; 边缘缩放热区仍在
+                    # 缩放走自建贴边热区(edge 面板), 不再用 THICKFRAME ——
+                    # THICKFRAME 会让 DWM 在 Win10 上画一圈浅色边框线(不可调色), 白线的来源
+                    try:   # 关掉 DWM 非客户区渲染, 双保险
                         val = ctypes.c_int(2)   # DWMWA_NCRENDERING_POLICY = DISABLED
                         ctypes.windll.dwmapi.DwmSetWindowAttribute(
                             hwnd, 2, ctypes.byref(val), ctypes.sizeof(val))
