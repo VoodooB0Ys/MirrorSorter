@@ -35,7 +35,7 @@ def install_strip(win, api, bg_rgb=(15, 17, 21)):
     BG = Color.FromArgb(*bg_rgb)
     FG_ON = Color.White
     FG_OFF = Color.FromArgb(168, 176, 190)
-    st = {"tabs": [], "active": 0, "hover_close": False}
+    st = {"tabs": [], "active": 0, "hover_btn": None}
     lock = threading.Lock()
     form = win.native
 
@@ -57,7 +57,9 @@ def install_strip(win, api, bg_rgb=(15, 17, 21)):
         if not n:
             return []
         gap, margin = int(4 * scale), int(6 * scale)
-        tw = min(int(200 * scale), max(int(120 * scale), (width - margin * 2 - gap * (n - 1)) // n))
+        btn_zone = BTN_W() * 3 + int(2 * scale)
+        tw = min(int(200 * scale),
+                 max(int(110 * scale), (width - margin - btn_zone - gap * (n - 1)) // n))
         out, x = [], margin
         for _ in range(n):
             out.append((x, tw))
@@ -95,8 +97,28 @@ def install_strip(win, api, bg_rgb=(15, 17, 21)):
                 cx = x + tw - close_w
                 g.DrawString("\u2715", font, SolidBrush(fg),
                              RectangleF(float(cx), float(y), float(close_w), float(h)), sf)
+        # 右端窗口按钮: ─ □ ✕ —— 无边框窗口的标题栏按钮, 白色符号 + 分隔线, 始终清晰可见
+        from System.Drawing import Pen
+        bw = BTN_W()
+        zx = strip.Width - bw * 3
+        g.DrawLine(Pen(Color.FromArgb(70, 76, 92), 1.0),
+                   float(zx), float(int(5 * scale)), float(zx), float(bar_h - int(5 * scale)))
+        sf_c = StringFormat()
+        sf_c.Alignment = StringAlignment.Center
+        sf_c.LineAlignment = StringAlignment.Center
+        for i, (name, sym) in enumerate((("min", "\u2500"), ("max", "\u25a1"), ("close", "\u2715"))):
+            bx = zx + bw * i
+            hov = (st["hover_btn"] == name)
+            if name == "close" and hov:
+                g.FillRectangle(SolidBrush(Color.FromArgb(232, 17, 35)),
+                                float(bx), 0.0, float(bw), float(bar_h))
+            elif hov:
+                g.FillRectangle(SolidBrush(Color.FromArgb(62, 68, 84)),
+                                float(bx), 0.0, float(bw), float(bar_h))
+            g.DrawString(sym, font, SolidBrush(Color.FromArgb(236, 240, 248)),
+                         RectangleF(float(bx), 0.0, float(bw), float(bar_h)), sf_c)
 
-    BTN_W = lambda: int(40 * scale)   # ─ □ ✕ 每个按钮宽
+    BTN_W = lambda: int(46 * scale)   # ─ □ ✕ 每个按钮宽(与系统标题栏按钮同规格)
 
     def _btn_zone(x):
         return x >= strip.Width - BTN_W() * 3
@@ -147,14 +169,14 @@ def install_strip(win, api, bg_rgb=(15, 17, 21)):
             pass
 
     def on_mouse_move(_sender, args):
-        hov = (_btn_at(args.X) == "close") and _btn_zone(args.X)
-        if hov != st["hover_close"]:
-            st["hover_close"] = hov
+        name = _btn_at(args.X)
+        if name != st["hover_btn"]:
+            st["hover_btn"] = name
             strip.Invalidate()
 
     def on_mouse_leave(_sender, _args):
-        if st["hover_close"]:
-            st["hover_close"] = False
+        if st["hover_btn"]:
+            st["hover_btn"] = None
             strip.Invalidate()
 
     def on_window_btn(name):
