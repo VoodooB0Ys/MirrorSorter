@@ -5,6 +5,8 @@
 }
 /* 手机上按住元素时WebView默认的蓝色点按高亮太晃眼(用户反馈), 统一去掉 */
 * { -webkit-tap-highlight-color: transparent; }
+/* 桌面壳切标签回首页时 WebView 恢复焦点, 会把鼠标时代的焦点环(设置栏白框)画出来; 去掉 */
+*:focus { outline: none; }
 /* 白天主题 */
 body.light {
   --bg:#f2f4f9; --panel:#ffffff; --card:#ffffff; --line:#dfe3ec;

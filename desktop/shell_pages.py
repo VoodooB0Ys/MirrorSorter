@@ -13,7 +13,28 @@ import threading
 import time
 
 
-def create_pool(win, on_title, on_newtab):
+_DARK_JS = """
+(function(){
+  var old = document.getElementById('__msx_dark');
+  if (old) old.remove();
+  var st = document.createElement('style');
+  st.id = '__msx_dark';
+  st.textContent = 'html{filter:invert(0.90) hue-rotate(180deg);background:#fff}'
+    + 'img,video,picture,canvas,svg,iframe,embed,object'
+    + '{filter:invert(1) hue-rotate(180deg)}';
+  (document.head || document.documentElement).appendChild(st);
+})()
+"""
+_LIGHT_JS = """
+(function(){
+  var old = document.getElementById('__msx_dark');
+  if (old) old.remove();
+  document.documentElement.style.filter = '';
+})()
+"""
+
+
+def create_pool(win, on_title, on_newtab, theme_getter=None):
     """创建控件池。须在窗口壳启动后调用(任意线程, 内部自行 marshal)。
 
     on_title(tab_key, title) / on_newtab(tab_key, url): 站点控件的
@@ -22,7 +43,7 @@ def create_pool(win, on_title, on_newtab):
     (key 0 = 信息流主控件); 控件对象由池内部持有。
     """
     import System.Windows.Forms as WinForms  # noqa: F401  提前加载 CLR(pythonnet)
-    box = {"form": None}
+    box = {"form": None, "theme": None, "stopping": False}
 
     def _ui(fn):
         """marshal 到 UI 线程(窗体未绑定时直接执行, 供测试注入)。"""
@@ -49,6 +70,47 @@ def create_pool(win, on_title, on_newtab):
     class _Pool:
         ctrls = {0: None}   # tab_key -> WebView2 控件(0 = 信息流主控件)
 
+        def _is_dark(self):
+            try:
+                return (theme_getter() or "dark") != "light"
+            except Exception:
+                return True
+
+        def _apply_theme(self, c, dark):
+            """给站点页面注入/移除自动深色(反色+色相旋转, 媒体类元素反转回原色)。"""
+            def go():
+                try:
+                    core = c.CoreWebView2
+                    if core is None:
+                        return
+                    try:   # 站点自身支持 prefers-color-scheme 的跟随(如已适配暗色的站点)
+                        from Microsoft.Web.WebView2.Core import CoreWebView2PreferredColorScheme
+                        core.Profile.PreferredColorScheme = CoreWebView2PreferredColorScheme(
+                            2 if dark else 1)   # Dark/Light
+                    except Exception:
+                        pass
+                    core.ExecuteScriptAsync(_DARK_JS if dark else _LIGHT_JS)
+                except Exception:
+                    import traceback
+                    print("[theme] ERROR:", flush=True)
+                    traceback.print_exc()
+            _ui(go)
+
+        def _theme_watch(self):
+            """轮询主题(主页切黑夜/白天会实时写库) → 对所有站点页面重新应用。"""
+            import time as _t
+            while not box["stopping"]:
+                try:
+                    dark = self._is_dark()
+                    if dark != box["theme"]:
+                        box["theme"] = dark
+                        for k, c in list(_Pool.ctrls.items()):
+                            if k != 0 and c is not None:
+                                self._apply_theme(c, dark)
+                except Exception:
+                    pass
+                _t.sleep(3)
+
         def init(self):
             """等原生窗体就绪, 记录主控件, 打无边框缩放补丁(WS_THICKFRAME)。"""
             end = time.time() + 30
@@ -62,6 +124,9 @@ def create_pool(win, on_title, on_newtab):
             if form is None:
                 raise RuntimeError("native window form not ready")
             box["form"] = form
+            box["theme"] = self._is_dark()
+            threading.Thread(target=self._theme_watch, daemon=True,
+                             name="msx-theme-watch").start()
 
             def init_ui():
                 try:
@@ -116,6 +181,11 @@ def create_pool(win, on_title, on_newtab):
                             a2.Handled = True
                             on_newtab(tab_key, str(a2.get_Uri()))
                         core.NewWindowRequested += on_newwin
+
+                        def on_nav_done(_s2, _a2):   # 每次整页加载完按当前主题补注入
+                            self._apply_theme(c, self._is_dark())
+                        core.NavigationCompleted += on_nav_done
+                        self._apply_theme(c, self._is_dark())
                     c.CoreWebView2InitializationCompleted += on_ready
                     form.Controls.Add(c)
                     _Pool.ctrls[tab_key] = c
@@ -137,7 +207,8 @@ def create_pool(win, on_title, on_newtab):
                         c.Visible = True
                         c.Focus()
                 except Exception:
-                    pass
+                    import traceback
+                    traceback.print_exc()
             _ui(go)
 
         def hide(self, key):

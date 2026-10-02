@@ -34,12 +34,15 @@ that used to open your system browser — now opens as a **tab in the app window
 - A native browser-style **tab bar sits at the top of the frameless window**: `信息流`
   is the pinned home tab (cannot be closed); every video/post opens as a new tab
   showing the page title with a hover `✕` to close; click a tab to switch. Site
-  pop-ups (target=_blank) become tabs too.
+  pop-ups (target=_blank) become tabs too. Tabs render browser-style (rounded top,
+  accent bar on the active tab).
+- **Pages follow the app's dark/light theme**: with 黑夜 mode on, embedded sites
+  (e.g. Bilibili) render dark automatically — no more blinding white pages.
 - **Switching tabs never reloads**: each tab is its own WebView2 instance sharing
   the same browser profile — the feed keeps its state, videos keep playing when
   you switch away and back.
-- The window is borderless: drag the tab bar's empty area to move, double-click it
-  to maximize, `─ □ ✕` window buttons at the right end, edges still resize.
+- The window is borderless: drag the tab bar's empty area to move, `─ □ ✕` window
+  buttons at the right end, edges still resize.
 - The tab bar is part of the window chrome (WinForms-drawn) — it never overlaps or
   blocks any website's own UI.
 - Site logins (e.g. Bilibili) persist across restarts (WebView2 non-private mode).

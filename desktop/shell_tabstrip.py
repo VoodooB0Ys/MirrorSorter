@@ -31,11 +31,12 @@ def install_strip(win, api, bg_rgb=(15, 17, 21)):
     tab_h = bar_h - 8
     font = Font("Microsoft YaHei", 9.0 * scale)
     ACCENT = Color.FromArgb(251, 114, 153)      # 应用主题粉
-    TAB_BG = Color.FromArgb(44, 50, 64)
-    BG = Color.FromArgb(*bg_rgb)
+    TAB_ACTIVE = Color.FromArgb(22, 25, 32)     # 激活标签(=应用 --panel)
+    TAB_HOVER = Color.FromArgb(30, 34, 44)      # 非激活悬停
+    BG = Color.FromArgb(10, 12, 16)             # 标签栏底色(比窗口更深一档)
     FG_ON = Color.White
-    FG_OFF = Color.FromArgb(168, 176, 190)
-    st = {"tabs": [], "active": 0, "hover_btn": None}
+    FG_OFF = Color.FromArgb(150, 158, 172)
+    st = {"tabs": [], "active": 0, "hover_btn": None, "hover_tab": None}
     lock = threading.Lock()
     form = win.native
 
@@ -69,34 +70,39 @@ def install_strip(win, api, bg_rgb=(15, 17, 21)):
     def _rounded_path(x, y, w, h, rad):
         p = GraphicsPath()
         d = rad * 2
-        p.AddArc(x, y, d, d, 180, 90)
-        p.AddArc(x + w - d, y, d, d, 270, 90)
-        p.AddArc(x + w - d, y + h - d, d, d, 0, 90)
-        p.AddArc(x, y + h - d, d, d, 90, 90)
+        p.AddArc(x, y, d, d, 180, 90)             # 左上
+        p.AddArc(x + w - d, y, d, d, 270, 90)     # 右上
+        p.AddLine(x + w, y + h, x, y + h)         # 底边直角(贴住栏底)
         p.CloseFigure()
         return p
 
     def on_paint(_sender, e):
         g = e.Graphics
         g.SmoothingMode = SmoothingMode.AntiAlias
+        g.Clear(BG)
         boxes = _layout(strip.Width)
+        rad = int(8 * scale)
         for i, t in enumerate(st["tabs"]):
             if i >= len(boxes):
                 break
             x, tw = boxes[i]
-            y, h = int(4 * scale), tab_h
             act = (t["id"] == st["active"])
-            g.FillPath(SolidBrush(ACCENT if act else TAB_BG),
-                       _rounded_path(x, y, tw, h, int(8 * scale)))
+            hov = (st["hover_tab"] == t["id"] and not act)
+            # 顶圆角矩形, 底边贴住栏底 —— 与内容区相连的浏览器标签观感
+            g.FillPath(SolidBrush(TAB_ACTIVE if act else (TAB_HOVER if hov else BG)),
+                       _rounded_path(x, 0, tw, bar_h, rad))
+            if act:   # 顶部强调条
+                g.FillRectangle(SolidBrush(ACCENT), float(x + rad * 0.4), 0.0,
+                                float(tw - rad * 0.8), float(int(3 * scale)))
             fg = FG_ON if act else FG_OFF
             close_w = int(22 * scale) if t.get("closable") else int(8 * scale)
-            rect = RectangleF(float(x + int(10 * scale)), float(y),
-                              float(tw - close_w - int(10 * scale)), float(h))
+            rect = RectangleF(float(x + int(10 * scale)), 0.0,
+                              float(tw - close_w - int(10 * scale)), float(bar_h))
             g.DrawString(t.get("title") or "页面", font, SolidBrush(fg), rect, sf)
             if t.get("closable"):
                 cx = x + tw - close_w
                 g.DrawString("\u2715", font, SolidBrush(fg),
-                             RectangleF(float(cx), float(y), float(close_w), float(h)), sf)
+                             RectangleF(float(cx), 0.0, float(close_w), float(bar_h)), sf)
         # 右端窗口按钮: ─ □ ✕ —— 无边框窗口的标题栏按钮, 白色符号 + 分隔线, 始终清晰可见
         from System.Drawing import Pen
         bw = BTN_W()
@@ -146,8 +152,7 @@ def install_strip(win, api, bg_rgb=(15, 17, 21)):
             if i >= len(boxes):
                 break
             bx, tw = boxes[i]
-            by, bh = int(4 * scale), tab_h
-            if bx <= x <= bx + tw and by <= yv <= by + bh:
+            if bx <= x <= bx + tw and 0 <= yv <= bar_h:
                 return st["tabs"][i]
         return None
 
@@ -156,9 +161,6 @@ def install_strip(win, api, bg_rgb=(15, 17, 21)):
         if args.Button != WinForms.MouseButtons.Left:
             return
         if _btn_at(args.X) is not None or _hit_tab(args.X, args.Y) is not None:
-            return
-        if args.Clicks == 2:   # 双击空白区: 最大化/还原
-            _toggle_max()
             return
         try:   # 空白区按下 → 拖动窗口(标准 NC 拖拽技巧)
             u32 = ctypes.windll.user32
@@ -173,10 +175,21 @@ def install_strip(win, api, bg_rgb=(15, 17, 21)):
         if name != st["hover_btn"]:
             st["hover_btn"] = name
             strip.Invalidate()
+        ht = _hit_tab(args.X, args.Y)
+        hid = ht["id"] if ht is not None else None
+        if hid != st["hover_tab"]:
+            st["hover_tab"] = hid
+            strip.Invalidate()
 
     def on_mouse_leave(_sender, _args):
+        ch = False
         if st["hover_btn"]:
             st["hover_btn"] = None
+            ch = True
+        if st["hover_tab"] is not None:
+            st["hover_tab"] = None
+            ch = True
+        if ch:
             strip.Invalidate()
 
     def on_window_btn(name):

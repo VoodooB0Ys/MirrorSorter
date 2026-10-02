@@ -322,8 +322,10 @@ def shell_main(e2e_url=None):
         # GUI 就绪(在 pywebview 的后台线程): 装控件池与标签栏, 再跑测试钩子
         try:
             from shell_pages import create_pool
-            pages = create_pool(win, api.update_title,
-                                lambda _k, u: api.open_in_app(u))
+            # 站点页面深浅跟随主界面: applyTheme() 每次切主题都会实时推送 float_ball_light
+            pages = create_pool(
+                win, api.update_title, lambda _k, u: api.open_in_app(u),
+                theme_getter=lambda: "light" if app.sget("float_ball_light") == "1" else "dark")
             pages.init()          # 等窗体就绪 + WS_THICKFRAME 无边框缩放补丁
             api.bind_pages(pages)
         except Exception:
@@ -338,6 +340,23 @@ def shell_main(e2e_url=None):
         if e2e_url:
             time.sleep(8)   # 等主窗口与服务就绪
             api.open_in_app(e2e_url, "E2E 视频标签页")
+
+            def dump_controls():
+                try:
+                    import System.Windows.Forms as WinForms
+                    f = win.native
+                    print("[dump] client=%s" % f.ClientSize, flush=True)
+                    for i in range(f.Controls.Count):
+                        c = f.Controls[i]
+                        print("[dump] z=%d %s vis=%s loc=%s size=%s dock=%s text=%s" % (
+                            i, c.GetType().Name, c.Visible, c.Location, c.Size, c.Dock,
+                            (c.Text or "")[:16]), flush=True)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+            time.sleep(6)
+            import threading as _th
+            _th.Thread(target=dump_controls, daemon=True).start()
 
     # 非无痕: 内置浏览器标签页里的登录态(B站等)跨重启保留, 数据落用户目录
     webview.start(func=gui_ready, private_mode=False,
