@@ -216,10 +216,17 @@ def create_pool(win, on_title, on_newtab, theme_getter=None):
                     hwnd = form.Handle.ToInt32()
                     # 缩放走自建贴边热区(edge 面板), 不再用 THICKFRAME ——
                     # THICKFRAME 会让 DWM 在 Win10 上画一圈浅色边框线(不可调色), 白线的来源
-                    try:   # 关掉 DWM 非客户区渲染, 双保险
+                    try:   # 关掉 DWM 非客户区渲染
                         val = ctypes.c_int(2)   # DWMWA_NCRENDERING_POLICY = DISABLED
                         ctypes.windll.dwmapi.DwmSetWindowAttribute(
                             hwnd, 2, ctypes.byref(val), ctypes.sizeof(val))
+                    except Exception:
+                        pass
+                    try:   # Win10 给所有窗口画 1px 系统色边框(浅色主题下发白) → 强制深色边框
+                        on = ctypes.c_int(1)   # TRUE
+                        for attr in (20, 19):   # DWMWA_USE_IMMERSIVE_DARK_MODE(新旧两个属性号)
+                            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                                hwnd, attr, ctypes.byref(on), ctypes.sizeof(on))
                     except Exception:
                         pass
                     _Pool.ctrls[0] = form.webview
