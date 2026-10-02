@@ -44,7 +44,8 @@ that used to open your system browser — now opens as a **tab in the app window
   the same browser profile — the feed keeps its state, videos keep playing when
   you switch away and back.
 - The window is borderless: drag the tab bar's empty area to move, `─ □ ✕` window
-  buttons at the right end, edges still resize.
+  buttons at the right end, and the window edges (left/right/bottom, plus the top
+  edge of the tab bar) resize it.
 - The tab bar is part of the window chrome (WinForms-drawn) — it never overlaps or
   blocks any website's own UI.
 - Site logins (e.g. Bilibili) persist across restarts (WebView2 non-private mode).

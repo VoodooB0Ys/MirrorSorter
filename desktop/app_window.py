@@ -355,9 +355,12 @@ def shell_main(e2e_url=None):
                     print("[dump] client=%s" % f.ClientSize, flush=True)
                     for i in range(f.Controls.Count):
                         c = f.Controls[i]
-                        print("[dump] z=%d %s vis=%s loc=%s size=%s dock=%s text=%s" % (
-                            i, c.GetType().Name, c.Visible, c.Location, c.Size, c.Dock,
-                            (c.Text or "")[:16]), flush=True)
+                        try:
+                            print("[dump] z=%d %s vis=%s loc=%s size=%s dock=%s" % (
+                                i, c.GetType().Name, c.Visible, c.Location, c.Size,
+                                c.Dock), flush=True)
+                        except Exception as _e:
+                            print("[dump] z=%d err %r" % (i, _e), flush=True)
                 except Exception:
                     import traceback
                     traceback.print_exc()

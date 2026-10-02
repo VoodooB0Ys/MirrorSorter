@@ -157,19 +157,26 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None):
                 return st["tabs"][i]
         return None
 
-    def on_mouse_down(_sender, args):
+    def _nc_drag(ht):
+        """进入系统模态循环(移动 HTCAPTION / 缩放 HTLEFT...) —— 无边框窗口标准技巧。"""
         import ctypes
+        try:
+            u32 = ctypes.windll.user32
+            u32.ReleaseCapture()
+            u32.SendMessageW(form.Handle.ToInt32(), 0xA1, ht, 0)
+        except Exception:
+            pass
+
+    def on_mouse_down(_sender, args):
         if args.Button != WinForms.MouseButtons.Left:
             return
         if _btn_at(args.X) is not None or _hit_tab(args.X, args.Y) is not None:
             return
-        try:   # 空白区按下 → 拖动窗口(标准 NC 拖拽技巧)
-            u32 = ctypes.windll.user32
-            hwnd = form.Handle.ToInt32()
-            u32.ReleaseCapture()
-            u32.SendMessageW(hwnd, 0xA1, 0x2, 0)   # WM_NCLBUTTONDOWN, HTCAPTION
-        except Exception:
-            pass
+        if (args.Y <= int(4 * scale) and
+                form.WindowState != WinForms.FormWindowState.Maximized):
+            _nc_drag(12)   # HTTOP: 标签栏上缘 4px = 顶边缩放带
+            return
+        _nc_drag(2)   # HTCAPTION: 空白区拖动窗口
 
     def on_mouse_move(_sender, args):
         name = _btn_at(args.X)
@@ -268,6 +275,36 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None):
             wv.Size = Size(form.ClientSize.Width, form.ClientSize.Height - bar_h)
             wv.Anchor = (WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Bottom |
                          WinForms.AnchorStyles.Left | WinForms.AnchorStyles.Right)
+
+            # ---- 无边框边缘缩放热区: 客户区被 WebView2 全覆盖, THICKFRAME 的
+            #      缩放带永远收不到鼠标 → 自己贴边放热区, 按下进入系统缩放循环 ----
+            def edge(name, loc, size, anchor, cursor):
+                p = WinForms.Panel()
+                p.BackColor = BG
+                p.Location = loc
+                p.Size = size
+                p.Anchor = anchor
+                p.Cursor = cursor
+                ht = {"left": 10, "right": 11, "bottom": 15}[name]
+
+                def down(_s, a):
+                    if (a.Button == WinForms.MouseButtons.Left and
+                            form.WindowState != WinForms.FormWindowState.Maximized):
+                        _nc_drag(ht)
+                p.MouseDown += down
+                form.Controls.Add(p)
+                p.BringToFront()
+            ew = int(4 * scale)
+            cw, ch = form.ClientSize.Width, form.ClientSize.Height
+            edge("left", Point(0, 0), Size(ew, ch),
+                 WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Bottom |
+                 WinForms.AnchorStyles.Left, WinForms.Cursors.SizeWE)
+            edge("right", Point(cw - ew, 0), Size(ew, ch),
+                 WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Bottom |
+                 WinForms.AnchorStyles.Right, WinForms.Cursors.SizeWE)
+            edge("bottom", Point(0, ch - ew), Size(cw, ew),
+                 WinForms.AnchorStyles.Bottom | WinForms.AnchorStyles.Left |
+                 WinForms.AnchorStyles.Right, WinForms.Cursors.SizeNS)
         except Exception:
             import traceback
             traceback.print_exc()
