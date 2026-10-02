@@ -339,7 +339,8 @@ def shell_main(e2e_url=None):
             traceback.print_exc()
         try:
             from shell_tabstrip import install_strip
-            api.bind_strip(install_strip(win, api))
+            api.bind_strip(install_strip(
+                win, api, accent_getter=lambda: app.sget("float_ball_accent")))
         except Exception:
             import traceback
             traceback.print_exc()

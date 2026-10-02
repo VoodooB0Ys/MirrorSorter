@@ -178,9 +178,22 @@ function pushBallTheme() {
   fetch("/api/floatball", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ theme: { accent: hex, light: theme === "light" } }),
+    body: JSON.stringify({ theme: { accent: hex, light: theme === "light", accent_id: accent } }),
   }).catch(() => {});
 }
+/* 桌面壳内 WebView2 的 localStorage 与用户平时用的浏览器相互独立;
+   首次在壳内启动(无本地主题)时, 从服务端设置镜像恢复主界面强调色/深浅 */
+(function restoreThemeFromServer() {
+  if (localStorage.getItem("theme")) return;
+  fetch("/api/ui_theme", { cache: "no-store" }).then((r) => r.json()).then((d) => {
+    if (!d || !d.theme) return;
+    localStorage.setItem("theme", d.theme);
+    if (d.accent_id) localStorage.setItem("accent", d.accent_id);
+    else if (d.accent_hex) localStorage.setItem("accent", "custom:" + d.accent_hex);
+    applyTheme();
+  }).catch(() => {});
+})();
+
 function applyTheme() {
   const theme = localStorage.getItem("theme") || "dark";
   const accent = localStorage.getItem("accent") || "pink";

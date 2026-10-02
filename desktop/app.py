@@ -8669,6 +8669,16 @@ class Handler(BaseHTTPRequestHandler):
                                    "xhh": {"logged_in": xhh_logged_in,
                                            "unread": xhh_unread,
                                            "url": "https://www.xiaoheihe.cn/message/home/comment"}})
+        if path == "/api/ui_theme":
+            # 桌面窗口壳: 页面首次启动(壳内localStorage为空)时从这里恢复主界面主题/强调色
+            acc_id = sget("ui_accent_id")
+            acc_hex = sget("float_ball_accent")
+            theme = sget("ui_theme")
+            if theme not in ("light", "dark"):
+                theme = "light" if sget("float_ball_light") == "1" else "dark"
+            return self.send_json({"theme": theme, "accent_id": acc_id,
+                                   "accent_hex": acc_hex if re.match(r"^#[0-9a-fA-F]{6}$", acc_hex or "") else ""})
+        
         if path == "/api/ui_version":
             # 悬浮球心跳打这里(兼作「定位悬浮球」通道); 前端也用它检测更新
             return self.send_json({"version": ui_version()})
@@ -9364,6 +9374,9 @@ class Handler(BaseHTTPRequestHandler):
                 light = bool(theme.get("light"))
                 sset("float_ball_light", "1" if light else "0")
                 sset("ui_theme", "light" if light else "dark")   # 正式主题键(桌面窗口壳读这份)
+                acc_id = str(theme.get("accent_id") or "").strip()
+                if acc_id and len(acc_id) <= 40 and "<" not in acc_id:
+                    sset("ui_accent_id", acc_id)   # 强调色原始标识(green/pink/custom:#xxx, 供壳内页面恢复)
             prefs_in = body.get("prefs")
             if isinstance(prefs_in, dict):
                 # 悬浮窗调节档位: 白名单校验, 非法值不落库

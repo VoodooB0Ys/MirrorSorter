@@ -10,10 +10,11 @@
 
 注意: pythonnet 对 .NET 虚方法重写(OnPaint 等)不可靠, 必须用 Paint/MouseClick 事件订阅。
 """
+import re
 import threading
 
 
-def install_strip(win, api, bg_rgb=(15, 17, 21)):
+def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None):
     """在窗口顶部安装原生标签栏并下移 WebView2 内容区。须在 GUI 就绪后调用(GUI 线程之外
     调用安全, 内部已 marshal)。返回 update(tabs, active) —— 传入
     [{"id":..,"title":..,"closable":..}] 与激活 id 即重绘。"""
@@ -30,13 +31,13 @@ def install_strip(win, api, bg_rgb=(15, 17, 21)):
     bar_h = max(34, int(44 * scale))
     tab_h = bar_h - 8
     font = Font("Microsoft YaHei", 9.0 * scale)
-    ACCENT = Color.FromArgb(251, 114, 153)      # 应用主题粉
     TAB_ACTIVE = Color.FromArgb(22, 25, 32)     # 激活标签(=应用 --panel)
     TAB_HOVER = Color.FromArgb(30, 34, 44)      # 非激活悬停
     BG = Color.FromArgb(10, 12, 16)             # 标签栏底色(比窗口更深一档)
     FG_ON = Color.White
     FG_OFF = Color.FromArgb(150, 158, 172)
-    st = {"tabs": [], "active": 0, "hover_btn": None, "hover_tab": None}
+    st = {"tabs": [], "active": 0, "hover_btn": None, "hover_tab": None,
+          "accent": Color.FromArgb(251, 114, 153)}   # 默认主题粉; accent_watch 会用设置文件的强调色覆盖
     lock = threading.Lock()
     form = win.native
 
@@ -91,8 +92,8 @@ def install_strip(win, api, bg_rgb=(15, 17, 21)):
             # 顶圆角矩形, 底边贴住栏底 —— 与内容区相连的浏览器标签观感
             g.FillPath(SolidBrush(TAB_ACTIVE if act else (TAB_HOVER if hov else BG)),
                        _rounded_path(x, 0, tw, bar_h, rad))
-            if act:   # 顶部强调条
-                g.FillRectangle(SolidBrush(ACCENT), float(x + rad * 0.4), 0.0,
+            if act:   # 顶部强调条(颜色跟随设置文件的强调色)
+                g.FillRectangle(SolidBrush(st["accent"]), float(x + rad * 0.4), 0.0,
                                 float(tw - rad * 0.8), float(int(3 * scale)))
             fg = FG_ON if act else FG_OFF
             close_w = int(22 * scale) if t.get("closable") else int(8 * scale)
@@ -224,6 +225,35 @@ def install_strip(win, api, bg_rgb=(15, 17, 21)):
     strip.MouseDown += on_mouse_down
     strip.MouseMove += on_mouse_move
     strip.MouseLeave += on_mouse_leave
+    def set_accent(hex_str):
+        try:
+            h = str(hex_str or "").strip()
+            if not re.match(r"^#[0-9a-fA-F]{6}$", h):
+                return
+            c = Color.FromArgb(int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16))
+            if st["accent"].ToArgb() != c.ToArgb():
+                st["accent"] = c
+                strip.Invalidate()
+        except Exception:
+            pass
+
+    def accent_watch():
+        import time as _t
+        last = None
+        while True:
+            try:
+                if accent_getter:
+                    cur = accent_getter()
+                    if cur != last:
+                        last = cur
+                        set_accent(cur)
+            except Exception:
+                pass
+            _t.sleep(2)
+
+    if accent_getter:
+        threading.Thread(target=accent_watch, daemon=True, name="msx-accent").start()
+
     strip.Paint += on_paint
     strip.MouseClick += on_mouse_click
     strip.Resize += lambda _s, _e: strip.Invalidate()

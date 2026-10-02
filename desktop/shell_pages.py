@@ -13,9 +13,12 @@ import threading
 import time
 
 
-# 智能深色: 页面背景已是深色(如 PreferredColorScheme 生效的B站夜间) → 不反色;
-# 浅色页面(贴吧等不跟随系统的站) → 反色+色相旋转, 媒体类元素反转回原色
+# 自愈式智能深色: 脚本在页面内常驻定时器, 每1.2s重测背景亮度 ——
+# 页面已深色(原生夜间/PreferredColorScheme生效) → 保持不动;
+# 浅色页面(贴吧等不跟随系统的站) → 反色+色相旋转兜底(媒体类反转回原色);
+# 主题晚于首次测量才应用(SPA懒应用)也会被自动追上; 白天模式由 mode 变量直接关断
 _SMART_JS = r"""
+window.__msx_theme_mode = 'dark';
 (function(){
   function lum(rgb){
     var m = String(rgb).match(/[\d.]+/g);
@@ -23,29 +26,39 @@ _SMART_JS = r"""
     if (m.length > 3 && parseFloat(m[3]) === 0) return -1;
     return 0.299*m[0] + 0.587*m[1] + 0.114*m[2];
   }
-  var b = lum(getComputedStyle(document.body).backgroundColor);
-  var h = lum(getComputedStyle(document.documentElement).backgroundColor);
-  var base = (b >= 0 ? b : (h >= 0 ? h : 255));
-  var old = document.getElementById('__msx_dark');
-  if (base < 100) {
-    if (old) old.remove();
-    document.documentElement.style.removeProperty('filter');
-    return;
+  function tick(){
+    if (window.__msx_theme_mode !== 'dark') {
+      var o = document.getElementById('__msx_dark');
+      if (o) o.remove();
+      document.documentElement.style.removeProperty('filter');
+      return;
+    }
+    var b = lum(getComputedStyle(document.body).backgroundColor);
+    var h = lum(getComputedStyle(document.documentElement).backgroundColor);
+    var base = (b >= 0 ? b : (h >= 0 ? h : 255));
+    var o = document.getElementById('__msx_dark');
+    if (base < 100) {
+      if (o) o.remove();
+      document.documentElement.style.removeProperty('filter');
+    } else if (!o) {
+      var st = document.createElement('style');
+      st.id = '__msx_dark';
+      st.textContent = 'html{filter:invert(0.90) hue-rotate(180deg);background:#fff}'
+        + 'img,video,picture,canvas,svg,iframe,embed,object'
+        + '{filter:invert(1) hue-rotate(180deg)}';
+      (document.head || document.documentElement).appendChild(st);
+    }
   }
-  if (old) return;
-  var st = document.createElement('style');
-  st.id = '__msx_dark';
-  st.textContent = 'html{filter:invert(0.90) hue-rotate(180deg);background:#fff}'
-    + 'img,video,picture,canvas,svg,iframe,embed,object'
-    + '{filter:invert(1) hue-rotate(180deg)}';
-  (document.head || document.documentElement).appendChild(st);
+  if (!window.__msx_theme_timer) window.__msx_theme_timer = setInterval(tick, 1200);
+  tick();
 })()
 """
-_LIGHT_JS = """
+_LIGHT_JS = r"""
+window.__msx_theme_mode = 'light';
 (function(){
   var old = document.getElementById('__msx_dark');
   if (old) old.remove();
-  document.documentElement.style.filter = '';
+  document.documentElement.style.removeProperty('filter');
 })()
 """
 
@@ -147,6 +160,8 @@ def create_pool(win, on_title, on_newtab, theme_getter=None):
             def init_ui():
                 try:
                     import ctypes
+                    from System.Drawing import Color as _C
+                    form.BackColor = _C.FromArgb(15, 17, 21)   # 控件缝隙不露窗体白底
                     u32 = ctypes.windll.user32
                     hwnd = form.Handle.ToInt32()
                     GWL_STYLE = -16
