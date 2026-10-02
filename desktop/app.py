@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.2.8.5a)
+洞鉴虚明 · 基础版 (v0.2.9.0a)
 =========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -47,6 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORTS = (8000, 8010, 8020)
+APP_VER = "v0.2.9.0a"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -12579,18 +12580,24 @@ if __name__ == "__main__":
             except Exception:
                 pass
         sys.exit(0)
+def run_server(auto_open=False):
+    """启动本地服务: 评分守护/选端口/孤儿球清理/租约看门狗/悬浮球带出。
+
+    返回 (server, port); 已有实例在跑 → (None, port), 端口全占 → (None, None)。
+    serve_forever 由调用方决定跑在哪个线程: CLI 主线程 / 窗口壳(app_window.py)后台线程。
+    """
+    global _SERVER
     # 评分器升级(v2: 标题党判低质/挂人开团扣帽子判引战/补小黑盒口径): 只做版本标记,
     # 不整体清评分缓存(全量清缓存会让全扫模式下首屏长时间空白; 新判据随条目自然重评生效)
     if sget("scorer_v") != "3":
         sset("scorer_v", "3")
     _ensure_score_bg()   # 启动后台渐进评分守护线程(评分写库, 交互路径只读缓存不阻塞)
-    AUTO_OPEN = ("--auto-open" in sys.argv) or bool(getattr(sys, "frozen", False))
     for port in PORTS:
         if port_busy(port):
             print("服务已在 http://127.0.0.1:%d 运行" % port)
-            if AUTO_OPEN:
+            if auto_open:
                 webbrowser.open("http://127.0.0.1:%d" % port)
-            sys.exit(0)
+            return None, port
         try:
             server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
             break
@@ -12598,24 +12605,63 @@ if __name__ == "__main__":
             continue
     else:
         print("端口 8000/8010/8020 均被占用, 无法启动")
-        sys.exit(1)
+        return None, None
     _SERVER = server
-    print("洞鉴虚明 v0.2.8.5a 已启动: http://127.0.0.1:%d" % port)
+    print("洞鉴虚明 " + APP_VER + " 已启动: http://127.0.0.1:%d" % port)
     print("按 Ctrl+C 停止服务")
     if os.name == "nt":
         _kill_stale_ball()   # 上次异常退出遗留的孤儿悬浮球(正常退出已被租约收走)
         threading.Thread(target=_lease_watchdog, daemon=True,
                          name="page-lease-watchdog").start()   # 兜底: 页面发不出leaving时收尾
-    if AUTO_OPEN:
+    if auto_open:
         webbrowser.open("http://127.0.0.1:%d" % port)
     if sget("float_ball") == "1" and os.name == "nt":
         float_ball_spawn(port)   # 上次开着悬浮窗 → 本次启动自动带出
+    return server, port
+
+
+def shutdown(server=None):
+    """统一收尾: 停服务/收悬浮球/停线程池与登录会话。CLI 与窗口壳(app_window.py)共用。"""
+    global _SERVER
+    if server is not None:
+        try:
+            server.shutdown()      # 退出 serve_forever 循环(不能在服务线程自身调用)
+        except Exception:
+            pass
+        try:
+            server.server_close()  # 关监听 socket
+        except Exception:
+            pass
+    float_ball_stop()   # 服务退出时收球, 不留孤儿
+    for executor in (_FX, _SERIOUS_X, _SCORE_X, _TAG_X, _EVIDENCE_X):
+        executor.shutdown(wait=False, cancel_futures=True)
+    tb_login_stop()
+    _SERVER = None
+
+
+if __name__ == "__main__":
+    # 悬浮球模式: 本进程只承载 tkinter 小球, 不起服务(必须在任何 DB 初始化之前分流)
+    if "--float-ball" in sys.argv:
+        try:
+            _port = int(sys.argv[sys.argv.index("--float-ball") + 1])
+        except (ValueError, IndexError):
+            _port = 8000
+        try:
+            run_float_ball(_port)
+        except Exception:
+            import traceback
+            try:   # windowed exe 没有 stdout, 错误落盘便于排查
+                with open(os.path.join(DATA_DIR, "float_ball_err.log"), "w",
+                          encoding="utf-8") as _f:
+                    traceback.print_exc(file=_f)
+            except Exception:
+                pass
+        sys.exit(0)
+    _server, _port = run_server(
+        auto_open=("--auto-open" in sys.argv) or bool(getattr(sys, "frozen", False)))
+    if _server is None:
+        sys.exit(0 if _port is not None else 1)
     try:
-        server.serve_forever()
+        _server.serve_forever()
     finally:
-        server.server_close()
-        float_ball_stop()   # 服务退出时收球, 不留孤儿
-        for executor in (_FX, _SERIOUS_X, _SCORE_X, _TAG_X, _EVIDENCE_X):
-            executor.shutdown(wait=False, cancel_futures=True)
-        tb_login_stop()
-        _SERVER = None
+        shutdown(_server)
