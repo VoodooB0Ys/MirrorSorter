@@ -13,10 +13,26 @@ import threading
 import time
 
 
-_DARK_JS = """
+# 智能深色: 页面背景已是深色(如 PreferredColorScheme 生效的B站夜间) → 不反色;
+# 浅色页面(贴吧等不跟随系统的站) → 反色+色相旋转, 媒体类元素反转回原色
+_SMART_JS = r"""
 (function(){
+  function lum(rgb){
+    var m = String(rgb).match(/[\d.]+/g);
+    if (!m) return 255;
+    if (m.length > 3 && parseFloat(m[3]) === 0) return -1;
+    return 0.299*m[0] + 0.587*m[1] + 0.114*m[2];
+  }
+  var b = lum(getComputedStyle(document.body).backgroundColor);
+  var h = lum(getComputedStyle(document.documentElement).backgroundColor);
+  var base = (b >= 0 ? b : (h >= 0 ? h : 255));
   var old = document.getElementById('__msx_dark');
-  if (old) old.remove();
+  if (base < 100) {
+    if (old) old.remove();
+    document.documentElement.style.removeProperty('filter');
+    return;
+  }
+  if (old) return;
   var st = document.createElement('style');
   st.id = '__msx_dark';
   st.textContent = 'html{filter:invert(0.90) hue-rotate(180deg);background:#fff}'
@@ -139,6 +155,13 @@ def create_pool(win, on_title, on_newtab, theme_getter=None):
                                        | 0x00040000 | 0x00010000 | 0x00020000)
                     u32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
                                      0x0020 | 0x0001 | 0x0002 | 0x0004)
+                    try:   # THICKFRAME 会让 DWM 画出一条浅色边框线(Win10 不可调色) → 关掉
+                        #       非客户区渲染; 边缘缩放热区仍在
+                        val = ctypes.c_int(2)   # DWMWA_NCRENDERING_POLICY = DISABLED
+                        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                            hwnd, 2, ctypes.byref(val), ctypes.sizeof(val))
+                    except Exception:
+                        pass
                     _Pool.ctrls[0] = form.webview
                 except Exception:
                     import traceback

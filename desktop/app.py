@@ -9361,7 +9361,9 @@ class Handler(BaseHTTPRequestHandler):
                 acc = str(theme.get("accent") or "").strip()
                 if re.match(r"^#[0-9a-fA-F]{6}$", acc):
                     sset("float_ball_accent", acc)
-                sset("float_ball_light", "1" if theme.get("light") else "0")
+                light = bool(theme.get("light"))
+                sset("float_ball_light", "1" if light else "0")
+                sset("ui_theme", "light" if light else "dark")   # 正式主题键(桌面窗口壳读这份)
             prefs_in = body.get("prefs")
             if isinstance(prefs_in, dict):
                 # 悬浮窗调节档位: 白名单校验, 非法值不落库

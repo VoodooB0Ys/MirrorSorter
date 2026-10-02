@@ -322,10 +322,16 @@ def shell_main(e2e_url=None):
         # GUI 就绪(在 pywebview 的后台线程): 装控件池与标签栏, 再跑测试钩子
         try:
             from shell_pages import create_pool
-            # 站点页面深浅跟随主界面: applyTheme() 每次切主题都会实时推送 float_ball_light
+            # 站点页面深浅跟随主界面: 读正式设置键(applyTheme 每次切主题实时落库),
+            # 旧存档无 ui_theme 时回退悬浮球镜像键
+            def _current_theme():
+                v = app.sget("ui_theme")
+                if v not in ("light", "dark"):
+                    v = "light" if app.sget("float_ball_light") == "1" else "dark"
+                return v
             pages = create_pool(
                 win, api.update_title, lambda _k, u: api.open_in_app(u),
-                theme_getter=lambda: "light" if app.sget("float_ball_light") == "1" else "dark")
+                theme_getter=_current_theme)
             pages.init()          # 等窗体就绪 + WS_THICKFRAME 无边框缩放补丁
             api.bind_pages(pages)
         except Exception:
