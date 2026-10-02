@@ -1,24 +1,47 @@
 # Mirror·Sorter · Desktop
 
-> Current version follows the `web/index.html` footer (e.g. v0.2.6.7a). Android lives in `android/`.
+> Current version follows the `web/index.html` footer (e.g. v0.2.9.0a). Android lives in `android/`.
 
 A locally-running content sorter: aggregates Bilibili / Baidu Tieba / HeyBox
 content → rule + AI filtering → interactive feed + source status panel + AI chat.
-**Zero third-party dependencies** (Python standard library only); all data stays
-in the user directory (`%LOCALAPPDATA%\LocalLow\MirrorSorter`) — the repo itself
-never stores user data.
+**Zero third-party backend dependencies** (server is Python standard library only);
+all data stays in the user directory (`%LOCALAPPDATA%\LocalLow\MirrorSorter`) —
+the repo itself never stores user data.
+
+**Since v0.2.9 the desktop runs in its own app window with a built-in browser:**
+the window is powered by [pywebview](https://github.com/r0x0r/pywebview) (MIT)
+on the system's Edge WebView2 runtime. Clicking any video/post opens it as a
+**tab inside the same window** — no external browser, no extra windows.
 
 ## Quick Start (recommended)
 
 | Action | What it does | Notes |
 |---|---|---|
-| Double-click `启动.bat` | starts the service → opens the browser | requires Python |
-| Double-click `dist\洞鉴虚明.exe` | same, standalone single file | **no Python needed**, portable to any Windows PC |
+| Double-click `启动.bat` | starts the service → opens the **app window** | requires Python + WebView2 (preinstalled on Win10/11) |
+| Double-click `dist\洞鉴虚明v0.2.9.0a.exe` | same, standalone single file | **no Python needed**, portable to any Windows PC |
+| Double-click `启动-服务模式.bat` | old headless mode → opens your default browser | fallback / advanced use |
 | Double-click `停止.bat` | stops all related processes | or kill via Task Manager |
 | Double-click `构建exe.bat` | rebuild the exe | run after changing code |
 
-Double-clicking again is safe: it detects the running service and just opens the browser.
-> ⚠ PyInstaller builds occasionally trigger antivirus false positives — if so, add `dist\洞鉴虚明.exe` to the trust list.
+Double-clicking again is safe: it detects the running service and just opens the window.
+> ⚠ PyInstaller builds occasionally trigger antivirus false positives — if so, add `dist\洞鉴虚明v0.2.9.0a.exe` to the trust list.
+
+## Built-in Browser Tabs (v0.2.9+)
+
+Clicking a feed card, message entry, account link, history/saved item — anything
+that used to open your system browser — now opens as a **tab in the app window**:
+
+- A floating tab bar sits at the **bottom center**: `[信息流] [页面标题 ✕] [⟳] [⧉]`
+  — click a pill to switch tabs, `✕` closes, `⟳` reloads, `⧉` hands the current
+  page to your system browser. It auto-hides while a video goes fullscreen.
+- The feed itself is the pinned `信息流` tab; in-site links navigate within the
+  current tab and the tab remembers its latest address; opening the same link
+  twice just switches to the existing tab.
+- Site logins (e.g. Bilibili) persist across restarts (WebView2 non-private mode).
+- Known trade-off: switching tabs reloads the page (one WebView per window), so
+  playback doesn't continue across tab switches.
+- No WebView2 runtime on the machine? The app falls back to the old
+  external-browser mode automatically (with a one-time notice) — never a blank window.
 
 ## UI Overview
 
@@ -92,8 +115,10 @@ public pages itself.
 
 ```
 cd desktop
-python app.py
-# open http://127.0.0.1:8000
+python app_window.py     # app window (built-in browser tabs) — same as 启动.bat
+python app_window.py --server   # headless service + default browser (old behavior)
+python app.py            # equivalent headless service (CLI)
+# windowless access: http://127.0.0.1:8000
 ```
 
 ## Layout
@@ -101,18 +126,21 @@ python app.py
 ```
 desktop/
 ├── app.py            # backend: fetching + AI scoring + SQLite + all APIs + local server
+├── app_window.py     # window shell (exe entry): pywebview window + built-in browser tabs
 ├── web/index.html    # UI skeleton
 ├── web/style.css     # styles
-├── web/app.js        # frontend logic
+├── web/app.js        # frontend logic (openExternal routes links into shell tabs)
+├── test_shell.py     # shell/tab-manager smoke tests (no GUI)
 ├── data.db           # data (auto-created; delete to reset)
-├── 启动.bat / 停止.bat / 构建exe.bat
-└── dist\洞鉴虚明.exe  # standalone single-file build
+├── 启动.bat / 启动-服务模式.bat / 停止.bat / 构建exe.bat
+└── dist\洞鉴虚明v0.2.9.0a.exe  # standalone single-file build
 ```
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
+| "未检测到 WebView2 运行时" notice | install the [WebView2 Evergreen runtime](https://developer.microsoft.com/microsoft-edge/webview2/) — Win10/11 usually have it already |
 | Page shows "offline sample data" | no network or Bilibili rate-limiting; click "Refresh now" and retry later |
 | AI calls fail | check API URL / key / model in settings; DeepSeek keys start with `sk-` |
 | Start over | delete `data.db` (or Account → clear all data) |
