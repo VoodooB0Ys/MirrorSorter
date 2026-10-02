@@ -1,7 +1,24 @@
-/* 洞鉴虚明 v0.2.8.0b - 前端逻辑 */
+/* 洞鉴虚明 v0.2.9.0a - 前端逻辑 */
 "use strict";
 
 const $ = (s) => document.querySelector(s);
+
+/* ---------- 链接跳转统一出口 ----------
+   桌面窗口壳(pywebview, 见 app_window.py)内 → 应用内置浏览器窗口;
+   普通浏览器/安卓壳 → 原生 window.open(安卓壳的 WebView 会转交系统浏览器)。
+   壳未就绪/桥被拒/返回非 ok 时都退回 window.open, 任何环境都能打开。 */
+function openExternal(url) {
+  try {
+    const a = window.pywebview && window.pywebview.api;
+    if (a && a.open_in_app) {
+      Promise.resolve(a.open_in_app(url, "")).then((r) => {
+        if (r !== "ok") window.open(url, "_blank", "noopener");
+      }).catch(() => window.open(url, "_blank", "noopener"));
+      return;
+    }
+  } catch (_) {}
+  window.open(url, "_blank", "noopener");
+}
 
 const pageLeaseToken = crypto.randomUUID ? crypto.randomUUID() :
   (Date.now().toString(36) + Math.random().toString(36).slice(2));
@@ -57,7 +74,7 @@ function updateMessageButton(platform, data) {
   }
   button.onclick = (e) => {
     e.stopPropagation();
-    if (data && data.url) window.open(data.url, "_blank", "noopener");
+    if (data && data.url) openExternal(data.url);
   };
 }
 async function loadMessages() {
@@ -651,7 +668,7 @@ function openPlayer(bvid, title) {
     '</div>';
   document.body.appendChild(playerBox);
   $("#pbClose").onclick = closePlayer;
-  $("#pbJump").onclick = () => window.open("https://www.bilibili.com/video/" + bvid, "_blank", "noopener");
+  $("#pbJump").onclick = () => openExternal("https://www.bilibili.com/video/" + bvid);
 }
 function closePlayer() {
   if (playerBox) { playerBox.remove(); playerBox = null; }
@@ -674,7 +691,7 @@ function openReader(tid, title) {
     '<div class="rb-body"><div class="rb-loading">正在加载帖子…</div></div>';
   document.body.appendChild(readerBox);
   $("#rbClose").onclick = closeReader;
-  $("#rbJump").onclick = () => window.open("https://tieba.baidu.com/p/" + tid, "_blank", "noopener");
+  $("#rbJump").onclick = () => openExternal("https://tieba.baidu.com/p/" + tid);
   api("/api/tieba/thread?tid=" + encodeURIComponent(tid)).then((d) => {
     if (!readerBox) return;
     const body = readerBox.querySelector(".rb-body");
@@ -740,10 +757,10 @@ async function openXhhReader(lid, title) {
       }
       // 安卓壳: 官方 heybox://link 协议进帖子, id用数字linkid(评论要用, hex会报帖子id错误);
       // App未装时壳回落到 #web= 网页; 无xlid时退化用网页hex
-      window.open(xhhJumpUrl(webUrl, readerBoxXlid || lid, readerBoxLtag), "_blank", "noopener");
+      openExternal(xhhJumpUrl(webUrl, readerBoxXlid || lid, readerBoxLtag));
     } else {
       // 桌面端: 直接开网页(heybox://深链留给安卓壳; 浏览器没装PC客户端时协议跳转体验差)
-      window.open(webUrl, "_blank", "noopener");
+      openExternal(webUrl);
     }
   };
   const d = await api("/api/xhh/thread?link_id=" + encodeURIComponent(lid)).catch(() => null);
@@ -892,7 +909,7 @@ function openCard(card, key) {
 }
 function openItem(key, url) {
   api("/api/click", { method: "POST", body: { key } });
-  window.open(url, "_blank", "noopener");
+  openExternal(url);
 }
 
 /* ---------- 简介悬浮提示(跟随白天/黑夜主题, 避免原生title刺眼) ---------- */
@@ -1017,7 +1034,7 @@ async function loadHistory() {
       <div class="s"><span>${esc(it.platform)}</span><span>${ago(it.ts)}</span></div>
     </div>`).join("") || '<div class="meta-line" style="border:none">还没有浏览记录</div>';
   $("#panelBody").querySelectorAll(".t").forEach((el) =>
-    el.addEventListener("click", () => window.open(el.dataset.url, "_blank", "noopener")));
+    el.addEventListener("click", () => openExternal(el.dataset.url)));
 }
 async function loadSaved() {
   const kind = state.savedKind;
@@ -1034,7 +1051,7 @@ async function loadSaved() {
           <button class="del" data-del="${esc(it.key)}">移除</button></div>
       </div>`).join("") || '<div class="meta-line" style="border:none">列表为空</div>';
   $("#panelBody").querySelectorAll(".t").forEach((el) =>
-    el.addEventListener("click", () => window.open(el.dataset.url, "_blank", "noopener")));
+    el.addEventListener("click", () => openExternal(el.dataset.url)));
   $("#panelBody").querySelectorAll("[data-del]").forEach((el) =>
     el.addEventListener("click", async () => {
       await api("/api/saved", { method: "POST", body: { key: el.dataset.del, kind, remove: true } });
@@ -1856,7 +1873,7 @@ function addSelfLoginLink(box, url) {
   btn.className = "alt";
   btn.style.cssText = "margin-top:8px;width:100%";
   btn.textContent = "📱 本机登录：在浏览器中打开确认页";
-  btn.onclick = () => window.open(url, "_blank", "noopener");
+  btn.onclick = () => openExternal(url);
   box.appendChild(btn);
 }
 async function qrStart() {
@@ -1924,7 +1941,7 @@ async function loadAccountView() {
     : "";
 }
 $("#qrRefresh").onclick = qrStart;
-$("#acctOpen").onclick = () => window.open("https://www.bilibili.com", "_blank", "noopener");
+$("#acctOpen").onclick = () => openExternal("https://www.bilibili.com");
 $("#acctLogin").onclick = async () => {
   const cookie = $("#acctCookie").value.trim();
   if (!cookie) { toast("请先粘贴 Cookie", { warn: true }); return; }

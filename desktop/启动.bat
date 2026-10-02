@@ -14,12 +14,12 @@ if not defined PYCMD (
 
 where pythonw >nul 2>nul
 if not errorlevel 1 (
-  start "" pythonw app.py --auto-open
+  start "" pythonw app_window.py
 ) else (
-  start "" /min %PYCMD% app.py --auto-open
+  start "" /min %PYCMD% app_window.py
 )
 
-echo 洞鉴虚明已启动，浏览器应自动打开页面。
-echo 如未自动打开，请手动访问 http://127.0.0.1:8000
+echo 洞鉴虚明已启动，应用窗口应自动弹出(内置浏览器版)。
+echo 关闭应用窗口即退出服务；如需外部浏览器访问: python app.py --auto-open
 timeout /t 2 /nobreak >nul
 exit /b 0
