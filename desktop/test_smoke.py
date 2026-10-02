@@ -4,7 +4,9 @@
 """
 import importlib.util
 import json
+import math
 import os
+import re
 import shutil
 import sys
 import threading
@@ -46,6 +48,10 @@ class MockLLM(BaseHTTPRequestHandler):
         is_intent = any("想让系统做什么" in (m.get("content") or "") for m in body.get("messages", []))
         is_score = any("内容筛选技能" in (m.get("content") or "") for m in body.get("messages", []))
         is_terms = any("近义词/相关搜索词" in (m.get("content") or "") for m in body.get("messages", []))
+        is_verify = any("事实核查员" in (m.get("content") or "") for m in body.get("messages", []))
+        is_rebut = any("对线的当事人" in (m.get("content") or "") for m in body.get("messages", []))
+        is_judge = any("网络对线的裁判" in (m.get("content") or "") for m in body.get("messages", []))
+        is_decomp = any("论点拆解器" in (m.get("content") or "") for m in body.get("messages", []))
         if is_score:
             MockLLM.score_calls += 1
             user_msg = next((m for m in body.get("messages", []) if m.get("role") == "user"), {})
@@ -86,6 +92,149 @@ class MockLLM(BaseHTTPRequestHandler):
                 ["深挖词%d" % n], ensure_ascii=False)}}],
                 "usage": {"prompt_tokens": 4, "completion_tokens": 2}},
                 ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+        if is_decomp:
+            # 拆解桩按原话给词: 查询词必须和搜索桩的返回内容对得上, 否则相关度过滤
+            # 会把证据全滤掉(这正是真实链路里「查询词照抄对方措辞就搜不到东西」的同一件事)
+            _usr = next((m.get("content", "") for m in body.get("messages", [])
+                         if m.get("role") == "user"), "")
+            if "可乐" in _usr:
+                _payload = {"claims": [{"point": "可乐能杀灭蛔虫", "query": "可乐 杀灭 蛔虫",
+                                        "counter": "可乐 蛔虫 医学 研究"}],
+                            "best_counter": "可乐 杀灭 蛔虫 辟谣"}
+            else:
+                _payload = {"claims": [{"point": "以色列空军战机能飞到中国", "query": "以色列空军 转场航程",
+                                        "counter": "以色列空军 空中加油 航程 实际"},
+                                       {"point": "中国战机飞不到以色列", "query": "中国空军 作战半径",
+                                        "counter": "中国战机 海外部署 远航 案例"}],
+                            "best_counter": "以色列空军 远程奔袭 战例 距离"}
+            out = json.dumps({"choices": [{"message": {"content": json.dumps(
+                _payload, ensure_ascii=False)}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 8}},
+                ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+        if is_verify:
+            user = next((m.get("content", "") for m in body.get("messages", [])
+                         if m.get("role") == "user"), "")
+            if "改用纯文本" in user:   # 纯文本兜底桩
+                reply = "结论：虚假（置信度85%）说法与权威证据矛盾\n- 与权威来源结论相反\n- 无可靠来源支持"
+            elif "触发降级" in user:   # 模拟推理模型截断: JSON 两次全坏
+                reply = '{"verdict": "fals'
+            else:
+                base = {"verdict": "false", "confidence": 88,
+                        "summary": "说法与权威来源相矛盾",
+                        "reasons": ["与权威来源结论相反[E1]", "无任何可靠来源支持[E1]"],
+                        "claims": [{"point": "以色列空军能飞到中国", "check": "false",
+                                    "note": "权威来源显示相反[E1]"}],
+                        "evidence_used": ["E1"]}
+                if "知识误区" in user:   # 误区/谬误分析常驻: 核查必然点名
+                    base["fallacies"] = ["假两难"]
+                reply = json.dumps(base, ensure_ascii=False)
+            out = json.dumps({"choices": [{"message": {"content": reply}}],
+                              "usage": {"prompt_tokens": 30, "completion_tokens": 20}},
+                             ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+        if is_judge:
+            # 独立裁判角色: 只看稿子。命中AI八股就判 revise, 让写手按意见重写
+            draft = next((m.get("content", "") for m in body.get("messages", [])
+                          if m.get("role") == "user"), "")
+            if "一方面" in draft or "另一方面" in draft:
+                reply = json.dumps({"verdict": "revise",
+                                    "problems": ["第2条是AI八股套话, 改成真人随手打的语气"],
+                                    "weakest": "第2条只有转折腔, 没有具体依据"},
+                                   ensure_ascii=False)
+            else:
+                reply = json.dumps({"verdict": "pass", "problems": [], "weakest": ""},
+                                   ensure_ascii=False)
+            out = json.dumps({"choices": [{"message": {"content": reply}}],
+                              "usage": {"prompt_tokens": 30, "completion_tokens": 20}},
+                             ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+        if is_rebut:
+            user = next((m.get("content", "") for m in body.get("messages", [])
+                         if m.get("role") == "user"), "")
+            cnt = 2
+            mc = re.search(r"现在写\s*(\d+)\s*条", user)
+            if mc:
+                cnt = int(mc.group(1))
+
+            def _lines(clean=False):
+                pool = [{"text": "作战半径摆在那，战机当火箭使？",
+                         "basis": "公开航程数据不支持[E1]", "target": "知识误区"},
+                        {"text": "先把航程查明白再来跟我说话",
+                         "basis": "公开数据不支撑该断言[E1]", "target": "以偏概全"},
+                        {"text": "体系对抗时代还在数单机航程",
+                         "basis": "证据无相关内容[E1]", "target": "知识误区"}]
+                if not clean:   # 首版埋一条AI八股, 逼出重写分支
+                    pool[1] = {"text": "一方面懒得查证，另一方面又急着下结论",
+                               "basis": "公开数据不支撑该断言[E1]", "target": "以偏概全"}
+                return pool[:cnt]
+
+            def _paras():
+                return [{"text": "我拿公开数据跟你说话：以军战机转场要多次空中加油，"
+                                 "几千公里直线距离根本撑不起护航航程，你把这当成作战半径就是偷换概念。",
+                         "basis": "公开航程数据不支持[E1]", "target": "偷换概念"} for _ in range(cnt)]
+
+            if "改用纯文本" in user:
+                reply = "转场航程差着数量级，拿地图直线当作战半径？\n把作战半径和空中加油摆一起看\n就这还想让我服气"
+            elif "触发降级" in user:
+                reply = "这不是JSON，是一段普通的话"
+            elif "先拆对方这段话的问题" in user:
+                if "无可回怼" in user:   # 正常反馈桩: 模型应声明无可回怼
+                    reply = json.dumps({"no_target": True,
+                                        "reason": "这是正常的产品反馈, 没有攻击性观点"},
+                                       ensure_ascii=False)
+                else:
+                    reply = json.dumps({
+                        "targets": [{"point": "以色列空军能飞到中国", "kind": "知识误区",
+                                     "note": "转场航程与作战半径差着数量级"},
+                                    {"point": "中国战机飞不到以色列", "kind": "以偏概全",
+                                     "note": "拿单机航程当体系投送能力"}],
+                        "stance_note": "证据一致否定该说法"}, ensure_ascii=False)
+            elif "按裁判意见重写一版" in user:   # 裁判复核后的重写桩: 返回干净版
+                if "一段话" in user:
+                    items = _paras()
+                elif "长篇" in user:
+                    items = [{"text": "你的两个论点我都拆过了：转场航程和作战半径差着数量级，"
+                                       "拿地图直线当投送距离，这套算法连基础军事常识都过不了。",
+                              "basis": "公开航程数据[E1]", "target": "整体反驳"}]
+                else:
+                    items = _lines(clean=True)
+                reply = json.dumps({"items": items}, ensure_ascii=False)
+            elif "长篇" in user:
+                reply = json.dumps({"items": [
+                    {"text": "你的两个论点我都拆过了：转场航程和作战半径差着数量级，"
+                             "拿地图直线当投送距离，这套算法连基础军事常识都过不了。",
+                     "basis": "公开航程数据[E1]", "target": "整体反驳"}]}, ensure_ascii=False)
+            elif "一段话" in user:
+                reply = json.dumps({"items": _paras()}, ensure_ascii=False)
+            elif "一句话" in user:
+                reply = json.dumps({"items": _lines()}, ensure_ascii=False)
+            else:
+                reply = json.dumps({"items": _lines()}, ensure_ascii=False)
+            out = json.dumps({"choices": [{"message": {"content": reply}}],
+                              "usage": {"prompt_tokens": 30, "completion_tokens": 25}},
+                             ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(out)))
@@ -1204,6 +1353,1041 @@ try:
     # 小黑盒状态API
     dx = req("/api/xhh")
     check("小黑盒状态API", dx.get("ok") is True, dx)
+
+    # ---------- AI 悬浮窗: 联网证据管线 + 悬浮球端点 ----------
+    # MockLLM 增补核查/回怼/查询词桩(见 MockLLM.do_POST 顶部标记)
+    def req_sse(path, body):
+        data = json.dumps(body).encode("utf-8")
+        r = urllib.request.Request("http://127.0.0.1:8099" + path, data=data,
+                                   headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=60) as resp:
+            return resp.read().decode("utf-8", "replace")
+
+    def parse_sse(raw):
+        evs = []
+        for chunk in raw.split("\n\n"):
+            ev, data = None, {}
+            for line in chunk.split("\n"):
+                if line.startswith("event:"):
+                    ev = line[6:].strip()
+                elif line.startswith("data:"):
+                    try:
+                        data = json.loads(line[5:].strip())
+                    except Exception:
+                        pass
+            if ev:
+                evs.append((ev, data))
+        return evs
+
+    # JSON 容错解析: 围栏 / 前后废话 / 嵌套 / 无JSON报错
+    check("悬浮窗:JSON容错-围栏", app.llm_json('```json\n{"a":1}\n```')["a"] == 1)
+    check("悬浮窗:JSON容错-废话", app.llm_json('好的，结果：{"a": {"b": 2}} 请查收')["a"]["b"] == 2)
+    try:
+        app.llm_json("完全没有JSON")
+        check("悬浮窗:JSON容错-报错", False)
+    except ValueError:
+        check("悬浮窗:JSON容错-报错", True)
+    check("悬浮窗:反八股清洗", app._deflavor("值得注意的是，综上所述他不仅错了——还嘴硬。")
+          == "说到底，他不仅错了，还嘴硬。")
+
+    # Bing/DDG/360 解析器(喂固定HTML, 不出网)
+    bing_html = ('<ol><li class="b_algo"><h2><a href="https://www.who.int/zh/news/a">'
+                 '世卫声明：可乐杀蛔虫不实</a></h2>'
+                 '<div><p>世卫组织表示可乐杀蛔虫的说法不实</p></div></li>'
+                 '<li class="b_algo"><h2><a href="/relative/path">相对链接</a></h2><p>x</p></li></ol>')
+    ddg_html = ('<a href="https://lite.duckduckgo.com/l/?uddg=https%3A%2F%2Fzh.wikipedia.org%2Fwiki%2F%E8%B0%A3%E8%A8%80">'
+                '维基谣言条目</a><td class="result-snippet">谣言辟谣内容</td>'
+                '<a href="https://example.com/ddg2">直接结果</a>')
+    soe_html = ('<h3 class="res-title"><a href="https://www.so.com/link?m=abc" '
+                'data-mdurl="https://new.qq.com/rain/a/WHO2024">世卫研究提醒</a></h3>'
+                '<p class="res-desc">2024年9月10日 - 少喝一口酒就是保护自己</p>'
+                '<h3 class="res-title"><a href="https://news.example.com/b">直链结果</a></h3>'
+                '<p class="res-desc">直链摘要</p>'
+                '<h3 class="res-title"><a href="https://www.so.com/link?m=nourl">无mdurl跳转</a></h3><p>x</p>')
+    old_http_get, old_fetch_page = app._http_get_text, app.fetch_page_text
+
+    def fake_http_get(url, timeout=10):
+        if "so.com/s" in url:
+            return soe_html
+        if "bing.com" in url:
+            return bing_html
+        if "duckduckgo" in url:
+            return ddg_html
+        raise AssertionError("意外出网: " + url)
+
+    def fake_fetch_page(url, max_chars=3200):
+        return "权威正文：研究表明该说法不成立。" if "who.int" in url else ""
+
+    app._http_get_text = fake_http_get
+    app.fetch_page_text = fake_fetch_page
+    app._SEARCH_CACHE.clear()
+    try:
+        rs = app.search_soe("测试", 6)
+        check("悬浮窗:360解析", len(rs) == 2 and rs[0]["url"] == "https://new.qq.com/rain/a/WHO2024"
+              and "世卫" in rs[0]["title"] and "少喝一口酒" in rs[0]["snippet"], rs)
+        # 新版 360 结果块: a 里套 h3, 真实地址藏在 /jump?u= 参数里
+        soe_new = ('<div class="g-card res-list"><a class=alink '
+                   'href="https://m.so.com/jump?u=https%3A%2F%2Fzhuanlan.zhihu.com%2Fp%2F1&amp;m=ab" '
+                   'data-md=\'{"b":"title"}\'><h3 class="res-title"><em>2024</em>年大厂裁员15万人 知乎</h3></a>'
+                   '<p class="g-main summary">互联网大厂如Meta、字节跳动等也进行了裁员。</p></div>'
+                   '<div><a href="https://m.so.com/jump?m=nourl"><h3 class="res-title">无目标跳转</h3></a></div>')
+        app._http_get_text = lambda url, timeout=10: soe_new
+        app._SEARCH_CACHE.clear()
+        try:
+            rs = app.search_soe("大厂裁员", 6)
+            check("悬浮窗:新版360解析", len(rs) == 1
+                  and rs[0]["url"] == "https://zhuanlan.zhihu.com/p/1"
+                  and "裁员" in rs[0]["title"] and "字节跳动" in rs[0]["snippet"], rs)
+        finally:
+            app._http_get_text = fake_http_get
+        # 神马(m.sm.cn): 目前唯一稳定能命中中文新闻正文的引擎 —— 按 data-tpl 切块,
+        # 块内首个外链是真实地址(站内跳转要丢弃), 标题/摘要/来源各自独立
+        sm_html = (
+            '<div data-tpl="structure_template_normal">'
+            '<a href="https://www.thepaper.cn/newsDetail_forward_1">'
+            '<div class="qk-title-text qk-font-bold">055型驱逐舰绕澳航行2万公里</div>'
+            '<div class="qk-paragraph-text">全程无靠岸补给, 舰体无明显锈迹</div>'
+            '<div class="qk-source-item">澎湃新闻 · 3天前</div></a></div>'
+            '<div data-tpl="structure_template_normal">'
+            '<a href="https://m.sm.cn/s?q=x"><div class="qk-title-text">站内跳转丢弃</div></a></div>'
+            '<div data-tpl="structure_template_normal">'
+            '<a href="https://www.sohu.com/a/2">'
+            '<div class="qk-title-text">美国航母部署286天后满身锈迹</div></a></div>'
+            '<div data-tpl="structure_template_normal"><a href="https://example.com/3">'
+            '<div class="qk-paragraph-text">无标题则丢弃</div></a></div>')
+        app._http_get_text = lambda url, timeout=10: sm_html
+        app._SEARCH_CACHE.clear()
+        try:
+            rs = app.search_sm("055驱逐舰 绕澳大利亚", 6)
+            check("悬浮窗:神马解析",
+                  len(rs) == 2
+                  and rs[0]["url"] == "https://www.thepaper.cn/newsDetail_forward_1"
+                  and "055" in rs[0]["title"] and "无靠岸补给" in rs[0]["snippet"]
+                  and "澎湃" in rs[0]["site"] and rs[1]["site"] == "www.sohu.com", rs)
+            check("悬浮窗:神马无结果块返回空", app._sm_parse("<html>访问异常</html>", 6) == [])
+        finally:
+            app._http_get_text = fake_http_get
+        rs = app.search_bing("测试", 6)
+        check("悬浮窗:Bing解析", len(rs) == 1 and rs[0]["url"] == "https://www.who.int/zh/news/a"
+              and "世卫" in rs[0]["title"] and "不实" in rs[0]["snippet"], rs)
+        merged = app.web_search("测试", 8)   # 360 两条<3 → 叠 Bing(1条) → 凑满3条即止
+        urls = " ".join(r["url"] for r in merged)
+        check("悬浮窗:三级兜底合并", len(merged) == 3 and "new.qq.com" in urls
+              and "who.int/zh/news/a" in urls, merged)
+        # 前两级全挂 → 降级到 DDG 也能出结果
+        def fake_http_get_ddg_only(url, timeout=10):
+            if "duckduckgo" in url:
+                return ddg_html
+            return "<html></html>"
+        app._http_get_text = fake_http_get_ddg_only
+        app._SEARCH_CACHE.clear()
+        merged2 = app.web_search("兜底", 8)
+        check("悬浮窗:仅DDG兜底", len(merged2) == 2
+              and any("wikipedia.org" in r["url"] for r in merged2), merged2)
+        app._http_get_text = fake_http_get
+        check("悬浮窗:可信度分级", app.domain_cred("https://www.who.int/x") == "high"
+              and app.domain_cred("https://tieba.baidu.com/p/1") == "low"
+              and app.domain_cred("https://baike.baidu.com/item/x") == "mid")
+        # 通用实体页识别: 引擎退化成头词匹配时只会回这些, 一条都不能当证据
+        check("悬浮窗:实体页识别",
+              all(app._is_entity_page(t) for t in
+                  ("山东省_百度百科", "山东省人民政府", "山东省行政区划_百度百科",
+                   "山东省教育招生考试院官网", "百度百科·美国", "辽宁旅游最值得去的10大景点",
+                   "中文 (中国) - United States Department of State", "055型驱逐舰_百度百科"))
+              and not app._is_entity_page("食物短缺、精神崩溃、舰体生锈 美国“林肯”号航母结束286天部署返美")
+              and not app._is_entity_page("山东舰航母编队首次赴西太平洋远海训练"), "")
+        ev = app.gather_evidence("可乐杀蛔虫", [])
+        check("悬浮窗:证据抓取排序", ev and ev[0]["_cred"] in ("high", "mid")
+              and any(r.get("page") for r in ev), ev)
+
+        # 营销号过滤: 低可信域名/震惊体标题在可靠来源充足时整体剔除
+        old_ws = app.web_search
+        app.web_search = lambda q, n=8: [
+            {"title": "某说法的权威研究", "url": "https://www.who.int/x", "snippet": ""},
+            {"title": "某说法可靠新闻", "url": "https://news.qq.com/y", "snippet": ""},
+            {"title": "某说法正常讨论", "url": "https://zhihu.com/z", "snippet": ""},
+            {"title": "震惊！某说法太可怕了", "url": "https://baijiahao.baidu.com/s?id=1", "snippet": ""},
+            {"title": "某说法普通文章", "url": "https://www.360kuai.com/a", "snippet": ""},
+            {"title": "紧急提醒！某说法是真的", "url": "https://news.qq.com/spam", "snippet": ""},
+        ]
+        try:
+            ev = app.gather_evidence("某说法", [])
+            urls = " ".join(r["url"] for r in ev)
+            check("悬浮窗:营销号过滤", len(ev) == 3 and "baijiahao" not in urls
+                  and "360kuai" not in urls and "/spam" not in urls, urls)
+        finally:
+            app.web_search = old_ws
+
+        # 引擎退化成头词匹配 → 回一堆通用实体页。这些绝不能进证据(实测模型会拿
+        # 「沈阳市_百度百科」当反例), 一条真证据都没有就该老实回空, 让上层说"未搜到网络证据"
+        old_ws = app.web_search
+        app.web_search = lambda q, n=8: [
+            {"title": "山东省_百度百科", "url": "https://baike.baidu.com/item/1", "snippet": "山东省"},
+            {"title": "山东省人民政府", "url": "https://www.shandong.gov.cn/", "snippet": ""},
+            {"title": "百度百科·美国", "url": "https://baike.baidu.com/item/2", "snippet": "美国"},
+            {"title": "辽宁旅游最值得去的10大景点", "url": "https://zhuanlan.zhihu.com/p/3", "snippet": ""},
+        ]
+        try:
+            ev = app.gather_evidence("山东舰 西太平洋 部署 天数", ["山东舰 西太平洋 部署 天数"])
+            check("悬浮窗:实体页不进证据", ev == [], ev)
+        finally:
+            app.web_search = old_ws
+
+        # 引擎风控 → 冷却: 被 captcha/「访问异常」页挡下后不再硬打(越打风控越久),
+        # 冷却期内连网络都不请求
+        _old_get = app._http_get_text
+        _hits = []
+        app._ENGINE_COOLDOWN.clear()
+        app._http_get_text = lambda url, timeout=10: (_hits.append(url)
+                                                      or '<script>window.location.replace("https://m.sm.cn//s/_____tmd_____/punish?x5secdata=abc")</script>')
+        try:
+            check("悬浮窗:风控页判定", app._engine_block("t", "访问异常页面") is True
+                  and app._engine_block("t2", "<html>正常页面</html>") is False)
+            app._ENGINE_COOLDOWN.clear()
+            check("悬浮窗:风控后回空", app.search_sm("测试", 6) == [] and len(_hits) == 1, _hits)
+            check("悬浮窗:冷却期内不再请求",
+                  app.search_sm("测试", 6) == [] and len(_hits) == 1, _hits)
+        finally:
+            app._http_get_text = _old_get
+            app._ENGINE_COOLDOWN.clear()
+
+        # 相关度过滤: 搜索引擎只匹配头一个词(回百科词条/日历页), 无关结果不进证据
+        old_ws2 = app.web_search
+        app.web_search = lambda q, n=8: [
+            {"title": "2024年程序员就业报告", "url": "https://www.stats.gov.cn/a",
+             "snippet": "程序员岗位变化统计"},
+            {"title": "2024年_百度百科", "url": "https://baike.baidu.com/item/2024", "snippet": ""},
+            {"title": "万年历2024年日历表", "url": "https://www.rili.com.cn/2024/", "snippet": ""},
+        ]
+        try:
+            ev = app.gather_evidence("2024年程序员岗位减少了四成", [])
+            urls = " ".join(r["url"] for r in ev)
+            check("悬浮窗:相关度过滤", len(ev) == 1 and "stats.gov.cn" in urls
+                  and "baike" not in urls and "rili" not in urls, urls)
+            # 相关度全为 0 时不硬塞垃圾证据
+            app.web_search = lambda q, n=8: [
+                {"title": "万年历2024年日历表", "url": "https://www.rili.com.cn/2024/", "snippet": ""},
+                {"title": "2024年_百度百科", "url": "https://baike.baidu.com/item/2024", "snippet": ""},
+            ]
+            check("悬浮窗:全不相关则不要证据",
+                  app.gather_evidence("量子纠缠的退相干时间被观测到了", []) == [])
+        finally:
+            app.web_search = old_ws2
+        check("悬浮窗:相关度切词", app._relevance("大厂都在裁员", "互联网大厂裁员比例统计") >= 0.3
+              and app._relevance("大厂都在裁员", "大厂回族自治县_百度百科") < 0.3
+              and app._relevance("大厂都在裁员", "2024年日历表") == 0
+              and app._relevance("ab", "随便什么") == 1.0)
+    finally:
+        app._http_get_text, app.fetch_page_text = old_http_get, old_fetch_page
+        app._SEARCH_CACHE.clear()
+
+    # /api/floatball 开关与状态(spawn 打桩 + 假进程, 不真拉起 tkinter; stop 走真逻辑验证闭环)
+    class _FakeBallProc:
+        def poll(self):
+            return None
+        def terminate(self):
+            pass
+        def wait(self, timeout=None):
+            return 0
+        def kill(self):
+            pass
+
+    old_spawn, old_proc = app.float_ball_spawn, app._BALL_PROC
+    spawn_calls = []
+
+    def fake_spawn(port):
+        spawn_calls.append(port)
+        app._BALL_PROC = _FakeBallProc()
+        return True
+
+    app.float_ball_spawn = fake_spawn
+    try:
+        d = req("/api/floatball", {"enabled": True})
+        check("悬浮窗:开关开启", d.get("ok") and d.get("running") is True and spawn_calls == [8000], (d, spawn_calls))
+        check("悬浮窗:开关持久化", app.sget("float_ball") == "1")
+        d = req("/api/floatball")
+        check("悬浮窗:状态查询", d.get("enabled") is True and d.get("running") is True, d)
+        d = req("/api/floatball", {"enabled": False})
+        check("悬浮窗:开关关闭", d.get("ok") and d.get("running") is False and app.sget("float_ball") == "0", d)
+    finally:
+        app.float_ball_spawn, app._BALL_PROC = old_spawn, old_proc
+
+    # AI 未配置 → 直接 JSON 拒绝(非 SSE)
+    old_key = app.sget("ai_key")
+    app.sset("ai_key", "")
+    try:
+        try:
+            req("/api/ai/assist", {"mode": "verify", "text": "测试"})
+            check("悬浮窗:AI未配置拒绝", False)
+        except urllib.error.HTTPError as e:
+            check("悬浮窗:AI未配置拒绝", e.code == 403, e.code)
+    finally:
+        app.sset("ai_key", old_key)
+
+    # 空文本 / 非法模式 → 400
+    try:
+        req("/api/ai/assist", {"mode": "verify", "text": "   "})
+        check("悬浮窗:空文本拒绝", False)
+    except urllib.error.HTTPError as e:
+        check("悬浮窗:空文本拒绝", e.code == 400)
+    try:
+        req("/api/ai/assist", {"mode": "hack", "text": "x"})
+        check("悬浮窗:非法模式拒绝", False)
+    except urllib.error.HTTPError as e:
+        check("悬浮窗:非法模式拒绝", e.code == 400)
+
+    # 论点拆解(逐个击破的第一步); 搜索/正文抓取保持打桩, 测试不出网
+    app._http_get_text = fake_http_get
+    app.fetch_page_text = fake_fetch_page
+    app._SEARCH_CACHE.clear()
+    cl = app.decompose_claim("以色列空军能飞到中国，中国战机飞不到以色列")
+    check("悬浮窗:论点拆解", len(cl) == 2 and cl[0]["point"] and cl[0]["query"], cl)
+    check("悬浮窗:拆解带反例向查询词", cl[0]["counter"] == "以色列空军 空中加油 航程 实际", cl)
+    cl = app.decompose_claim("地球绕着太阳转")
+    check("悬浮窗:短句不脑补拆解", len(cl) == 1 and cl[0]["point"] == "地球绕着太阳转", cl)
+
+    # 查询池: 整段反例 + 逐论点反例全部排前面(不能因为条数上限把某个论点的反例词挤掉), 再补正向
+    _cl, _qs = app.assist_plan("以色列空军能飞到中国，中国战机飞不到以色列")
+    check("悬浮窗:查询池反例优先",
+          _qs == ["以色列空军 远程奔袭 战例 距离", "以色列空军 空中加油 航程 实际",
+                  "中国战机 海外部署 远航 案例", "以色列空军 转场航程", "中国空军 作战半径"], _qs)
+    check("悬浮窗:查询池上限", app._ASSIST_MAX_QUERIES == 5 and len(_qs) <= 5, _qs)
+    # 3 个论点时: 上限内必须容得下全部反例词(旧的正反交替会把第3个论点的词整条丢掉)
+    _old_dec = app.decompose_plan
+    app.decompose_plan = lambda t: ([{"point": "p%d" % i, "query": "pos%d" % i,
+                                      "counter": "neg%d" % i} for i in (1, 2, 3)], "best")
+    try:
+        _c3, _q3 = app.assist_plan("x" * 20)
+        check("悬浮窗:反例词不被条数上限挤掉", _q3 == ["best", "neg1", "neg2", "neg3", "pos1"], _q3)
+    finally:
+        app.decompose_plan = _old_dec
+    # 拆解整个失败(模型两次都没给出JSON) → 不能让取证链路断掉, 回落到兜底词
+    _old_dec = app.decompose_plan
+    app.decompose_plan = lambda t: ([], "")
+    try:
+        _c4, _q4 = app.assist_plan("地球绕着太阳转")
+        check("悬浮窗:拆解失败仍有兜底查询", _q4 == ["地球绕着太阳转 辟谣 真相"], _q4)
+    finally:
+        app.decompose_plan = _old_dec
+    # 短句没有拆解词 → 兜底一条辟谣向查询
+    _cl2, _qs2 = app.assist_plan("地球绕着太阳转")
+    check("悬浮窗:短句兜底查询", _qs2 == ["地球绕着太阳转 辟谣 真相"], _qs2)
+
+    # 验证真实性: SSE 端到端(搜索桩 + MockLLM)
+    evs = parse_sse(req_sse("/api/ai/assist", {"mode": "verify", "text": "网传说可乐能杀灭蛔虫"}))
+    phases = [d for e, d in evs if e == "phase"]
+    dones = [d for e, d in evs if e == "done"]
+    check("悬浮窗:核查SSE阶段", len(phases) >= 2 and "拆解" in phases[0].get("label", ""), phases)
+    res = dones[0] if dones else {}
+    r = res.get("result") or {}
+    check("悬浮窗:核查结果", res.get("ok") is True and res.get("mode") == "verify"
+          and r.get("verdict") == "false" and r.get("confidence") == 88
+          and r.get("evidence_used") == ["E1"] and r.get("offline") is False
+          and (r.get("claims") or [{}])[0].get("check") == "false", res)
+    usage = res.get("usage") or {}
+    check("悬浮窗:用量回报", usage.get("calls", 0) >= 1 and usage.get("in_tokens", 0) > 0
+          and usage.get("cost", -1) >= 0, usage)
+    check("悬浮窗:谬误点名", r.get("fallacies") == ["假两难"], r)
+    refs = res.get("evidence") or []
+    check("悬浮窗:核查证据卡", len(refs) == 1 and refs[0]["id"] == "E1"
+          and refs[0]["cred"] in ("high", "mid") and refs[0]["url"].startswith("http"), refs)
+
+    # 生成回怼: SSE 端到端(三段式, 每段生成完立刻推送)
+    evs = parse_sse(req_sse("/api/ai/assist", {"mode": "rebut", "text": "喝可乐能杀灭蛔虫"}))
+    segs = [d for e, d in evs if e == "seg"]
+    dones = [d for e, d in evs if e == "done"]
+    res = dones[0] if dones else {}
+    r = res.get("result") or {}
+    check("悬浮窗:回怼分段推送",
+          [s.get("kind") for s in segs] == ["targets", "lines", "paras", "long"], segs)
+    check("悬浮窗:回怼误区谬误清单",
+          bool(r.get("targets")) and r["targets"][0]["kind"] == "知识误区"
+          and r["targets"][0]["point"] and r["targets"][0]["note"], r.get("targets"))
+    check("悬浮窗:回怼三段条数",
+          len(r.get("lines") or []) == 2 and len(r.get("paras") or []) == 2
+          and len(r.get("long") or []) == 1,
+          {k: len(r.get(k) or []) for k in ("lines", "paras", "long")})
+    check("悬浮窗:回怼可粘贴无编号",
+          all("[E" not in it["text"] for k in ("lines", "paras", "long") for it in (r.get(k) or []))
+          and all(it["basis"] for it in (r.get("lines") or [])), r)
+    check("悬浮窗:回怼立场说明", isinstance(r.get("stance_note"), str) and r.get("stance_note"), r)
+    check("悬浮窗:写作硬规则重写",
+          all("一方面" not in it["text"] for it in (r.get("lines") or [])), r.get("lines"))
+    check("悬浮窗:回怼无引号", all(not re.search(r"[「」『』“”]", it["text"])
+                                   for k in ("lines", "paras", "long")
+                                   for it in (r.get(k) or [])), r)
+    evs = parse_sse(req_sse("/api/ai/assist", {"mode": "rebut", "text": "无可回怼 这只是正常反馈"}))
+    dones = [d for e, d in evs if e == "done"]
+    res = dones[0] if dones else {}
+    r = res.get("result") or {}
+    check("悬浮窗:无可回怼提示", res.get("ok") is True and r.get("no_target") is True
+          and r.get("reason"), res)
+
+    # JSON 两次解析失败 → 自动降级纯文本解析(用户不见内部报错)
+    evs = parse_sse(req_sse("/api/ai/assist", {"mode": "verify", "text": "触发降级 某个说法"}))
+    dones = [d for e, d in evs if e == "done"]
+    res = dones[0] if dones else {}
+    r = res.get("result") or {}
+    check("悬浮窗:核查纯文本兜底", res.get("ok") is True and r.get("verdict") == "false"
+          and r.get("confidence") == 85 and len(r.get("reasons") or []) == 2
+          and "矛盾" in (r.get("summary") or ""), res)
+    evs = parse_sse(req_sse("/api/ai/assist", {"mode": "rebut", "text": "触发降级 某个言论"}))
+    dones = [d for e, d in evs if e == "done"]
+    res = dones[0] if dones else {}
+    r = res.get("result") or {}
+    check("悬浮窗:回怼纯文本兜底", res.get("ok") is True and len(r.get("lines") or []) == 2
+          and len(r.get("paras") or []) == 2 and len(r.get("long") or []) == 1
+          and all(it["text"] for it in r["lines"]), res)
+    app._http_get_text, app.fetch_page_text = old_http_get, old_fetch_page   # 恢复真实网络层
+    app._SEARCH_CACHE.clear()
+
+    # 调节档位: 白名单校验 + 持久化(条数档位 1/2/3, 旧的风格值折算成新人设名)
+    d = req("/api/floatball", {"prefs": {"think": "深挖", "savage": "阴阳", "len": "3", "hack": "x"}})
+    check("悬浮窗:档位保存", d.get("ok") and d["prefs"]["think"] == "深挖"
+          and d["prefs"]["savage"] == "阴阳怪气" and d["prefs"]["len"] == "3"
+          and "fallacy" not in d["prefs"], d)
+    d = req("/api/floatball", {"prefs": {"think": "乱写", "savage": "", "len": 9}})
+    d = req("/api/floatball")
+    check("悬浮窗:档位白名单", d["prefs"]["think"] == "深挖" and d["prefs"]["savage"] == "阴阳怪气"
+          and d["prefs"]["len"] == "3", d)
+    req("/api/floatball", {"prefs": {"len": "长"}})   # 旧档位「长」折算成 3
+    d = req("/api/floatball")
+    check("悬浮窗:旧档位折算", d["prefs"]["len"] == "3", d)
+
+    # 条数档位 3: 一句话与一段话各 3 条, 长篇仍 1 条
+    app._http_get_text = fake_http_get
+    app.fetch_page_text = fake_fetch_page
+    app._SEARCH_CACHE.clear()
+    try:
+        evs = parse_sse(req_sse("/api/ai/assist", {"mode": "rebut", "text": "回怼这条言论"}))
+        dones = [d2 for e, d2 in evs if e == "done"]
+        rr = (dones[0].get("result") or {}) if dones else {}
+        check("悬浮窗:条数档位生效",
+              len(rr.get("lines") or []) == 3 and len(rr.get("paras") or []) == 3
+              and len(rr.get("long") or []) == 1,
+              {k: len(rr.get(k) or []) for k in ("lines", "paras", "long")})
+    finally:
+        app._http_get_text, app.fetch_page_text = old_http_get, old_fetch_page
+        app._SEARCH_CACHE.clear()
+    req("/api/floatball", {"prefs": {"think": "标准", "savage": "毒舌", "len": "2"}})   # 还原默认
+
+    # 直调三段式生成: 结构与写作硬规则清洗
+    ev1 = [{"title": "t", "url": "https://x.io/a", "snippet": "s",
+            "_cred": "mid", "_cred_label": "可靠", "page": ""}]
+    rr2, _refs2 = app.assist_rebut("回怼这条言论", ev1,
+                                   [{"point": "以色列空军能飞到中国", "query": "x"}])
+    check("悬浮窗:直调三段结构", len(rr2["lines"]) == 2 and len(rr2["paras"]) == 2
+          and len(rr2["long"]) == 1 and len(rr2["targets"]) == 2, rr2)
+    check("悬浮窗:硬规则清洗",
+          app._style_fix("这方案落地后崩了，判一下") == "这方案实施后崩溃了，判一下"
+          and not app._style_violations("这方案实施后崩溃了"))
+    check("悬浮窗:硬规则命中", bool(app._style_violations("这不是A而是B"))
+          and bool(app._style_violations("一句话总结: 都挺好"))
+          and bool(app._style_violations("用了技术栈")))
+    check("悬浮窗:人称失守判定", app._seg_score([{"text": "就这？"}])[0] == 2
+          and app._seg_score([{"text": "我跟你说，就这？"}])[0] == 0
+          and app._seg_score([{"text": "我劝你先把资料查明白"}])[0] == 0
+          and app._seg_score([{"text": "我先把资料查明白"}])[0] == 1)
+    _tg = app._targets_from_text("电池三年必换 | 知识误区 | 质保普遍八年\n"
+                                 "油车不用修｜绝对化断言｜前提不成立\n"
+                                 "谁买谁后悔")
+    check("悬浮窗:误区清单文本兜底", len(_tg) == 3 and _tg[0]["kind"] == "知识误区"
+          and _tg[1]["kind"] == "绝对化断言" and _tg[1]["note"] == "前提不成立"
+          and _tg[2]["point"] == "谁买谁后悔" and _tg[2]["kind"] == "", _tg)
+
+    # 话术模板库: 联网采集(搜索走桩, 正文里埋模板句) + 广告/链接过滤
+    app._TALK_CACHE.update(ts=0.0, templates=[])
+    old_gt2, old_fp2 = app._http_get_text, app.fetch_page_text
+    app._http_get_text = fake_http_get
+    app.fetch_page_text = lambda url, max_chars=3200: (
+        "就这水平也敢来对线？研究了半天就这结论！建议先查查资料再来对线，不难。"
+        "广告位招租 http://example.com 快来关注订阅")
+    try:
+        pool = app.fetch_talk_templates()
+        check("悬浮窗:话术模板采集", any("就这水平" in t for t in pool)
+              and not any(("http" in t or "广告" in t or "关注" in t) for t in pool), pool[:6])
+    finally:
+        app._http_get_text, app.fetch_page_text = old_gt2, old_fp2
+        app._TALK_CACHE.update(ts=0.0, templates=[])
+    check("悬浮窗:内置话术库", len(app._BUILTIN_TALK) >= 10)
+
+    # 主题推送: 主界面强调色/深浅主题 → 悬浮球(展开时向后端取)
+    d = req("/api/floatball", {"theme": {"accent": "#4a9eff", "light": True}})
+    check("悬浮窗:主题推送", d.get("ok") and d.get("accent") == "#4a9eff" and d.get("light") is True, d)
+    d = req("/api/floatball", {"theme": {"accent": "不合法", "light": False}})
+    d = req("/api/floatball")
+    check("悬浮窗:主题持久化", d.get("accent") == "#4a9eff" and d.get("light") is False, d)
+
+    # 悬浮球进程真身: 带自关钩子拉起一次, 验证 tkinter 建窗不崩(不支持的环境跳过)
+    if app.float_ball_supported() and "--skip-ball" not in sys.argv:
+        import subprocess as _sp
+        p = _sp.Popen([sys.executable, os.path.join(PROJECT, "app.py"),
+                       "--float-ball", "8099", "--ball-autoclose", "1500"],
+                      stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        try:
+            code = p.wait(timeout=15)
+            check("悬浮球:进程建窗自关", code == 0, code)
+        except _sp.TimeoutExpired:
+            p.kill()
+            check("悬浮球:进程建窗自关", False, "timeout")
+
+    # ---------- 逻辑谬误分类体系(LOGIC 13 类) ----------
+    check("谬误:13类清单", len(app._FALLACY_TAXONOMY) == 13
+          and all(k and d for k, d in app._FALLACY_TAXONOMY),
+          app._FALLACY_TAXONOMY)
+    check("谬误:清单进提示词", all(k in app._TARGET_ASK for k, _d in app._FALLACY_TAXONOMY))
+    check("谬误:要求只标真命中的",
+          "拿不准就不标" in app._TARGET_ASK and "最多标两个" in app._TARGET_ASK)
+
+    # ---------- 身份(武器)与风格(语气)解耦 ----------
+    check("档位:风格旧值折算", app._savage_key("温和") == "冷静理性"
+          and app._savage_key("毒舌") == "毒舌律师" and app._savage_key("阴阳") == "阴阳怪气"
+          and app._savage_key("乱写") == "毒舌律师")
+    check("档位:风格温度分档", app._SAVAGE_TEMP["阴阳怪气"] > app._SAVAGE_TEMP["毒舌律师"]
+          > app._SAVAGE_TEMP["冷静理性"])
+    check("档位:身份非法值退回不设", app._persona_key("乱写") == "不设"
+          and app._persona_key("数据党") == "数据党")
+    _sys_data = app._rebut_system("冷静理性", "数据党")
+    _sys_plain = app._rebut_system("冷静理性", "不设")
+    check("档位:身份注入提示词", "统计口径" in _sys_data and "统计口径" not in _sys_plain,
+          (_sys_data[:80], _sys_plain[:80]))
+    check("档位:换身份不动风格", "语气克制" in _sys_data
+          and "语气克制" in app._rebut_system("冷静理性", "理工科")
+          and "统计口径" in _sys_data)
+
+    # ---------- 自定义人设预设(结构化字段存本地, 可增删切换) ----------
+    for _it in (req("/api/rebut/saved").get("items") or []):   # 收藏表是持久化的, 先清干净
+        req("/api/rebut/delete", {"id": _it["id"]})
+    d = req("/api/personas", {"items": [
+        {"name": "老球迷", "identity": "看了二十年球的死忠球迷",
+         "weapon": "历年比赛数据与阵型", "taboo": "编造比分"},
+        {"name": "不设", "identity": "想冒充内置档位", "weapon": "x"},     # 撞内置名 → 丢
+        {"name": "", "identity": "空名字"},                              # 空名 → 丢
+        {"name": "空壳"}]})                                             # 只有名字 → 丢
+    check("人设:保存与脏数据过滤", d.get("ok") and d.get("count") == 1
+          and len(d["items"]) == 1 and d["items"][0]["name"] == "老球迷", d)
+    d = req("/api/personas")
+    check("人设:内置档位与字段", d["builtin"] == ["不设", "理工科", "行业老手", "数据党", "路人"]
+          and [f["key"] for f in d["fields"]] == ["identity", "weapon", "taboo"], d)
+    check("人设:注入提示词",
+          "看了二十年球的死忠球迷" in app._persona_line("老球迷")
+          and "历年比赛数据与阵型" in app._persona_line("老球迷")
+          and "编造比分" in app._persona_line("老球迷"), app._persona_line("老球迷"))
+    check("人设:自定义名合法", app._persona_key("老球迷") == "老球迷"
+          and app._persona_valid("老球迷") and not app._persona_valid("查无此人"))
+    _sys_custom = app._rebut_system("毒舌律师", "老球迷")
+    check("人设:自定义身份进系统提示词", "看了二十年球的死忠球迷" in _sys_custom, _sys_custom[:120])
+    d = req("/api/floatball", {"prefs": {"persona": "老球迷"}})
+    check("人设:档位可选自定义", d["prefs"]["persona"] == "老球迷", d["prefs"])
+    req("/api/floatball", {"prefs": {"persona": "查无此人"}})
+    d = req("/api/floatball")
+    check("人设:非法档位不落库", d["prefs"]["persona"] == "老球迷", d["prefs"])
+    # 换档位就是另一份结果: 缓存键必须带上身份
+    app.sset("assist_persona", "老球迷")
+    _k_custom = app.rebut_cache_key("同一句话")
+    app.sset("assist_persona", "数据党")
+    _k_data = app.rebut_cache_key("同一句话")
+    check("人设:缓存键区分身份", _k_custom != _k_data, (_k_custom, _k_data))
+    req("/api/personas", {"items": []})   # 清理, 后面用例回到内置档位
+    req("/api/floatball", {"prefs": {"persona": "不设"}})
+    check("人设:清空后自定义名失效", app._persona_key("老球迷") == "不设"
+          and app.persona_presets() == [])
+
+    # ---------- 裁判复核替掉自查式重写 ----------
+    check("裁判:角色与写手分开",
+          "裁判" in app._judge_system() and "不要重写" in app._judge_system()
+          and "对线的当事人" not in app._judge_system())
+    _old_json = app._assist_llm_json
+    _jcall = []
+    _stub = {"items": [{"text": "我查过公开数据，2024年这数掉了一半，你那算法过不了关",
+                        "basis": "公开资料", "target": "知识误区"}]}
+
+    def _fake_json(system, user, mt, temp):
+        _jcall.append("judge" if "裁判" in system else "rewrite")
+        if "裁判" in system:
+            return {"verdict": "revise", "problems": ["没把具体数字砸进去"],
+                    "weakest": "第1条只有气势"}
+        return {"items": list(_stub["items"])}
+    app._assist_llm_json = _fake_json
+    try:
+        _clean = [{"text": "我跟你说，转场航程差着数量级", "basis": "x", "target": "y"},
+                  {"text": "你拿地图直线当作战半径，这不成立", "basis": "x", "target": "y"}]
+        _same = app._seg_polish("sys", "user", "lines", _clean, 2, 1200, 0.8, ask="要打的点")
+        check("裁判:机械检查过关就不请裁判", _same is _clean and _jcall == [], _jcall)
+        _jcall.clear()
+        # 一段话不砸具体东西 = 空话 → 请裁判 → 按裁判意见重写 → 分更高则采纳
+        _thin = [{"text": "我跟你说，这事根本站不住", "basis": "x", "target": "y"},
+                 {"text": "你别嘴硬了", "basis": "x", "target": "y"}]
+        _out = app._seg_polish("sys", "user", "paras", _thin, 2, 1700, 0.8, ask="要打的点",
+                               evidence=[{"title": "国家统计局数据", "url": "https://stats.gov.cn/a"}])
+        check("裁判:空话命中→请裁判并重写",
+              _jcall[:2] == ["judge", "rewrite"] and _out[0]["text"] == _stub["items"][0]["text"],
+              (_jcall, _out))
+        _jcall.clear()
+        # 重写版更差(人称失守 + 一堆八股) → 一律不采纳, 保留原稿
+        _bad = [{"text": "一方面懒得查证，另一方面又急着下结论", "basis": "x", "target": "y"}]
+        _stub["items"] = [{"text": "一方面这方案站不住，另一方面众所周知毋庸置疑",
+                           "basis": "x", "target": "y"}]
+        _out2 = app._seg_polish("sys", "user", "lines", _bad, 2, 1200, 0.8, ask="要打的点")
+        check("裁判:重写更差则保留原稿",
+              "懒得查证" in _out2[0]["text"] and "judge" in _jcall, (_jcall, _out2))
+    finally:
+        app._assist_llm_json = _old_json
+
+    # ---------- 推理模型的思考额度下限(拆解空回复的根因) ----------
+    # deepseek-flash 先出思考再出正文, max_tokens 把思考一起算; 给少了 content 就是空串。
+    # 契约: 调用方要多少都行, 实际下发不得低于 _JSON_MIN_TOKENS; 空 content 必须重试。
+    _old_call = app.call_llm
+    _calls = []
+    _empty_first = [True]
+
+    def _fake_call(messages, max_tokens=None, temperature=None):
+        _calls.append(max_tokens)
+        if _empty_first[0]:
+            _empty_first[0] = False
+            return "", {"completion_tokens": 1128, "reasoning_tokens": 1074}   # 思考吃光额度
+        return '{"ok": 1}', {}
+    app.call_llm = _fake_call
+    try:
+        check("额度:下限常量", app._JSON_MIN_TOKENS >= 4000, app._JSON_MIN_TOKENS)
+        out = app._assist_llm_json("sys", "user", 1200, 0.2)
+        check("额度:小额度被抬到下限+空回复重试", out == {"ok": 1} and _calls == [4000, 7000], _calls)
+        _calls.clear()
+        out = app._assist_llm_json("sys", "user", 9000, 0.2)
+        check("额度:调用方要更多就给更多", out == {"ok": 1} and _calls == [9000], _calls)
+        _calls.clear()
+
+        def _always_empty(messages, max_tokens=None, temperature=None):
+            _calls.append(max_tokens)
+            return "", {}
+        app.call_llm = _always_empty
+        try:
+            app._assist_llm_json("sys", "user", 1200, 0.2)
+            check("额度:两轮全空必须报错", False, _calls)
+        except Exception as e:
+            check("额度:两轮全空必须报错", _calls == [4000, 7000] and "思考" in str(e), (e, _calls))
+    finally:
+        app.call_llm = _old_call
+
+    # ---------- 段落具体性判定(空话 vs 砸了具体东西) ----------
+    _ev = [{"title": "国家统计局2024年就业数据", "url": "https://stats.gov.cn/a"}]
+    check("空话:没有数字也没有证据专名", app._seg_has_specifics(
+        [{"text": "我跟你说，这事根本站不住"}], _ev) is False)
+    check("空话:砸了数字就算具体", app._seg_has_specifics(
+        [{"text": "2024年这个数掉了一半"}], _ev) is True)
+    check("空话:引用了证据标题里的专名也算", app._seg_has_specifics(
+        [{"text": "国家统计局的口径覆盖哪些你查过吗"}], _ev) is True)
+    check("空话:没证据时不苛求", app._seg_has_specifics(
+        [{"text": "我跟你说，这事根本站不住"}], []) is True)
+
+    # ---------- 同一条原话的 LRU 缓存 + 上一轮上下文复用 ----------
+    _txt = "缓存与换批测试 某某言论"
+    evs_a = parse_sse(req_sse("/api/ai/assist", {"mode": "rebut", "text": _txt}))
+    check("缓存:首轮正常生成",
+          [s.get("kind") for e, s in evs_a if e == "seg"] == ["targets", "lines", "paras", "long"],
+          [s.get("kind") for e, s in evs_a if e == "seg"])
+    evs_b = parse_sse(req_sse("/api/ai/assist", {"mode": "rebut", "text": _txt}))
+    _ph = [d.get("stage") for e, d in evs_b if e == "phase"]
+    check("缓存:同原话直接命中", "cache" in _ph, _ph)
+    check("缓存:命中后按同样顺序补推",
+          [s.get("kind") for e, s in evs_b if e == "seg"] == ["targets", "lines", "paras", "long"],
+          [s.get("kind") for e, s in evs_b if e == "seg"])
+    _db = [d for e, d in evs_b if e == "done"][0]
+    check("缓存:命中结果与首轮一致",
+          len(_db["result"]["lines"]) == 2 and _db["result"]["targets"][0]["point"],
+          _db["result"])
+    # 换了档位就是另一份结果, 不能再命中旧缓存
+    req("/api/floatball", {"prefs": {"len": "1"}})
+    evs_c = parse_sse(req_sse("/api/ai/assist", {"mode": "rebut", "text": _txt}))
+    _phc = [d.get("stage") for e, d in evs_c if e == "phase"]
+    check("缓存:换档位不命中", "cache" not in _phc, _phc)
+    req("/api/floatball", {"prefs": {"len": "2"}})
+
+    # ---------- 换一批: 只重跑那一段, 论点与证据沿用上一轮 ----------
+    evs_r = parse_sse(req_sse("/api/ai/assist", {"mode": "rebut", "text": _txt, "seg": "paras"}))
+    _sr = [s for e, s in evs_r if e == "seg"]
+    check("换批:只推这一段", [s.get("kind") for s in _sr] == ["paras"] and _sr[0].get("regen") is True,
+          _sr)
+    check("换批:走复用上下文的快路",
+          "regen" in [d.get("stage") for e, d in evs_r if e == "phase"],
+          [d.get("stage") for e, d in evs_r if e == "phase"])
+    _dr = [d for e, d in evs_r if e == "done"][0]
+    check("换批:done 带回 regen 标记", _dr.get("regen") == "paras"
+          and len(_dr["result"]["paras"]) == 2 and not _dr["result"]["lines"], _dr["result"])
+    _bad_seg = None
+    try:
+        req_sse("/api/ai/assist", {"mode": "rebut", "text": _txt, "seg": "没这段"})
+    except urllib.error.HTTPError as _e:
+        _bad_seg = _e.code
+    check("换批:非法段落 400", _bad_seg == 400, _bad_seg)
+
+    # ---------- 正文挂证据编号: 编号单独下发, 不写进正文 ----------
+    _sT = [s for e, s in evs_a if e == "seg"][0]
+    check("证据:分段带证据摘要", isinstance(_sT.get("evidence"), list)
+          and all({"id", "title", "url"} <= set(x) for x in _sT["evidence"]), _sT.get("evidence"))
+    _res_a = [d for e, d in evs_a if e == "done"][0]["result"]
+    check("证据:编号不进正文",
+          all("[E" not in it["text"] for k in ("lines", "paras", "long")
+              for it in (_res_a.get(k) or [])), _res_a)
+
+    # ---------- 收藏夹(存本机 SQLite, 可搜索/删除) ----------
+    d = req("/api/rebut/save", {"source": "喝可乐能杀灭蛔虫", "seg": "lines",
+                                "content": "可乐要能杀蛔虫，医院早改行卖饮料了"})
+    _rid = d.get("id")
+    check("收藏:存一条", d.get("ok") and _rid, d)
+    req("/api/rebut/save", {"source": "另一条原话", "seg": "long", "content": "别拿老偏方当证据"})
+    d = req("/api/rebut/saved")
+    check("收藏:列表", len(d["items"]) == 2 and d["items"][0]["source"], d)
+    d = req("/api/rebut/saved?q=" + urllib.parse.quote("老偏方"))
+    check("收藏:按正文搜索", len(d["items"]) == 1 and "老偏方" in d["items"][0]["content"], d)
+    d = req("/api/rebut/saved?q=" + urllib.parse.quote("喝可乐"))
+    check("收藏:按原话搜索", len(d["items"]) == 1 and d["items"][0]["id"] == _rid, d)
+    d = req("/api/rebut/saved?q=" + urllib.parse.quote("查无此物"))
+    check("收藏:搜不到返回空", d["items"] == [], d)
+    d = req("/api/rebut/delete", {"id": _rid})
+    check("收藏:删除", d.get("ok") is True and len(req("/api/rebut/saved")["items"]) == 1, d)
+    check("收藏:重复删除不报错", req("/api/rebut/delete", {"id": _rid}).get("ok") is True)
+    for _it in req("/api/rebut/saved")["items"]:
+        req("/api/rebut/delete", {"id": _it["id"]})
+
+    # ---------- 悬浮窗环境体检: 说清到底缺什么 ----------
+    _env = app.float_ball_env()
+    check("体检:本机可跑悬浮窗", _env["ok"] is True and not _env["reason"]
+          and "python.exe" in _env["python"], _env)
+    _old_nt = app.os.name
+    try:
+        app.os.name = "posix"
+        _env2 = app.float_ball_env()
+        check("体检:非Windows给明确原因", _env2["ok"] is False and "不是 Windows" in _env2["reason"]
+              and _env2["hint"], _env2)
+    finally:
+        app.os.name = _old_nt
+    _fb = req("/api/floatball")
+    check("体检:浮窗接口带诊断字段",
+          "reason" in _fb and "hint" in _fb and "spawn_error" in _fb and "python" in _fb, _fb)
+    check("体检:启动失败原因可读", isinstance(app.float_ball_last_error(), str))
+
+    # ---------- 开合只认点击: 悬停自动展开已按用户要求整体移除 ----------
+    # 用户原话:「不想要鼠标放到球上面就自动打开窗口的功能, 必须是点击球才行」。
+    # 这里钉住两件事: ①档位接口里不再有 hover(老开关彻底下线, 老库里残留的键不再被读);
+    # ②生成档位本身没被误伤。
+    d = req("/api/floatball", {"prefs": {"hover": "1"}})
+    check("悬浮球:悬停展开档位已下线", "hover" not in d["prefs"], d["prefs"])
+    check("悬浮球:其余生成档位仍在",
+          all(k in d["prefs"] for k in ("think", "persona", "savage", "len")), d["prefs"])
+    check("悬浮球:接口不再回 hover 字段", "hover" not in req("/api/floatball"))
+
+    # ---------- 配色派生: 球体的明暗面/描边/光晕都由强调色算出来 ----------
+    # _hex_mix 是「球体渐变」的唯一来源, 出错的表现是球变成纯黑或纯白(而不是报错),
+    # 所以它的端点行为必须有断言兜住。
+    check("配色:混合端点 t=0 取左色", app._hex_mix("#336699", "#ffffff", 0) == "#336699")
+    check("配色:混合端点 t=1 取右色", app._hex_mix("#336699", "#ffffff", 1) == "#ffffff")
+    _mid = app._hex_mix("#000000", "#ffffff", 0.5)
+    check("配色:混合中点取中值", _mid == "#7f7f7f", _mid)
+    check("配色:t 越界被夹回", app._hex_mix("#000000", "#ffffff", 9) == "#ffffff"
+          and app._hex_mix("#000000", "#ffffff", -9) == "#000000")
+    check("配色:非法色值回退左色", app._hex_mix("不是色", "#ffffff", 0.5) == "不是色")
+
+    _px = app._ball_palette("#3b82f6", False)
+    _keys = ("bg", "card", "txt", "sub", "line", "input", "accent",
+             "ac_lit", "ac_dark", "ring", "glow", "hover", "danger")
+    check("配色:深色板字段齐全", all(k in _px for k in _keys),
+          [k for k in _keys if k not in _px])
+    check("配色:派生色都是合法色值",
+          all(isinstance(_px[k], str) and len(_px[k]) == 7 and _px[k][0] == "#"
+              and all(c in "0123456789abcdef" for c in _px[k][1:].lower())
+              for k in _keys), {k: _px[k] for k in _keys})
+    check("配色:亮面比强调色亮、暗面比强调色暗",
+          app._hex_mix(_px["ac_lit"], "#000000", 0) != _px["accent"]
+          and _px["ac_lit"] != _px["ac_dark"]
+          and app._hex_mix(_px["ac_lit"], "#ffffff", 0.5) > app._hex_mix(_px["ac_dark"], "#ffffff", 0.5))
+    _pl = app._ball_palette("#3b82f6", True)
+    check("配色:明暗板都认强调色", _pl["accent"] == "#3b82f6" == _px["accent"])
+    check("配色:明暗板底色不同", _pl["bg"] != _px["bg"] and _pl["card"] != _px["card"],
+          (_pl["bg"], _px["bg"]))
+    check("配色:换强调色球面跟着变",
+          app._ball_palette("#e11d48", False)["ac_lit"] != _px["ac_lit"])
+
+    # ---------- 隐藏/显示: 状态与恢复入口 ----------
+    # hide_ball/show_ball 是 run_float_ball 内的闭包, 测试进程里拿不到引用,
+    # 这里只断言「面板里有隐藏入口」和「状态字段齐备」——真正的收边/恢复条动效
+    # 由 --ball-autohide 外部钩子跑真实 tkinter 验证(见 test_ball_* 用例)。
+    _src = open(os.path.join(os.path.dirname(os.path.abspath(app.__file__)),
+                             "app.py"), encoding="utf-8").read()
+    check("隐藏:面板头部有隐藏入口", 'hide_btn' in _src and "✕ 隐藏" in _src)
+    check("隐藏:有收边恢复条的实现", "_peer_show" in _src and "_peer_hide" in _src)
+    check("隐藏:状态字典带 hidden/peer",
+          '"hidden": False, "peer": None' in _src)
+    check("隐藏:右键菜单有隐藏项", "隐藏悬浮球" in _src)
+    check("隐藏:贴边松手即隐藏", "hide_ball()" in _src and "near[0] <= 1" in _src)
+    check("隐藏:四缘都判(左右上下)",
+          all(('"%s"' % e) in _src
+              for e in ("left", "right", "top", "bottom")))
+    check("隐藏:收边态点球体=恢复(不在屏外展开)",
+          'if st["hidden"] and not st["moved"]:' in _src and "show_ball()" in _src)
+    check("隐藏:有外部验证钩子", "--ball-autohide" in _src)
+    # 收边 = 球体**滑出屏幕**, 只留 ≤4px(恢复条正好盖住)。写成"球体外缘贴缘"就退化成
+    # 「出现恢复条、球却没隐藏」—— 用户报的正是这个。这四条目标式是唯一判据。
+    # 取整方向也在内: 左/上 floor、右/下 ceil(否则右侧少挪 0.6px, 球比条多露一截)。
+    check("隐藏:收边是球体滑出屏幕而非贴着缘",
+          'math.floor(e_px - BALL + PAD) if edge == "left"' in _src
+          and "math.ceil(sw - e_px - PAD)" in _src
+          and 'math.floor(e_px - BALL + PAD) if edge == "top"' in _src
+          and "math.ceil(sh - e_px - PAD)" in _src
+          and "e_px - BALL / 2.0 + RB" not in _src)
+    check("隐藏:恢复条压在球窗之上", "p.lift()" in _src)
+    # 球体滑出去后, 它的外发光/环阵半径比球体大一圈, 不清画布就会在条下面留一圈抖动亮点
+    # (实测条下 1~14px 有强调色光点), 读起来还是"球没走干净"。
+    check("隐藏:收边后清空球体画布(只剩恢复条)", 'ballcv.delete("all")' in _src)
+    # ---------- 开合只认点击(悬停自动展开已整体移除) ----------
+    check("交互:悬停不再自动展开",
+          "hover_tick" not in _src and "HOVER_IN" not in _src and "HOVER_OUT" not in _src
+          and "hoverstate" not in _src and 'sget("assist_hover")' not in _src
+          and 'sset("assist_hover"' not in _src)
+    check("交互:没有悬停展开开关按钮", "hover_btn" not in _src and "toggle_hover" not in _src)
+    check("交互:单击球才展开",
+          'act == "click"' in _src
+          and 'if st["view"] == "ball" and not st["moved"] and time.time() - st["t0"] < 0.8:'
+          in _src)
+    check("交互:悬停仍保留高亮反馈", "_ptr_on_ball(6)" in _src)
+    # ---------- 球体输入层(轮询式状态机) ----------
+    # 背景: 颜色键控窗的**透明像素收不到鼠标消息**(实测球窗圆内只有 15.6% 的点能落到球上),
+    # 线框球于是"点不到"。修法是丢了 Tk 绑定, 自己轮询全局键态 —— 这里直接测那台状态机。
+    _V = app._vin_step
+    _v0 = {"down": False, "moved": False, "t": 0.0, "ox": 0, "oy": 0, "r": False, "pl": False}
+    _a, _v1 = _V(_v0, 100.0, True, True, False, px=10, py=10)
+    check("输入:球内按下 → press", _a == "press" and _v1["down"] and not _v1["moved"])
+    _a, _v2 = _V(_v1, 100.1, True, True, False, px=11, py=10)
+    check("输入:按住不动 → 无动作", _a is None)
+    _a, _v3 = _V(_v2, 100.2, True, False, False, px=11, py=10)
+    check("输入:快速抬起 → click(单击展开)", _a == "click" and not _v3["down"])
+    _a, _v1b = _V(_v0, 200.0, True, True, False, px=10, py=10)
+    _a, _v2b = _V(_v1b, 201.5, True, False, False, px=10, py=10)
+    check("输入:慢按(>0.8s)抬起不算单击", _a == "drop")
+    _a, _v1c = _V(_v0, 300.0, True, True, False, px=10, py=10)
+    _a, _v2c = _V(_v1c, 300.1, True, True, False, px=40, py=10)
+    check("输入:移动超过阈值 → drag", _a == "drag" and _v2c["moved"])
+    _a, _v3c = _V(_v2c, 300.2, True, False, False, px=60, py=10)
+    check("输入:拖完抬起 → drop", _a == "drop")
+    _a, _v1d = _V(_v0, 400.0, False, True, False, px=1, py=1)
+    check("输入:球外按下不接管", _a is None and not _v1d["down"])
+    _a, _v2d = _V(_v1d, 400.1, True, True, False, px=10, py=10)
+    check("输入:按着从球外移进来也不接管(不抢用户正在拖的东西)",
+          _a is None and not _v2d["down"])
+    _a, _v1e = _V(_v0, 500.0, True, False, True, px=10, py=10)
+    check("输入:球内右键 → 弹菜单", _a == "rmenu" and _v1e["r"])
+    _a, _v1f = _V(_v0, 600.0, False, True, False, px=1, py=1)
+    _a, _v2f = _V(_v1f, 600.1, False, False, False, px=1, py=1)
+    check("输入:球外单击无动作", _a is None)
+    # 结构: 球面 Tk 绑定必须摘掉(否则和轮询层叠加, 拖拽速度翻倍), 命中圆要比线框大一圈
+    check("输入:球面 Tk 鼠标绑定已摘除", 'ballcv.bind("<Button-1>"' not in _src)
+    check("输入:命中圆按比例且大于线框", "HIT_R = BALL * 0.44" in _src
+          and "rr = HIT_R + pad" in _src)
+    check("输入:指针在球上时轮询提到 30ms", "root.after(30 if active else 90, poll)" in _src)
+    check("输入:右键菜单支持按坐标弹出(虚拟层没有 Tk 事件)",
+          "def on_right(e=None, at=None)" in _src and "at[0] if at else e.x_root" in _src)
+    check("输入:有鼠标无关的自测钩子", '"--ball-fake-click"' in _src)
+    check("适配:尺寸按 DPI 缩放", 'winfo_fpixels("1i")' in _src and "int(_BALL_SIZE * scale)" in _src)
+    # ---------- 悬浮球视觉 = 正十二面体线框全息(用户 2026-09-20 第 3 轮明确要求) ----------
+    # 这一组尽量**直接调几何函数**而不是匹配源码字符串: 形状对不对、有没有真的在做三维投影,
+    # 是行为问题, 用 "源码里有某个名字" 去钉很容易被"改个名照样错"骗过去。
+    _sv, _se, _sf, _sn, _sef = app._solid_geo()
+    check("球体:形状是正十二面体(20 顶点/30 棱/12 个五边形面)",
+          len(_sv) == 20 and len(_se) == 30 and len(_sf) == 12
+          and all(len(f) == 5 for f in _sf), (len(_sv), len(_se), len(_sf)))
+    check("球体:顶点都在单位球上", all(abs(sum(c * c for c in p) - 1.0) < 1e-6 for p in _sv))
+    check("球体:棱长一致(正多面体)", True and
+          len({round(math.dist(_sv[i], _sv[j]), 6) for i, j in _se}) == 1)
+    check("球体:每条棱恰好属于 2 个面(隐藏线消除的依据)",
+          all(len(x) == 2 for x in _sef))
+    # 真三维: 转一下, 投影点必须整体变化; 深度必须真的有正有负(有近有远)
+    _p1 = app._solid_project(_sv, 0.5, 0.3, 0.1, 0, 0, 100)
+    _p2 = app._solid_project(_sv, 0.5 + 0.7, 0.3, 0.1, 0, 0, 100)
+    check("球体:真的在做三轴旋转(转动后投影点变化)",
+          all(abs(a[0] - b[0]) + abs(a[1] - b[1]) > 1.0 for a, b in zip(_p1, _p2)))
+    check("球体:投影带深度且近大远小",
+          min(p[2] for p in _p1) < -0.5 and max(p[2] for p in _p1) > 0.5)
+    # 泛光 = 逐棱多层描边(宽而淡 → 窄而亮), 近白棱芯是"发光"读感的关键; 面**不**填充
+    check("球体:泛光是多层描边阶梯",
+          "max(2.0, w_core * (5.4 if idle else 7.0))" in _src
+          and 'stipple="gray12"' in _src and 'stipple="gray50"' in _src)
+    check("球体:棱芯混向白色(泛光的核心)",
+          '"#ffffff", 0.48 * near * near' in _src)
+    check("球体:不铺填充面(透明桌面上铺面=点阵圆盘)",
+          "create_polygon(*[q for p in pts" not in _src)
+    check("球体:背面棱仍然画且用实线(抖动线是 CPU 大头)",
+          "e[3] == 0" in _src
+          and 'fill=dim(_hex_mix(C["deep"], C["cool"], 0.50)' in _src)
+    check("球体:扫描线已移除(不再有横贯球体的虚线/凸包求交)",
+          "def _hline_span(" not in _src and "_hline_span(hull, sy)" not in _src
+          and "n_scan" not in _src)
+    check("球体:中心徽记放大×1.3", "_GLYPH_SCALE = 1.3" in _src
+          and "R = BALL * 0.070 * _GLYPH_SCALE" in _src)
+    check("隐藏:移开指针后恢复条缩回窄条(_peer_tick 会调 _shrink_peer)",
+          "_shrink_peer()" in _src)
+    # 中心徽记 = 方舟那套 identity glyph(嵌套菱形)。挖洞必须用**窗口键色**(键控窗里=真透明,
+    # 顺带把穿过徽记的线框棱清干净); 画个暗色块在浅色桌面上就是一块脏补丁。
+    check("球体:中心有嵌套菱形身份徽记",
+          "def _core_glyph(" in _src and "dia(R, fill=mid" in _src
+          and "dia(R * 0.30, fill=lit" in _src and "_core_glyph(cx, cy, br, t, dim, fl)" in _src)
+    check("球体:徽记挖洞用窗口键色",
+          "fill=_BALL_TRANSPARENT, outline=\"\", tags=\"ball_fx\"" in _src)
+    check("球体:徽记有横贯亮杠与四角刻度",
+          "cx - R * 1.60, cy, cx + R * 1.60" in _src and "create_rectangle(px - q" in _src)
+    check("球体:徽记可切换且默认嵌套菱形",
+          '_BALL_CORE = "diamond"' in _src and '"--ball-core"' in _src
+          and 'st.get("core", _BALL_CORE)' in _src)
+    check("球体:三种实心体可切换(正12/正20/截角)",
+          "def _dode_solid_geo()" in _src and "def _ico_geo()" in _src
+          and "def _trunc_ico_geo()" in _src and '"--ball-solid"' in _src.replace("'", '"'))
+    check("球体:静态层与动态层都走同一个全息渲染",
+          'ballcv.delete("ball_art")' in _src and 'ballcv.delete("ball_fx")' in _src
+          and "def draw_ball_fx()" in _src and "def _holo_draw()" in _src
+          and "def draw_ball():" in _src)
+    check("球体:五种皮肤状态齐备",
+          'return "drag"' in _src and 'return "busy"' in _src
+          and 'return "unread"' in _src and 'return "hover"' in _src)
+    # 帧率直接等于 CPU 占用。原来 idle 走 150ms(6.7fps) 想省 CPU, 但探针实测单帧才 1.2ms
+    # (球) + 0.6ms(玻璃层): 省下的不到 1% 单核, 代价是肉眼可见的顿。现在各态统一 33ms。
+    # 这条钉的是"别再退回按状态降帧"和"帧率是单一来源, 别写成一堆 if"。
+    check("球体:动效帧率统一(不再按状态降帧)",
+          "def ball_anim()" in _src and "root.after(33, ball_anim)" in _src
+          and 'after(150 if sk == "idle"' not in _src)
+    check("球体:有画帧耗时/图元数探针", "DJXM_BALL_PROF" in _src and "_BALL_PROF" in _src)
+    # 浅色主题下顶点节点必须换成强调色: 固定白色的话浅底上等于看不见
+    check("球体:浅色主题下顶点节点换色", '"mark": accent' in _src and '"mark": "#ffffff"' in _src)
+    # 球面所有内缩量必须是 BALL 的系数, 不能写死像素: 写死 2.5px 在 96 DPI 正常,
+    # 到 288 DPI 时占球径的比例会缩掉一大半, 外圈光晕基本被吃掉。
+    check("适配:球面尺寸一律按比例而非写死像素",
+          "BALL * (2.5 / 56.0)" not in _src and "BALL / 2.0 - 2.5" not in _src
+          and "RS = BALL * 0.340" in _src)
+    # 窗口比球体大一圈透明边距 → 所有"球在哪"的换算都要补 PAD, 否则球会系统性偏移
+    check("球体:窗口边距参与位置换算",
+          "PAD = BALL / 2.0 - RB" in _src and "def _ball_win(sw)" in _src
+          and "def _ball_top(sh" in _src)
+    # 启动必须画第一帧。原来漏了这一步, 画布底色=透明键色 → 球在桌面上根本看不见,
+    # 用户报的「找不到悬浮球, 是不是默认隐藏了」根子就在这。
+    check("球体:启动就画第一帧", "    draw_ball()\n    try:   # 把自身 pid" in _src)
+    # 透明区域会穿透点击(实测 WindowFromPoint), 所以窗口放大不会挡桌面; 但**悬停高亮**判定
+    # 用的是窗口矩形, 必须改成圆形, 否则指针离球几十像素球就亮起来(像"够到你了", 其实没有)。
+    check("球体:悬停判定按圆不按窗口矩形",
+          "def _ptr_on_ball(" in _src
+          and 'if st["view"] == "ball" and not st["hidden"] and not st["down"]:' in _src
+          and 'st["hover"] = _ptr_on_ball(6)' in _src)
+
+    # ---------- 「找不到悬浮球」的两条兜底 ----------
+    # 症结: 位置文件可能存着换屏前的坐标(或贴在最右缘), 球落在任务栏通知区/被置顶窗盖住,
+    # 用户就"找不到球"。这里钉住两个修复不被回退。判据按**球体**算(窗口有一圈透明边距)。
+    check("定位:贴边坐标会被挪进来",
+          "off_right = (x + BALL - PAD) > sw - RB * 2" in _src
+          and "return int(max(0, sw - 96 - BALL + PAD))" in _src)
+    check("定位:贴顶坐标会下移",
+          "off_top = (y + PAD) < RB" in _src and "sh * frac - PAD" in _src)
+    check("定位:有 recall_ball 实现", "def recall_ball()" in _src)
+    check("定位:右键菜单有定位项", "定位悬浮球" in _src)
+    check("定位:有服务端信号通道", "_BALL_RECALL" in _src)
+    # ↓ 本轮真实 bug 的回归闸。球是 subprocess 拉起的**独立进程**, 信号计数只在
+    #   HTTP 服务进程里; 心跳必须从**响应体**把 n 读回来比对。曾写成读本进程的
+    #   _BALL_RECALL(旧 ball_recall_take), 球那边永远是 0 → 按钮点了球不动。
+    check("定位:心跳从响应体读信号(跨进程)",
+          'int(json.loads(r.read().decode("utf-8")).get("n", 0))' in _src
+          and "ball_recall_take" not in _src)
+    check("定位:心跳会打 ball_recall", '"/api/ball_recall"' in _src)
+    check("定位:首轮只对齐基线不动作", "recall_seen[0] is None" in _src)
+    check("定位:有回执通道",
+          "def ball_recall_ack" in _src and '"/api/ball_recall_ack"' in _src)
+    check("定位:球执行后回调回执", "ball_recall_ack?n=%d" in _src)
+    check("定位:隐藏后恢复也不贴右缘", "sw - BALL - 24" not in _src)
+    # 收起面板的落点原来写的是 sw - BALL - 4(贴最右缘), 用户展开一次再收起球就贴边了,
+    # 又变成"找不到球"。展开时还错把面板左上角坐标存进球位文件, 语义串了。
+    check("定位:收起面板后不贴右缘", "x + PW - BALL + PAD, _ball_win(sw)" in _src)
+    check("定位:展开时不把面板坐标当球位", "save_pos(bx, by)" in _src)
+    check("定位:展开与收起严格互逆",
+          "tx = bx + BALL - PAD - PW" in _src and "x + PW - BALL + PAD" in _src)
+    check("定位:拖拽钳制按球体算", "int(-PAD), min(st[\"wx\"] + e.x_root - st[\"ox\"]," in _src)
+    check("定位:有测试钩子", "--ball-recall" in _src)
+    check("定位:有皮肤循环钩子", "--ball-skin-demo" in _src)
+
+    # ---------- 面板视觉改造: 切角边框 + 标题栏切角 + 线框背景 ----------
+    # 这几条钉的是「为什么长这样」而不是像素值: 改配色/改切角量都不该红, 但把装饰层删掉、
+    # 把切角换回直角、把线框换成实色块, 就必须红。tkinter 的 Frame 画不出斜边, 所以装饰
+    # 一律走 place 在最底层的 Canvas(panel_deco), 其他控件照常 pack 叠在上面 —— 这是本
+    # 方案能不动任何布局逻辑就加上装饰的关键。
+    check("面板:有底层装饰 Canvas", "panel_deco = tk.Canvas(panel" in _src
+          and 'relwidth=1, relheight=1' in _src)
+    check("面板:装饰层画法独立成函数", "def draw_panel_deco(" in _src)
+    check("面板:外框是切角八边形", 'create_polygon(pts, fill=C["bg"]' in _src
+          and 'outline=C["accent"]' in _src)
+    check("面板:有内框细线做厚度", 'create_polygon(pts2, fill=""' in _src)
+    check("面板:四角有准星刻度", "tl = 10" in _src
+          and 'fill=C["accent"], width=1, tags="deco"' in _src)
+    check("面板:标题栏两端切角", "def _clip_header(" in _src
+          and "hcut_l = tk.Canvas(header" in _src)
+    check("面板:线框背景用正十二面体", "_dode_project(v, 0.25, 0.4, cx, cy, r)" in _src)
+    check("面板:线框按深度做亮度衰减", "br * 0.18" in _src
+          and "(d1 + d2) / 2.0" in _src)
+    check("面板:尺寸变化时重画装饰", 'lambda e: panel_deco.after(50, draw_panel_deco)' in _src)
+    check("面板:apply_palette 里联动重画", "draw_panel_deco()" in _src
+          and "_clip_header()" in _src)
+
+    # ---------- 几何落点必须真的落地(_geo 语义) ----------
+    # root.geometry() 只是**登记**请求, 不 update_idletasks 在分层窗口上会一直不生效。
+    # 「点了定位悬浮球球却没动」的根因就是这里 —— 所以这些断言一条都不能少。
+    check("几何:瞬间跳位统一走 _geo", "def _geo(w, h, x, y):" in _src
+          and "root.update_idletasks()" in _src)
+    check("几何:定位/收边/展开/启动全部走 _geo", _src.count("_geo(") >= 5)
+    check("几何:拖拽每步都刷 idle 任务", 'root.geometry("+%d+%d" % (nx, ny))' in _src
+          and _src.count('root.update_idletasks()') >= 6)
+
+    # ---------- 主页面预览档位: ×1 必须仍在, 且走「原位播放」分支 ----------
+    # ×1 的意义是「不放大也能看」——对已足够大的封面/竖屏视频, 放大反而糊。
+    # 它必须和小程序里的放大档一样的可见性, 不能被谁顺手删掉。
+    _root = os.path.dirname(os.path.abspath(app.__file__))
+    _html = open(os.path.join(_root, "web", "index.html"), encoding="utf-8").read()
+    _js = open(os.path.join(_root, "web", "app.js"), encoding="utf-8").read()
+    _css = open(os.path.join(_root, "web", "style.css"), encoding="utf-8").read()
+    check("预览:×1 档位按钮存在", 'data-v="1"' in _html, _html[_html.find('id="pvRow"'):][:200])
+    check("预览:×1 在倍率白名单内", "PV_ZOOMS = [1," in _js)
+    check("预览:非法倍率回退到 2", "PV_ZOOMS.includes(v) ? v : 2" in _js)
+    check("预览:×1 走原位分支", "if (zoom === 1) {" in _js)
+    check("预览:×1 有独立样式钩子", ".pv-overlay.pv-flat" in _css and 'zoom === 1 ? " pv-flat"' in _js)
+    # 窗口窄 + 高倍率时浮层会比信息流还宽, 简单的 Math.max/min 夹取会退化成"永远贴左缘"。
+    # 那时应当按信息流居中(两侧对称溢出), 这条断言钉住这个分支不被删掉。
+    check("预览:过宽时改为居中而非贴边",
+          "ovW >= feedRect.width" in _js and "(feedRect.width - ovW) / 2" in _js)
+
+    # ---------- 孤儿球清理: tasklist 输出必须按 GBK 解 ----------
+    # 中文 Windows 的 tasklist 输出是 GBK; 以前用 text=True 让 subprocess 按 UTF-8 解,
+    # 会在读线程里抛 UnicodeDecodeError(启动日志可见 _readerthread), 于是孤儿球永远清不掉。
+    check("清理:tasklist 不用 text=True 直解",
+          'text=True, timeout=10,\n                             creationflags=flags).stdout' not in _src)
+    check("清理:按 GBK 优先解码", 'for enc in ("gbk", "utf-8")' in _src)
+    check("清理:解码失败有兜底", 'decode("utf-8", "replace")' in _src)
+
+    # ---------- 长按抑制标志: 全站必须用 window.__lpSuppress ----------
+    # 曾经写值用 window.__lpSuppress、读值用裸 lpSuppress, 于是 document 上的捕获阶段
+    # click 处理器每次都抛 ReferenceError("lpSuppress is not defined") —— 每次点击都报错,
+    # 且长按菜单后的那次点击会穿透。这条断言钉死命名一致。
+    # 先剥掉注释再查: 注释里为了说明由来会提到那个裸名字, 不该算命中。
+    import re as _re
+    _js_code = _re.sub(r"//[^\n]*", "", _re.sub(r"/\*.*?\*/", "", _js, flags=_re.S))
+    _bare = _re.findall(r'(?<![.\w])lpSuppress(?![.\w])', _js_code)
+    check("长按:无裸 lpSuppress 引用", not _bare, "裸引用 %d 处" % len(_bare))
+    check("长按:统一走 window.__lpSuppress",
+          "window.__lpSuppress" in _js_code and _js_code.count("window.__lpSuppress") >= 3,
+          _js_code.count("window.__lpSuppress"))
+
+    # ---------- 设置页的「找不到球」入口 ----------
+    check("定位:设置页有定位按钮", 'id="floatBallFind"' in _html)
+    check("定位:按钮已绑事件", "#floatBallFind" in _js and "/api/ball_recall_go" in _js)
+    check("定位:按钮有独立样式", ".fb-acts" in _css and "#floatBallFind" in _css)
+    check("定位:未运行时不误报成功",
+          "先点「开启悬浮窗」" in _js)
+    # 请求发出去 ≠ 球收到了(球靠 2.5s 心跳取信号), 所以必须等回执才敢报成功,
+    # 等不到就如实提示「没有响应」—— 否则用户只能对着没反馈的按钮反复点。
+    check("定位:等回执才报成功",
+          "s.ack" in _js and "正在等悬浮球响应" in _js)
+    check("定位:无响应时如实提示", "悬浮球没有响应" in _js)
 
 finally:
     srv.shutdown()

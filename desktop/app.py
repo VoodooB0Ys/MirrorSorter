@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.2.8.0a)
+洞鉴虚明 · 基础版 (v0.2.8.5a)
 =========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -15,15 +15,18 @@
   - 模式档位: 严格/标准/宽松(引战剔除阈值)
   - 只存「标题+作者+封面+热度+链接」元数据, 不搬运内容
   - AI 悬浮窗(仅电脑版): 屏幕常悬浮球 → 对话窗提供「验证真实性」(联网取证判真伪)
-    与「生成回怼」(联网找反驳证据, 生成简洁刻薄的回怼)两个选项卡
+    与「生成回怼」两个选项卡; 回怼为第一人称对线, 先点出对方的知识误区与逻辑谬误,
+    再按条数档位(1/2/3)逐段产出「一句话 n 条 + 一段话 n 条 + 长篇 1 条」并即时显示
 """
 import base64
 import collections
+import ctypes
 import hashlib
 import html
 import html.parser
 import http.cookiejar
 import json
+import math
 import os
 import queue
 import random
@@ -44,6 +47,16 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORTS = (8000, 8010, 8020)
+# 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
+# 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
+# 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
+# 默认 urlopen 保留代理能力(国内访问境外 LLM API 常需要代理)。
+_NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def local_open(url, timeout=5):
+    """打 127.0.0.1 的 GET: 不走任何代理。返回类文件响应(with 语法可用)。"""
+    return _NO_PROXY.open(url, timeout=timeout)
 PAGE_LEASE_GRACE_SECONDS = 3
 PAGE_LEASE_EXPIRE_SECONDS = 150   # 租约心跳超时: 兼容后台隐藏页被节流到~1分钟的定时器
 _SERVER = None
@@ -163,6 +176,8 @@ def db():
         CREATE TABLE IF NOT EXISTS item_exposure_state(key TEXT PRIMARY KEY, run_count INTEGER NOT NULL DEFAULT 0,
                                                        last_presented_at INTEGER NOT NULL DEFAULT 0,
                                                        cooldown_until INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS rebut_saved(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                               source TEXT, seg TEXT, content TEXT, ts INTEGER);
         """)
         try:   # 老库补 gid 列
             conn.execute("ALTER TABLE kw ADD COLUMN gid TEXT")
@@ -249,9 +264,12 @@ DEFAULTS = {
     "float_ball_accent": "",  # 悬浮球强调色(主界面切换强调色时推送; 空=默认粉)
     "float_ball_light": "0",  # 悬浮球浅色主题(跟随主界面深浅主题)
     "assist_think": "标准",   # 悬浮窗思考档位: 快/标准/深挖(输出额度+推理提示)
-    "assist_savage": "毒舌",  # 悬浮窗刻薄程度: 温和/毒舌/阴阳(回怼语气)
-    "assist_len": "中",       # 悬浮窗回复字数: 短/中/长(可粘贴回复的长度档)
-    "assist_fallacy": "1",    # 悬浮窗谬误分析增强: 1=验证/回怼时自动点名对方话术中的逻辑谬误
+    "assist_persona": "不设",  # 悬浮窗身份档位: 不设/理工科/行业老手/数据党/路人(决定拿什么当武器)
+    "assist_savage": "毒舌律师",  # 悬浮窗风格档位: 冷静理性/毒舌律师/阴阳怪气(旧值温和/毒舌/阴阳自动折算)
+    "assist_len": "2",        # 悬浮窗输出档位: 1/2/3, 只调节条数(一句话与一段话各 N 条, 长篇恒 1 条)
+    # 注: 旧的 assist_hover(悬停自动展开)键已弃用 —— 该功能按用户要求整体移除, 只剩点击展开。
+    # 老库里残留的这个键不再被读取, 留着不删以免动到用户数据。
+    "assist_personas": "[]",  # 自定义人设预设(JSON 数组, 见 persona_presets)
 }
 
 
@@ -304,6 +322,7 @@ _FUNNEL_LABELS = {
     "blocklist": "拉黑名单", "help": "求助帖", "xhh": "小黑盒筛选", "dedup": "重复标题",
     "follow_window": "关注超强调窗", "cooldown": "展示冷却", "cooldown_relaxed": "冷却不足复用", "ai_gate": "AI门禁", "kept": "最终入池",
     "pref_fetch": "偏好·搜到", "pref_kept": "偏好·入池", "pref_drop": "偏好·被拦",
+    "pref_age": "偏好·超时间窗",
     "build_full": "全量构建", "build_quick": "快速构建",
 }
 
@@ -659,25 +678,17 @@ _recent_rand = []
 _kw_cursor = 0
 _kw_page = 0
 _fetch_count = 0
-_pref_cursor = 0   # 偏好词轮换游标
-_pref_page = 0     # 偏好词翻页游标(逐轮推进, 永远只搜第1页会反复同一批视频)
+_pref_cursor = 0   # 偏好词轮换游标(严肃模式变体池仍按此轮换)
+_pref_page = 0     # 偏好词翻页计数(保留兼容, 实际取页已改为随机)
+_pref_bag = []     # 偏好词洗牌袋: 一轮内全覆盖 + 顺序随机
+_pref_page_hist = []   # 最近用过的页码(防连续命中同一页)
 _PREF_PAGE_MAX = 4 # 偏好词翻页深度(4页×30条/词, 覆盖小众主题的近期供给)
+PREF_LOOSE_BONUS_MONTHS = 6   # 宽松档: 偏好备注内容额外宽限月数(其余档位不加)
 
 
 def pref_keywords(enabled):
-    """偏好备注 → 搜索词(逗号分词, 2-12字); 每轮取2个, 多轮刷新轮换覆盖全部偏好。"""
-    raw = sget("prefs_note") or ""
-    out = []
-    for part in re.split(r"[，,、;；\n。！？!?]+", raw):
-        p = part.strip()
-        if 2 <= len(p) <= 12:
-            out.append(p)
-    if not out:
-        return []
-    if len(out) == 1:
-        return out
-    idx = _pref_cursor % len(out)
-    return [out[idx], out[(idx + 1) % len(out)]]
+    """偏好备注 → 搜索词(逗号分词, 2-12字); 每轮取2个, 洗牌袋保证覆盖全部偏好但顺序随机。"""
+    return _pref_pick(pref_all_kws(), 2)
 
 
 def pref_all_kws():
@@ -691,14 +702,68 @@ def pref_all_kws():
     return out
 
 
-def _pref_search_terms(enabled, quick):
-    """本轮要搜的(偏好词, 页码): 完整构建取2词/快速开屏取1词(轮换游标覆盖全部偏好),
-    页码游标逐轮推进 —— 永远只搜第1页会把同一批视频翻来覆去, 被已看窗口压光后偏好就"消失"了。"""
-    prefs = pref_keywords(enabled)
-    if not prefs:
+def pref_age_months():
+    """偏好备注内容的发布时间窗(月, 0=不限) —— 偏好同样受时间窗约束, 不再整段豁免。
+    严格/标准: 与设定窗完全一致(设定3个月就绝不出现3个月前的内容);
+    宽松: 额外宽限 PREF_LOOSE_BONUS_MONTHS 个月(偏好主题常是小众长尾, 多给半年保供给);
+    严肃: 走严肃独立时间窗(知识类内容历史长), 同样不再豁免。
+    设定为 0(不限)时偏好也随之为不限。"""
+    try:
+        if sget("mode") == "严肃":
+            base = int(sget("ser_max_age_months") or 0)
+        else:
+            base = int(sget("m_max_age_months") or 0)
+    except Exception:
+        base = 0
+    if not base:
+        return 0
+    if sget("mode") == "宽松":
+        return base + PREF_LOOSE_BONUS_MONTHS
+    return base   # 严格/标准/其它档位: 一分不多给
+
+
+def pref_age_cut():
+    """偏好时间窗的绝对时间戳(0=不限), 供抓取侧预过滤使用。"""
+    m = pref_age_months()
+    return int(time.time() - m * 30.44 * 86400) if m else 0
+
+
+def _pref_pick(pool, n):
+    """洗牌袋取词: 一轮内每个偏好词都被轮到, 但顺序随机。
+    旧版按固定游标取相邻两词, 顺序完全可预期 → 用户感知"每次刷出来都一样"。"""
+    global _pref_bag
+    pool = list(dict.fromkeys([w for w in pool if w]))
+    if not pool or n <= 0:
+        _pref_bag = []
         return []
-    pg = (_pref_page % _PREF_PAGE_MAX) + 1
-    return [(kw, pg) for kw in prefs[:1 if quick else 2]]
+    bag = [w for w in _pref_bag if w in pool]
+    if len(bag) < n:                     # 袋见底 → 补入新一轮洗好的全量词(只补袋里没有的)
+        rest = [w for w in pool if w not in bag]
+        random.shuffle(rest)
+        bag += rest
+    picked = bag[:n]
+    _pref_bag = bag[n:]
+    return picked
+
+
+def _pref_pick_page():
+    """随机页码(避开最近用过的页): 旧版 1→2→3→4 顺序循环, 4轮后完全复现同一批视频。"""
+    global _pref_page_hist
+    cands = [p for p in range(1, _PREF_PAGE_MAX + 1) if p not in _pref_page_hist]
+    if not cands:
+        _pref_page_hist = []
+        cands = list(range(1, _PREF_PAGE_MAX + 1))
+    pg = random.choice(cands)
+    _pref_page_hist = (_pref_page_hist + [pg])[-2:]
+    return pg
+
+
+def _pref_search_terms(enabled, quick):
+    """本轮要搜的(偏好词, 页码): 完整构建取2词/快速开屏取1词。
+    词走洗牌袋、页码随机 —— 两者都随机才不会固定周期复现同一批视频
+    (旧版是双顺序游标, 每 N×4 轮就完整重放一轮)。"""
+    prefs = _pref_pick(pref_all_kws(), 1 if quick else 2)
+    return [(kw, _pref_pick_page()) for kw in prefs]
 
 
 def serious_kw_pool(enabled):
@@ -852,16 +917,22 @@ def search_pushdown():
     return push
 
 
-def search_items(keyword, page=1, limit=30, order=None, duration=None):
+def search_items(keyword, page=1, limit=30, order=None, duration=None, pub_begin=None):
     """WBI签名搜索(实测免登录可用, 可翻页)。失败返回[]。
-    order/duration: 筛选条件下推(见 search_pushdown), 不传则行为与旧版一致。"""
-    try:
+    order/duration: 筛选条件下推(见 search_pushdown), 不传则行为与旧版一致。
+    pub_begin: 只收该时间戳之后发布的内容(秒级), 服务端下推偏好时间窗 —— 后端时间窗是硬约束,
+    能下推就下推, 抓回来的才多是窗内新内容; 若下推后整页为空(小众词无近期供给)则回退免窗重取,
+    最终仍由 pref_age_cut 在本地兜底过滤。"""
+
+    def _once(extra):
         params = {"search_type": "video", "keyword": keyword,
                   "page": str(page), "page_size": str(limit)}
         if order:
             params["order"] = order
         if duration:
             params["duration"] = duration
+        if extra:
+            params.update(extra)
         qs = wbi_enc(params)
         req = urllib.request.Request(
             "https://api.bilibili.com/x/web-interface/wbi/search/type?" + qs,
@@ -871,6 +942,15 @@ def search_items(keyword, page=1, limit=30, order=None, duration=None):
             return []
         res = (d.get("data") or {}).get("result") or []
         return [normalize_search(it) for it in res[:limit] if it.get("bvid")]
+
+    try:
+        if pub_begin:
+            got = _once({"pubtime_begin_s": str(int(pub_begin))})
+            if got:
+                return got
+            got = _once(None)      # 窗内无供给 → 回退免窗重取(本地仍会按窗过滤)
+            return got
+        return _once(None)
     except Exception:
         return []
 HEADERS = {
@@ -1714,7 +1794,7 @@ def tb_login_poll():
         return {"status": "expired", "message": "登录超时(10分钟), 请重试"}
     try:
         import json as _json
-        with urllib.request.urlopen("http://127.0.0.1:%d/json/list" % _CDP_PORT,
+        with local_open("http://127.0.0.1:%d/json/list" % _CDP_PORT,
                                     timeout=3) as resp:
             targets = _json.loads(resp.read().decode("utf-8"))
         page = next((t for t in targets if t.get("type") == "page"), None)
@@ -2536,11 +2616,15 @@ def fetch_pool(quick=False):
     # 与榜单/贴吧/小黑盒同批发出请求; 结果在榜单消费后立即收编(见下方消费块),
     # 保证预算不被相关链/搜索词引擎挤占 —— 旧版排最末且带 len(items)<420 闸门,
     # 相关链+词引擎把池子灌满后偏好词整段被跳过(用户"偏好几乎刷不到"的根因);
-    # 快速开屏也搜1词(旧版quick完全不搜偏好); 页码游标逐轮翻页防同一批视频反复。
+    # 快速开屏也搜1词(旧版quick完全不搜偏好); 取词走洗牌袋、取页随机, 防同一批视频反复。
+    # 偏好内容同样受时间窗硬约束(见 pref_age_months): 服务端能下推就下推, 不再整段豁免。
     pref_terms = _pref_search_terms(enabled, quick)
     _push0 = search_pushdown()
+    _pref_cut0 = pref_age_cut()
     pref_futures = [(kw, pg, _FX.submit(search_items, kw, pg,
-                                        order=_push0.get("order"), duration=_push0.get("duration")))
+                                        order=_push0.get("order"),
+                                        duration=_push0.get("duration"),
+                                        pub_begin=_pref_cut0 or None))
                     for kw, pg in pref_terms]
     cur_gids = []
     jobs = []
@@ -2568,28 +2652,34 @@ def fetch_pool(quick=False):
             errors.append("%s: %s" % (shown, (data or {}).get("code") or err))
 
     # --- 偏好词引擎(消费): 紧跟榜单之后、贴吧/相关链/词引擎之前收编, 预算必有富余 ---
-    # 偏好备注是用户明写的主动意图, 优先级高于分区白名单与严肃模式硬拒:
-    # 结果统一打 pref_kw 标记, 在 machine_filter(时间窗)/bake_universe/planned_feed 各层豁免。
+    # 偏好备注是用户明写的主动意图, 优先级高于分区白名单与严肃模式硬拒(仍在 planned_feed 豁免);
+    # 但时间窗是用户对"新鲜度"的硬设定, 不再豁免 —— 抓回即按偏好窗预过滤, 老视频不占池子名额。
+    _pref_cut = pref_age_cut()   # 0=不限
     for kw, pg, fut in pref_futures:
         try:
             res = fut.result() or []
         except Exception:
             res = []
+        if len(res) > 1:
+            random.shuffle(res)   # 同词同页返回结果顺序固定 → 打散, 不再每轮池顶同一批
         made = 0
         for x in res:
             bvid = (x.get("url") or "").rsplit("/", 1)[-1]
-            if bvid and bvid not in seen and len(items) < 450:
-                seen[bvid] = 1
-                x["src"] = "偏·" + kw[:6]   # 混排桶标记(偏好词)
-                x["pref_kw"] = kw           # 偏好意图标记: 下游各层据此豁免/加成
-                items.append(x)
-                made += 1
+            if not bvid or bvid in seen or len(items) >= 450:
+                continue
+            if _pref_cut and (x.get("pubdate") or 0) and x["pubdate"] < _pref_cut:
+                _funnel_bump("pref_age")   # 超偏好时间窗 → 丢弃(标准/严格档绝不放行)
+                continue
+            seen[bvid] = 1
+            x["src"] = "偏·" + kw[:6]   # 混排桶标记(偏好词)
+            x["pref_kw"] = kw           # 偏好意图标记: 下游据此加成/豁免分区与严肃硬拒
+            items.append(x)
+            made += 1
         if made:
             names.append("偏好·%s×%d" % (kw, made))
             _funnel_bump("pref_fetch", made)
     if pref_terms:
-        _pref_cursor += 1 if quick else 2   # 下轮换下一批偏好词(quick搜1词只进1格)
-        _pref_page += 1                     # 下轮翻新的一页
+        _pref_cursor += 1 if quick else 2   # 严肃模式变体池仍按此游标轮换
 
     # --- 快速开屏: 消费与榜单同时发出的搜索词请求(见 quick 分支的提前提交) ---
     if quick:
@@ -3067,6 +3157,9 @@ def llm_stream(messages, max_tokens=1200, on_reasoning=None):
 # ---------------------------------------------------------------- 联网证据: 事实核查 / 回怼 (AI 悬浮窗)
 
 _ASSIST_MAX_TEXT = 2000    # 待核查/回怼文本长度上限(防超长粘贴撑爆请求)
+# 取证用的搜索词条数上限。每条查询要 2~4 秒(神马单次搜索 + 后续并发抓正文),
+# 5 条 ≈ 15 秒; 再多用户就要盯着「正在搜集证据」等太久了。
+_ASSIST_MAX_QUERIES = 5
 _SEARCH_TTL = 1800         # 搜索结果缓存 30 分钟(同一问题反复查不重复出网)
 _SEARCH_CACHE = {}         # query -> (ts, results)
 _EVIDENCE_X = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ev")   # 网页正文抓取池
@@ -3124,37 +3217,163 @@ def _strip_tags(fragment):
     return html.unescape(re.sub(r"<[^>]+>", "", fragment)).strip()
 
 
-def search_soe(query, n=6):
-    """360 搜索(国内网络最稳, 中文查询不截断)。结果带 data-mdurl=真实链接, 免解跳转。"""
-    try:
-        page = _http_get_text("https://www.so.com/s?" + urllib.parse.urlencode(
-            {"q": query, "rn": str(n)}), timeout=8)
-    except Exception:
-        return []
+# 360 的结果块有两代结构: 旧版 h3 里套 a(链接带 data-mdurl=), 新版 a 里套 h3
+# (链接是 /jump?u= 或 /link?url= 跳转, 真实地址在参数里)。
+_SOE_BLOCK = re.compile(
+    r"<h3[^>]*>\s*<a[^>]*>.*?</a>\s*</h3>"
+    r"|<a[^>]+href=\"[^\"]*\"[^>]*>\s*<h3[^>]*>.*?</h3>", re.S)
+_SOE_DESC = re.compile(
+    r'class="[^"]*(?:res-desc|summary|g-main)[^"]*"[^>]*>(.*?)(?:</div>|</p>|</span>)', re.S)
+
+
+def _soe_real_url(raw):
+    """还原 360 结果链接: 直接地址原样返回, /jump?u= 与 /link?url= 解出参数里的目标。"""
+    u = html.unescape(str(raw or "")).strip()
+    if u.startswith("//"):
+        u = "https:" + u
+    elif u.startswith("/"):
+        u = "https://www.so.com" + u
+    if not u.startswith("http"):
+        return ""
+    if "so.com/link" in u or "so.com/jump" in u:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
+        for k in ("url", "u"):
+            for v in qs.get(k, []):
+                v = html.unescape(v).strip()
+                if v.startswith("http"):
+                    return v
+        return ""   # 只有 m= 标记没有目标地址 → 是广告位/跳转壳, 不收
+    return u
+
+
+def _soe_parse(page, n):
+    """解析 360 结果页, 兼容新旧两代结构。"""
     out = []
-    anchors = [(m.start(), m.end(), m.group(0)) for m in
-               re.finditer(r"<h3[^>]*>\s*<a[^>]*>.*?</a>\s*</h3>", page, re.S)]
-    for pos, end, tag in anchors:
-        md = re.search(r'data-mdurl="([^"]+)"', tag)
-        hr = re.search(r'href="([^"]+)"', tag)
-        u = html.unescape((md.group(1) if md else (hr.group(1) if hr else ""))).strip()
-        if not u.startswith("http") or "so.com/link" in u:
-            continue   # 无真实链接的跳转链/广告位不收
-        ti = re.search(r"<a[^>]*>(.*?)</a>", tag, re.S)
+    blocks = [(m.start(), m.end(), m.group(0)) for m in _SOE_BLOCK.finditer(page)]
+    for pos, end, tag in blocks:
+        ti = re.search(r"<h3[^>]*>(.*?)</h3>", tag, re.S) or re.search(r"<a[^>]*>(.*?)</a>", tag, re.S)
         if not ti:
             continue
-        nxt = next((p for p, _e, _t in anchors if p > pos), len(page))
-        seg = page[end:nxt]
-        ab = re.search(r'class="[^"]*res-desc[^"]*"[^>]*>(.*?)(?:</div>|</p>|</span>)', seg, re.S)
-        out.append({"title": _strip_tags(ti.group(1)), "url": u,
+        title = _strip_tags(ti.group(1))
+        if not title:
+            continue
+        md = re.search(r'data-mdurl="([^"]+)"', tag)
+        hr = re.search(r'href="([^"]+)"', tag)
+        u = _soe_real_url(md.group(1) if md else (hr.group(1) if hr else ""))
+        if not u:
+            continue
+        nxt = next((p for p, _e, _t in blocks if p > pos), len(page))
+        ab = _SOE_DESC.search(page[end:nxt])
+        out.append({"title": title, "url": u,
                     "snippet": _strip_tags(ab.group(1))[:200] if ab else ""})
         if len(out) >= n:
             break
     return out
 
 
+def search_soe(query, n=6):
+    """360 搜索(曾经国内最稳, 近期长期风控)。
+    桌面站被风控时只会回「访问异常页面」, 这时改用移动站再试一次; 两个站都被风控就冷却。"""
+    if not _engine_ready("soe"):
+        return []
+    for host in ("https://www.so.com/s?", "https://m.so.com/s?"):
+        try:
+            page = _http_get_text(host + urllib.parse.urlencode(
+                {"q": query, "rn": str(n)}), timeout=8)
+        except Exception:
+            continue
+        if _engine_block("soe", page):
+            continue
+        out = _soe_parse(page, n)
+        if out:
+            return out
+    return []
+
+
+# 引擎冷却: 被风控页挡下就别继续硬打(越打风控越久), 先歇一会儿再试。
+# 实测神马 m.sm.cn 打太密会回 captcha 跳转页(858 字节, 见 _SM_BLOCK),
+# 360 回「访问异常页面」(9847 字节)。冷却期内直接跳过, 省一次请求也少惹一次风控。
+_ENGINE_COOLDOWN = {}      # 引擎名 → 冷却截止时间戳
+_ENGINE_COOLDOWN_SECS = 180
+
+
+def _engine_ready(name):
+    return time.time() >= _ENGINE_COOLDOWN.get(name, 0)
+
+
+def _engine_block(name, page):
+    """命中风控页 → 该引擎冷却一段时间。返回是否被风控。"""
+    if page and _BLOCK_PAGE_RE.search(page[:4000]):
+        _ENGINE_COOLDOWN[name] = time.time() + _ENGINE_COOLDOWN_SECS
+        return True
+    return False
+
+
+_BLOCK_PAGE_RE = re.compile(r"访问异常|/punish|x5secdata|captcha|验证码|安全验证|robot check",
+                            re.I)
+
+
+def search_sm(query, n=6):
+    """神马搜索(m.sm.cn, 阿里/UC 系移动搜索): 目前唯一稳定好用的中文新闻源。
+    360 长期回「访问异常」风控页(带 Cookie 也没用), Bing 对中文多词查询只匹配头一个词
+    并且退化成百科实体页(搜「055驱逐舰 绕澳大利亚 5万海里」只回 055 百度百科词条),
+    只有神马既给真实外链又能命中新闻正文。被风控时冷却 3 分钟。失败返回 []。"""
+    if not _engine_ready("sm"):
+        return []
+    try:
+        page = _http_get_text("https://m.sm.cn/s?" + urllib.parse.urlencode({"q": query}),
+                              timeout=10)
+    except Exception:
+        return []
+    if _engine_block("sm", page):
+        return []
+    return _sm_parse(page, n)
+
+
+_SM_TPL = 'data-tpl="structure_template_normal"'   # 每个自然结果块的标记
+_SM_TITLE = re.compile(r'class="qk-title-text[^"]*"[^>]*>(.*?)</div>', re.S)
+_SM_DESC = re.compile(r'class="qk-paragraph-text"[^>]*>(.*?)</div>', re.S)
+_SM_SRC = re.compile(r'class="qk-source-item[^"]*"[^>]*>(.*?)</div>', re.S)
+_SM_HREF = re.compile(r'href="(https?://[^"]+)"')
+
+
+def _sm_parse(page, n=6):
+    """神马结果块: 按 data-tpl 切块, 块内取首个外链(真实地址) + qk-title-text(标题)
+    + qk-paragraph-text(摘要) + qk-source-item(来源·时间)。"""
+    if not page or _SM_TPL not in page:
+        return []
+    out, seen = [], set()
+    for blk in page.split(_SM_TPL)[1:]:
+        m = _SM_HREF.search(blk)
+        if not m:
+            continue
+        url = html.unescape(m.group(1))
+        if not url.startswith("http"):
+            continue
+        u = urllib.parse.urlparse(url)
+        if not u.netloc or u.netloc.endswith("sm.cn"):
+            continue   # 神马自家聚合页/跳转页不要
+        t = _SM_TITLE.search(blk)
+        title = _strip_tags(t.group(1)) if t else ""
+        if not title:
+            continue
+        d = _SM_DESC.search(blk)
+        s = _SM_SRC.search(blk)
+        k = u.netloc + u.path
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append({"title": title[:120], "url": url,
+                    "snippet": _strip_tags(d.group(1))[:300] if d else "",
+                    "site": _strip_tags(s.group(1))[:40] if s else u.netloc})
+        if len(out) >= n:
+            break
+    return out
+
+
 def search_bing(query, n=6):
-    """Bing 网页搜索(HTML 解析, 免 key)。失败/被风控返回 []。"""
+    """Bing 网页搜索(HTML 解析, 免 key)。失败/被风控返回 []。
+    注意: 中文多词查询会退化成头一个词的百科/门户页, 只适合英文查询与兜底。"""
     try:
         page = _http_get_text("https://www.bing.com/search?" + urllib.parse.urlencode(
             {"q": query, "count": str(n), "mkt": "zh-CN"}), timeout=8)
@@ -3207,8 +3426,10 @@ def search_ddg(query, n=6):
 
 
 def web_search(query, n=8):
-    """360 → Bing → DDG 三级兜底(凑不满 3 条才降级下一家); 合并去重 + 30 分钟缓存。
-    360: 国内网络中文最稳; Bing: 海外/英文; DDG: 最后保险(部分网络不可达)。"""
+    """多引擎兜底(凑不满 3 条才降级下一家); 合并去重 + 30 分钟缓存。
+    引擎顺序按语言分流: 中文查询走神马(m.sm.cn)——目前唯一能稳定命中中文新闻正文的一家;
+    英文查询走 Bing(海外索引好)。之后依次 Bing/360/DDG 兜底。
+    360 近段时间长期回风控页, 放在后面只当恢复后的备用。"""
     key = query.strip()[:120]
     now = time.time()
     hit = _SEARCH_CACHE.get(key)
@@ -3226,11 +3447,17 @@ def web_search(query, n=8):
                 results.append(r)
         return results
 
-    results = search_soe(query, n)
-    if len(results) < 3:
-        results = merge(results, search_bing(query, n))
-    if len(results) < 3:
-        results = merge(results, search_ddg(query, n))
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", query))
+    order = ((search_sm, search_bing, search_soe, search_ddg) if has_cjk
+             else (search_bing, search_sm, search_soe, search_ddg))
+    results = []
+    for engine in order:
+        if len(results) >= 3:
+            break
+        try:
+            results = merge(results, engine(query, n))
+        except Exception:
+            continue   # 单个引擎炸了不影响其它引擎
     results = [r for r in results
                if r["url"].startswith("http") and "duckduckgo.com" not in r["url"]][:n]
     if len(_SEARCH_CACHE) > 64:   # 防膨胀: 超限清掉最旧一半
@@ -3298,14 +3525,70 @@ def fetch_page_text(url, max_chars=3200):
     return re.sub(r"\s{2,}", " ", " ".join(p.parts)).strip()[:max_chars]
 
 
+# 搜索引擎对中文查询常只匹配头一个词(搜「大厂都在裁员」回一堆大厂排名, 搜
+# 「2024程序员岗位减少40%」回 2024 年日历页)。这类页面混进证据会让模型拿日历页当论据,
+# 所以按查询词与结果文本的字符重合度筛一遍: 重合太低的直接不要。
+_REL_STOP = set("的了和与及或在是有为对不也就都还你我他她它这那吗呢吧啊么"
+                "什么怎样如何为何没有会要很太可能已经正在并且而且但是所以因为如果虽然可以")
+_REL_MIN = 0.3
+# 权威域名放宽到这(同一件事换个说法也值得留), 但不能零门槛。0.15 是实测分界:
+# 真实命中在短句场景下会被「辟谣 真相」这类兜底后缀稀释到 0.18 左右
+# (查询「网传说可乐能杀灭蛔虫 辟谣 真相」vs 标题「世卫声明：可乐杀蛔虫不实」),
+# 而引擎退化成头词匹配时回的实体页只有 0.14 及以下(「山东省_百度百科」vs「山东舰 西太平洋 部署 天数」)。
+_REL_RELAX = 0.15
+
+# 通用实体页不是证据: 引擎退化成「头词匹配」时只会回这类页面(实测搜「山东舰 西太平洋
+# 部署 天数」回「山东省_百度百科」「山东省人民政府」「山东省教育招生考试院官网」,
+# 搜「美国航母生锈」回「百度百科·美国」「美国历史…_百度百科」)。它们域名权威度高、
+# 与具体说法却毫无关系, 放进去模型就会拿「沈阳市_百度百科」当反例。
+# 注意只拦地名/国家/机构这类通用实体页; 具体装备词条(「055型驱逐舰_百度百科」)也一样拦,
+# 因为百科对「这艘舰跑过多少海里」这种具体事实给不出证据, 真正管用的是新闻。
+_ENTITY_TITLE_RE = re.compile(
+    r"百度百科|维基百科|搜狗百科|360百科|互动百科|"
+    r"人民政府|政务服务|招生考试|国家概况|行政区划|省情|市情|"
+    r"旅游攻略|旅游景点|值得去的|必去的|"
+    r"官方网站|官网$|Department of State")
+
+
+def _is_entity_page(title):
+    return bool(_ENTITY_TITLE_RE.search(str(title or "")))
+
+
+def _rel_grams(text):
+    """切词: 英文数字按整词, 中文按两字滑窗; 丢掉全由停用字拼成的碎片。"""
+    t = str(text or "").lower()
+    out = set(w for w in re.findall(r"[a-z0-9]+", t) if len(w) >= 2)
+    for seg in re.findall(r"[\u4e00-\u9fff]+", t):
+        for i in range(len(seg) - 1):
+            g = seg[i:i + 2]
+            if g[0] in _REL_STOP and g[1] in _REL_STOP:
+                continue
+            out.add(g)
+    return out
+
+
+def _relevance(query, *texts):
+    """查询词与结果文本的重合度(0~1)。查询词太短无法判断时返回 1(不做过滤)。"""
+    qg = _rel_grams(query)
+    if len(qg) < 2:
+        return 1.0
+    tg = _rel_grams(" ".join(str(t or "") for t in texts))
+    return len(qg & tg) / float(len(qg))
+
+
 def gather_evidence(claim, extra_queries=(), per_query=6, want_pages=4, max_evidence=10):
-    """围绕说法联网搜索并抓正文, 证据按可信度排序(权威在前)。
+    """围绕说法联网搜索并抓正文, 证据按可信度与相关度排序(权威且贴题的在前)。
     全程容错: 搜不到/抓不到只返回已得部分, 完全失败返回 []。"""
-    queries = [claim.strip()[:64]]
+    queries = []
     for q in extra_queries:
         q = (q or "").strip()
         if q and q not in queries:
             queries.append(q[:64])
+    raw = claim.strip()[:64]
+    # 论点拆解出的短查询词命中率远高于原话整段(整段口语句子只会搜回一堆泛化页面),
+    # 短查询词够两个时就不拿原话整段去搜
+    if raw and raw not in queries and len(queries) < 2:
+        queries.append(raw)
     results, seen = [], set()
     for q in queries:
         for r in web_search(q, per_query):
@@ -3314,6 +3597,7 @@ def gather_evidence(claim, extra_queries=(), per_query=6, want_pages=4, max_evid
             if k in seen:
                 continue
             seen.add(k)
+            r["_q"] = q
             r["_cred"] = domain_cred(r["url"])
             r["_cred_label"] = _CRED_LABEL[r["_cred"]]
             results.append(r)
@@ -3323,7 +3607,19 @@ def gather_evidence(claim, extra_queries=(), per_query=6, want_pages=4, max_evid
     for r in results:
         if _SPAM_TITLE_RE.search(r["title"] + " " + r.get("snippet", "")):
             r["_cred"], r["_cred_label"] = "low", "参考"   # 营销号腔标题 → 降级
-    results.sort(key=lambda r: rank.get(r["_cred"], 3))
+        r["_rel"] = _relevance(r["_q"], r["title"], r.get("snippet", ""))
+    # 通用实体页(百科/政府门户/旅游攻略)先剔掉: 引擎退化时它们会占满结果, 而它们
+    # 恰恰是最不可能是证据的东西
+    results = [r for r in results if not _is_entity_page(r["title"])]
+    # 权威来源即便措辞与查询词不同也留着(可能是同一件事的另一种说法), 但不能零门槛:
+    # 否则一条只碰巧提到查询词头两个字的高权重页面也会被当成证据
+    keep = [r for r in results
+            if r["_rel"] >= _REL_MIN or (r["_cred"] == "high" and r["_rel"] >= _REL_RELAX)]
+    if not keep:   # 全军覆没: 只留最贴题的一条, 一条都不贴题就干脆不拿证据
+        best = max(results, key=lambda r: r["_rel"]) if results else None
+        keep = [best] if best and best["_rel"] >= _REL_MIN else []
+    results = keep
+    results.sort(key=lambda r: (rank.get(r["_cred"], 3), -r["_rel"]))
     solid = [r for r in results if r["_cred"] != "low"]
     if len(solid) >= 3:
         results = solid   # 权威/可靠来源够用时, 低可信(含营销号)整个剔除
@@ -3429,44 +3725,83 @@ def fetch_talk_templates():
     return []
 
 
-def decompose_claim(text):
-    """把言论拆成可验证的事实论点, 每个论点配一个搜索词(逐个击破的基础)。
+def decompose_plan(text):
+    """把言论拆成可验证的事实论点, 每个论点配「正向 + 反例向」搜索词, 外加一条整段话的
+    最有力反例词。返回 (claims, best_counter); 失败返回 ([], "")。
     短句(≤12字)只有一层意思: 不拆不脑补, 直接按原文单论点处理; 长句才走 LLM 拆解。"""
     t = text.strip()
     if len(t) <= 12:
-        return [{"point": t[:60], "query": ""}]
+        return [{"point": t[:60], "query": "", "counter": ""}], ""
     if not ai_on():
-        return []
+        return [], ""
+    # query 是「顺着原话查」, counter 是「反例向查」——后者才是能打脸的关键。
+    # 只给正向词时模型会照抄对方措辞(「中国航母 不生锈 远洋任务」), 搜回来全是同温层内容
+    # (「辽宁号也生锈」); 换成事实措辞(「055驱逐舰 绕澳 5万海里」)才能搜到直接反例。
+    # best_counter 更进一步: 允许跳出原话点名的对象去找同类装备/同类事件的纪录——
+    # 「中国航母没跑过远洋」最有力的一击其实来自驱逐舰的远洋纪录, 逐论点拆解抓不到这种跨类反例。
+    ask = ("把下面这段言论拆成2-4个独立的事实论点(剥掉修辞和情绪, 只留可验证的事实主张, "
+           "按原意保留错误主张不要纠正), 并给每个论点配两条中文搜索词:\n%s\n\n"
+           "query: 顺着原话查证的词, 用来找与该主张直接相关的资料。\n"
+           "counter: 反例向的词, 用来找能直接打脸该说法的真实案例。写 counter 的硬性要求:\n"
+           "  1) 必须能搜到「具体对象 + 具体数字」的实例(装备型号/舰机名/事件名/天数/海里数), "
+           "不许用形容词和评价词;\n"
+           "  2) 绝对不许照抄原话里的措辞, 一个字都不许复用原话的词组;\n"
+           "  3) 想清楚「要推翻这个说法, 网上该有什么事实」, 再把这个事实描述成搜索词。\n"
+           "例: 原话「中国航母不生锈是因为没执行远洋长时间任务」→ counter 写"
+           "「山东舰 西太平洋 训练 天数」, 绝不写成「中国航母 不生锈 远洋任务」。\n\n"
+           "best_counter: 跳出原话点名的对象, 想一下「整段话最容易被哪个公开事实打脸」, "
+           "给一条搜索词去搜那个事实——可以是同类装备、同类事件的纪录。\n"
+           "例: 整段话在说「中国航母没跑过远洋所以不生锈」→ best_counter 写"
+           "「055型驱逐舰 远洋部署 天数」或「052D驱逐舰 亚丁湾护航 连续部署 天数」, "
+           "因为驱逐舰跑过更长时间的远洋任务, 最能反证「没跑过远洋」这个前提。\n\n"
+           "硬性要求: 论点必须是对原话的直接拆分, 严禁添加原话里没有的主张、"
+           "严禁脑补对方的其他观点; 原话只有一个主张就只输出1个论点。\n"
+           '只输出JSON: {"claims": [{"point": "事实论点(简短陈述句)", '
+           '"query": "顺着查的词(不超过20字)", "counter": "反例向的词(不超过20字)"}], '
+           '"best_counter": "整段话最有力的反例搜索词(不超过20字)"}'
+           % t[:_ASSIST_MAX_TEXT])
     try:
-        content, _ = call_llm([
-            {"role": "system", "content": "你是论点拆解器, 只输出JSON对象, 不要任何解释。"},
-            {"role": "user", "content":
-                "把下面这段言论拆成2-4个独立的事实论点(剥掉修辞和情绪, 只留可验证的事实主张, "
-                "按原意保留错误主张不要纠正), 并给每个论点配一个适合搜索引擎查证的中文查询词:\n%s\n\n"
-                "硬性要求: 论点必须是对原话的直接拆分, 严禁添加原话里没有的主张、"
-                "严禁脑补对方的其他观点; 原话只有一个主张就只输出1个论点。\n"
-                "只输出JSON: {\"claims\": [{\"point\": \"事实论点(简短陈述句)\", \"query\": \"搜索词(不超过20字)\"}]}"
-                % text[:_ASSIST_MAX_TEXT]}],
-            max_tokens=600, temperature=0.2)
-        res = llm_json(content)
-        out = []
-        for c in (res.get("claims") or [])[:4]:
-            p = str(c.get("point") or "").strip()[:120]
-            q = str(c.get("query") or "").strip()[:40]
-            if p:
-                out.append({"point": p, "query": q})
-        return out
+        # 推理模型容易把输出额度花在思考上导致JSON截断 → 交给带重试的解析(额度加大再试一次),
+        # 否则拆解一失败, 后面的取证与「要打的点」就全丢了
+        res = _assist_llm_json("你是论点拆解器, 只输出JSON对象, 不要任何解释。", ask, 1200, 0.2)
     except Exception:
-        return []   # 拆解失败不致命: 后续按原文整体检索
+        return [], ""   # 拆解失败不致命: 后续按原文整体检索
+    out = []
+    for c in (res.get("claims") or [])[:4]:
+        if not isinstance(c, dict):
+            continue
+        p = str(c.get("point") or "").strip()[:120]
+        q = str(c.get("query") or "").strip()[:40]
+        k = str(c.get("counter") or "").strip()[:40]
+        if p:
+            out.append({"point": p, "query": q, "counter": k})
+    return out, str(res.get("best_counter") or "").strip()[:40]
+
+
+def decompose_claim(text):
+    """只要论点列表(旧接口, 测试与内部调用沿用)。"""
+    return decompose_plan(text)[0]
 
 
 def assist_plan(text):
-    """论点拆解 + 汇总搜索词(每论点1个; 不足2个时补一条辟谣向兜底)。返回 (claims, queries)。"""
-    claims = decompose_claim(text)
-    queries = [c["query"] for c in claims if c.get("query")]
+    """论点拆解 + 汇总搜索词(整段反例 + 逐论点反例优先, 再补正向; 上限 5 条)。
+    返回 (claims, queries)。
+
+    排序有讲究: gather_evidence 会把查询词逐条搜完再合并, 但条数越多越慢(每条 2~4 秒),
+    所以必须裁到固定条数。裁的时候先保反例向——正向词照抄对方措辞只能搜到同温层内容,
+    反例向词才是能打脸的素材; 按「正反交替」排的话, 3 个论点时第 3 个论点的词会被整条丢掉,
+    而往往最后那个论点(「中国航母没执行过远洋任务」)才是真正要打的那个。
+    """
+    claims, best = decompose_plan(text)
+    pos = [c["query"] for c in claims if c.get("query")]
+    neg = [c["counter"] for c in claims if c.get("counter")]
+    queries = []
+    for q in ([best] if best else []) + neg + pos:
+        if q not in queries:
+            queries.append(q)
     if len(queries) < 2:
         queries.append(text.strip()[:30] + " 辟谣 真相")
-    return claims, queries[:4]
+    return claims, queries[:_ASSIST_MAX_QUERIES]
 
 
 def _norm_evidence(evidence, ids=None):
@@ -3482,20 +3817,50 @@ def _norm_evidence(evidence, ids=None):
     return out
 
 
+def _evidence_brief(refs):
+    """给悬浮球用的证据摘要(编号+标题+链接): 让每条回复后面的编号能点开溯源。"""
+    out = []
+    for e in refs or []:
+        u = str(e.get("url") or "")
+        if not u:
+            continue
+        out.append({"id": e.get("id") or "", "title": str(e.get("title") or "")[:60],
+                    "url": u, "cred": e.get("cred_label") or ""})
+    return out[:10]
+
+
+# 推理模型的思考额度下限。deepseek-flash 这类模型先产出思考再产出正文, 而 max_tokens 把
+# 思考一起算进去: 实测同一句论点拆解在 max_tokens=1200 时 6 次有 5 次思考占满额度、
+# content 是空串; 2000 时 3/6; 4000 时 1/6; 6000 时 0/6。思考长度本身波动很大
+# (实测 372~4137), 所以任何要 JSON 的调用都不能按「正文有多长」给额度。
+# 额度给大不会多花钱——模型不用就按实际 completion_tokens 计费, 只是别再让它截断。
+_JSON_MIN_TOKENS = 4000
+
+
 def _assist_llm_json(system, user, max_tokens, temperature):
-    """要求 LLM 按 JSON 回答: 首次解析失败(常见于推理模型把输出额度花在思考上导致
-    正文截断)→ 加大额度并强调格式重试一次; 仍失败抛 ValueError, 由调用方走纯文本兜底。"""
+    """要求 LLM 按 JSON 回答。
+    两轮: 第一轮按调用方给的额度(但不低于 _JSON_MIN_TOKENS, 给思考留够空间);
+    第二轮再加大额度并强调格式。content 为空串是「思考把额度吃光」的典型症状,
+    加多少「只输出JSON」的强调都没用, 只能给更多额度重来。"""
     last = None
-    for i, mt in enumerate((max_tokens, max_tokens + 1000)):
+    base = max(int(max_tokens or 0), _JSON_MIN_TOKENS)
+    for i, mt in enumerate((base, base + 3000)):
         msg = user if i == 0 else user + "\n\n再次强调: 只输出JSON对象本身, 不要任何解释文字, 不要代码块围栏。"
         try:
             content, _ = call_llm([{"role": "system", "content": system},
                                    {"role": "user", "content": msg}],
                                   max_tokens=mt, temperature=temperature)
+        except Exception as e:
+            last = e
+            continue
+        if not str(content or "").strip():
+            last = ValueError("模型把输出额度花在思考上, 没留下正文")
+            continue
+        try:
             return llm_json(content)
         except ValueError as e:
             last = e
-    raise last
+    raise last if isinstance(last, Exception) else ValueError("模型没有给出可用回复")
 
 
 def _verify_from_text(content, evidence):
@@ -3535,6 +3900,56 @@ def _rebut_from_text(content, evidence):
             "finale": "", "stance_note": "", "offline": not evidence}
 
 
+def _floatball_prefs():
+    """悬浮窗调节档位(给前端与悬浮球读的当前值; 旧值一律折算成新档位)。
+
+    只含**点击展开后仍生效**的生成档位: 思考/身份/风格/条数。悬停自动展开已移除,
+    所以不再有 hover 这一项(见 run_float_ball 里的开合说明)。
+    """
+    return {"think": sget("assist_think") or "标准",
+            "persona": _persona_key(sget("assist_persona")),
+            "savage": _savage_key(sget("assist_savage")),
+            "len": str(assist_len_n())}
+
+
+# ---------------- 对线收藏(回怼结果存本地, 可搜索复用) ----------------
+
+def rebut_save(source, seg, content):
+    """收藏一条回怼。返回新记录 id(内容为空返回 0)。"""
+    content = str(content or "").strip()
+    if not content:
+        return 0
+    with _db_lock:
+        cur = db().execute("INSERT INTO rebut_saved(source, seg, content, ts) VALUES(?,?,?,?)",
+                           (_norm_rebut_text(source), str(seg or "")[:16], content[:2000],
+                            int(time.time())))
+        db().commit()
+        return int(cur.lastrowid or 0)
+
+
+def rebut_saved_list(q="", limit=60):
+    """收藏列表(按时间倒序); q 非空时按原话或正文模糊匹配。"""
+    sql = "SELECT id, source, seg, content, ts FROM rebut_saved"
+    args = []
+    q = str(q or "").strip()
+    if q:
+        sql += " WHERE source LIKE ? OR content LIKE ?"
+        args = ["%" + q + "%", "%" + q + "%"]
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(int(limit))
+    with _db_lock:
+        rows = db().execute(sql, args).fetchall()
+    return [{"id": r[0], "source": r[1] or "", "seg": r[2] or "",
+             "content": r[3] or "", "ts": r[4]} for r in rows]
+
+
+def rebut_saved_delete(rid):
+    with _db_lock:
+        db().execute("DELETE FROM rebut_saved WHERE id=?", (int(rid),))
+        db().commit()
+    return True
+
+
 # ---------------- 反八股正则: 识别/清洗回复里的 AI 腔(网上常见 AI 味检测式样) ----------------
 
 _AIFLAVOR_SUB = [   # (正则, 替换): 套话删除或换成口语
@@ -3564,215 +3979,673 @@ def _deflavor(text):
     return re.sub(r"[「」『』“”‘’\"']", "", text).strip()
 
 
+# ---------------- 写作硬规则(用户给定: 每次生成都注入提示词, 产出后再清洗一遍) ----------------
+
+_STYLE_RULES = (
+    "写作硬规则(逐条强制, 违反任意一条都算失败, 没有例外):\n"
+    "1. 禁止「不是…而是…」「要…而不是…」「而不是」以及一切同类对比句式; "
+    "没有需要对比的对象时, 不要凭空对比。\n"
+    "2. 禁止分阶段措辞(先做第一版、之后再观察、分稳妥与激进), 直接给最终结果。\n"
+    "3. 禁止罗列不满足要求的无关内容, 搜到用不上的东西一律不写出来。\n"
+    "4. 禁止总结与总起: 不许出现「上述内容…下面详细拆开」「一句话总结:…」「综上」这类开头或结尾。\n"
+    "5. 用词用两个及以上的完整形式, 禁止单字缩写: 崩溃不写崩, 死亡不写死, 判定不写判, "
+    "推断不写推, 抛出不写抛, 挂起不写挂。代码标识符保持英文原名。禁止生造名词。\n"
+    "6. 禁止「落地」「钉死」「对齐」这类黑话, 用任何人都看得懂的日常词汇。\n"
+    "7. 禁止「栈」字(技术栈、模型栈), 直接说具体事物。"
+)
+
+# 事后清洗: 黑话换日常词 + 单字缩写补全 + 总结式开头删除
+_STYLE_SUB = [
+    (r"技术栈", "使用的技术"), (r"模型栈", "全部模型"), (r"全栈", "全部环节"),
+    (r"落地", "实施"), (r"钉死", "确定"), (r"对齐", "统一"),
+    (r"崩(?=[了掉]|$|[，。！？；、\s])", "崩溃"),
+    (r"死(?=[了掉]|$|[，。！？；、\s])", "死亡"),
+    (r"判(?=[了掉]|$|[，。！？；、\s])", "判定"),
+    (r"推(?=[了掉]|$|[，。！？；、\s])", "推断"),
+    (r"抛(?=[了掉]|$|[，。！？；、\s])", "抛出"),
+    (r"挂(?=[了掉]|$|[，。！？；、\s])", "挂起"),
+    (r"^(?:一句话总结|总结一下|总结|综上|综上所述)[:：,，]?\s*", ""),
+    (r"^(?:上述内容|上面这些|以上内容)[^。！？]{0,14}[，,]?\s*(?:下面|接下来)[^。！？]{0,12}[。！？]\s*", ""),
+    (r"一句话总结[:：,，]?\s*", ""),
+]
+
+_STYLE_DETECT = re.compile(
+    r"不是[^，。；！？]{0,20}而是|要[^，。；！？]{0,20}而不是|而不是|"
+    r"一句话总结|综上所述|上述内容|下面详细|下面拆开|"
+    r"落地|钉死|对齐|栈|"
+    r"(?:^|[，。！？；、\s])[崩死判推抛挂](?=[了掉]|$|[，。！？；、\s])")
+
+
+def _style_fix(text):
+    """写作硬规则清洗: 黑话换日常词、单字缩写补全、总结式开头删除。"""
+    t = str(text or "")
+    for pat, rep in _STYLE_SUB:
+        t = re.sub(pat, rep, t, flags=re.M)
+    return t.strip()
+
+
+def _style_violations(*texts):
+    """收集命中写作硬规则的写法(供重写重试点名)。"""
+    hits = []
+    for t in texts:
+        for m in _STYLE_DETECT.finditer(str(t or "")):
+            s = m.group(0).strip()
+            if s and s not in hits:
+                hits.append(s)
+    return hits
+
+
 def _claims_block(claims):
     """把拆解出的论点排成提示词清单。"""
     return "\n".join("%d. %s" % (i, c["point"]) for i, c in enumerate(claims, 1)) if claims else ""
 
 
-def assist_result(mode, text, evidence, claims=()):
+def assist_result(mode, text, evidence, claims=(), emit=None):
     """基于已收集的证据+论点拆解调 LLM 生成结构化结果, 返回 (result, 证据卡列表)。
-    思考/刻薄/字数档位从设置读取(面板 ⚙ 调节, 服务端持久化)。"""
+    思考/刻薄/条数档位从设置读取(面板 ⚙ 调节, 服务端持久化)。
+    mode=rebut 时走三段式对线生成, emit(kind, payload) 让每段产出后立刻推给用户。"""
     cb = _claims_block(claims)
     think = sget("assist_think")
     savage = sget("assist_savage")
-    rlen = sget("assist_len")
     mt_mul = {"快": 0.6, "标准": 1.0, "深挖": 1.5}.get(think, 1.0)
     think_line = {"快": "\n(用户选了快速模式: 直接给结论, 不要展开推理过程。)",
                   "深挖": "\n(用户选了深挖模式: 多角度交叉验证每条证据, 谨慎权衡后再下结论。)"}.get(think, "")
-    savage_line = {"温和": "语气克制理性, 平静指出错误即可, 不讽刺。",
-                   "阴阳": "大量使用反讽与阴阳怪气(假装夸赞、捧杀式讽刺), 刻薄值拉满。"}.get(
-        savage, "犀利刻薄带讽刺。")
-    len_line = {"短": "每条不超过25字, 一句话。",
-                "中": "每条50字左右, 1~2句话。",
-                "长": "每条严格90字左右, 2~3句话, 至少把一个证据里的具体数字或名称写进句子, 宁长勿短。"
-                }.get(rlen, "每条50字左右, 1~2句话。")
-    fallacy_on = sget("assist_fallacy") == "1"
-    fallacy_note = ("若说法存在明显逻辑谬误(偷换概念/假两难/以偏概全/诉诸权威/滑坡谬误/稻草人等), "
-                    "在 reasons 里顺口点名谬误, 并把谬误名写全 fallacies 字段。" if fallacy_on
-                    else "fallacies 字段恒为空数组。")
-    if mode == "verify":
-        system = ("你是严谨的事实核查员。只依据给出的网络证据判断说法真伪, 不臆测; "
-                  "证据不足或互相矛盾时必须判存疑。只输出一个JSON对象, 不要输出任何其它文字。")
-        cseg = ("【说法拆解出的分论点】\n%s\n\n" % cb) if cb else ""
-        ask = ("判断该说法整体真伪, 并对每个分论点分别给出判定。只输出JSON: "
-               "{\"verdict\": \"true|false|uncertain\", \"confidence\": 0到100的整数(判定置信度), "
-               "\"summary\": \"一句话总结论\", \"reasons\": [\"总体理由(引用证据编号如[E1])\"共2到4条], "
-               "\"claims\": [{\"point\": \"分论点原文\", \"check\": \"true|false|uncertain\", "
-               "\"note\": \"一句话判定依据(引用证据编号)\"}], "
-               "\"fallacies\": [\"谬误名\"], "
-               "\"evidence_used\": [\"E1\"等实际使用的证据编号]}。"
-               "注意: 判true就给证明其为真的理由, 判false就给证明其为假的理由, "
-               "理由必须能在证据中找到依据; 分论点没有对应证据时判 uncertain。" + fallacy_note)
-        if evidence:
-            user = ("【待核查说法】\n%s\n\n%s【网络证据】(可信度: 权威>可靠>参考; "
-                    "参考级为自媒体/论坛, 不得作为结论的唯一依据)\n%s\n\n%s"
-                    % (text[:_ASSIST_MAX_TEXT], cseg, evidence_block(evidence), ask))
-        else:
-            user = ("【待核查说法】\n%s\n\n%s(网络搜索暂不可用, 请基于你已有的知识谨慎判断, "
-                    "证据不足就判 uncertain)\n只输出JSON: {\"verdict\": \"true|false|uncertain\", "
-                    "\"confidence\": 0到100的整数, \"summary\": \"一句话结论\", "
-                    "\"reasons\": [\"理由\"共2到4条], "
-                    "\"claims\": [{\"point\": \"分论点\", \"check\": \"true|false|uncertain\", \"note\": \"一句话\"}], "
-                    "\"evidence_used\": []}" % (text[:_ASSIST_MAX_TEXT], cseg))
-        try:
-            res = _assist_llm_json(system, user + think_line, int(2000 * mt_mul), 0.2)
-        except ValueError:
-            # JSON 两次都没按格式来 → 纯文本兜底(保证总有结果)
-            fb = ("【待核查说法】\n%s\n\n%s\n\n改用纯文本回答: 第一行必须是「结论：真实」「结论：虚假」"
-                  "或「结论：存疑」，并附（置信度NN%%）与一句话说明; 随后用2-4行、每行以-开头给出理由"
-                  "(不要贴链接)。不要输出JSON。"
-                  % (text[:_ASSIST_MAX_TEXT],
-                     ("【网络证据】\n" + evidence_block(evidence)) if evidence
-                     else "(网络搜索暂不可用, 请谨慎判断)"))
-            content, _ = call_llm([{"role": "system", "content": system},
-                                   {"role": "user", "content": fb}],
-                                  max_tokens=1000, temperature=0.2)
-            res = _verify_from_text(content, evidence)
-        verdict = res.get("verdict")
-        res["verdict"] = verdict if verdict in ("true", "false", "uncertain") else "uncertain"
-        try:
-            res["confidence"] = max(0, min(100, int(res.get("confidence") or 60)))
-        except Exception:
-            res["confidence"] = 60
-        res["summary"] = str(res.get("summary") or "").strip()[:200]
-        res["reasons"] = [str(x).strip()[:300] for x in (res.get("reasons") or []) if str(x).strip()][:5]
-        claims_out = []
-        for c in (res.get("claims") or [])[:4]:
-            chk = c.get("check")
-            claims_out.append({"point": str(c.get("point") or "").strip()[:120],
-                               "check": chk if chk in ("true", "false", "uncertain") else "uncertain",
-                               "note": str(c.get("note") or "").strip()[:200]})
-        res["claims"] = claims_out
-        res["fallacies"] = ([str(x).strip()[:20] for x in (res.get("fallacies") or [])
-                             if str(x).strip()][:4] if fallacy_on else [])
-        refs = _norm_evidence(evidence, set(res.get("evidence_used") or []) or None)
-        res["evidence_used"] = [e["id"] for e in refs]
-        res["offline"] = not evidence
-        return res, refs
-    # rebut: 逐个击破, 但产出是「能直接粘贴当评论的回复」, 不是分析文
-    system = ("你是评论区抬杠回复生成器: 产出能直接粘贴到评论区当回复的文字。口语、有信息量; "
-              "语气要求: %s 禁止脏话、歧视、攻击外貌与家人、编造数据。"
-              "只输出一个JSON对象, 不要输出任何其它文字。" % savage_line)
-    cseg = ("【言论拆解出的论点】\n%s\n\n" % cb) if cb else ""
-    fallacy_line = ("若论点有明显逻辑谬误: 整版最多给 1 条 reply 点破谬误名(口语带过, 如:这不就假两难吗), "
-                    "该条 fallacy 字段写谬误名, 其余条目一律留空字符串——条条点谬误太像AI。\n") if fallacy_on else ""
+    if mode == "rebut":
+        return assist_rebut(text, evidence, claims, emit)
+    # 知识误区与逻辑谬误分析常驻: 不再由开关控制
+    fallacy_note = ("必须点名说法里的知识误区(事实性错误)与逻辑谬误, 谬误名称只从这份清单里挑、"
+                    "照抄不要自创: " + "、".join(k for k, _d in _FALLACY_TAXONOMY)
+                    + "; 拿不准的不标, 并把命中的名称写进 fallacies 字段。")
+    system = ("你是严谨的事实核查员。只依据给出的网络证据判断说法真伪, 不臆测; "
+              "证据不足或互相矛盾时必须判存疑。只输出一个JSON对象, 不要输出任何其它文字。")
+    cseg = ("【说法拆解出的分论点】\n%s\n\n" % cb) if cb else ""
+    ask = ("判断该说法整体真伪, 并对每个分论点分别给出判定。只输出JSON: "
+           "{\"verdict\": \"true|false|uncertain\", \"confidence\": 0到100的整数(判定置信度), "
+           "\"summary\": \"一句话总结论\", \"reasons\": [\"总体理由(引用证据编号如[E1])\"共2到4条], "
+           "\"claims\": [{\"point\": \"分论点原文\", \"check\": \"true|false|uncertain\", "
+           "\"note\": \"一句话判定依据(引用证据编号)\"}], "
+           "\"fallacies\": [\"知识误区或谬误名称\"], "
+           "\"evidence_used\": [\"E1\"等实际使用的证据编号]}。"
+           "注意: 判true就给证明其为真的理由, 判false就给证明其为假的理由, "
+           "理由必须能在证据中找到依据; 分论点没有对应证据时判 uncertain。" + fallacy_note)
+    if evidence:
+        user = ("【待核查说法】\n%s\n\n%s【网络证据】(可信度: 权威>可靠>参考; "
+                "优先采用权威与可靠级里的具体数字、名称、时间、机构名; "
+                "参考级为自媒体/论坛, 不得作为结论的唯一依据)\n%s\n\n%s\n\n%s"
+                % (text[:_ASSIST_MAX_TEXT], cseg, evidence_block(evidence), ask, _STYLE_RULES))
+    else:
+        user = ("【待核查说法】\n%s\n\n%s(网络搜索暂不可用, 请基于你已有的知识谨慎判断, "
+                "证据不足就判 uncertain)\n只输出JSON: {\"verdict\": \"true|false|uncertain\", "
+                "\"confidence\": 0到100的整数, \"summary\": \"一句话结论\", "
+                "\"reasons\": [\"理由\"共2到4条], "
+                "\"claims\": [{\"point\": \"分论点\", \"check\": \"true|false|uncertain\", \"note\": \"一句话\"}], "
+                "\"evidence_used\": []}\n\n%s"
+                % (text[:_ASSIST_MAX_TEXT], cseg, _STYLE_RULES))
+    try:
+        res = _assist_llm_json(system, user + think_line, int(2000 * mt_mul), 0.2)
+    except ValueError:
+        # JSON 两次都没按格式来 → 纯文本兜底(保证总有结果)
+        fb = ("【待核查说法】\n%s\n\n%s\n\n改用纯文本回答: 第一行必须是「结论：真实」「结论：虚假」"
+              "或「结论：存疑」，并附（置信度NN%%）与一句话说明; 随后用2-4行、每行以-开头给出理由"
+              "(不要贴链接)。不要输出JSON。\n\n%s"
+              % (text[:_ASSIST_MAX_TEXT],
+                 ("【网络证据】\n" + evidence_block(evidence)) if evidence
+                 else "(网络搜索暂不可用, 请谨慎判断)", _STYLE_RULES))
+        content, _ = call_llm([{"role": "system", "content": system},
+                               {"role": "user", "content": fb}],
+                              max_tokens=1000, temperature=0.2)
+        res = _verify_from_text(content, evidence)
+    verdict = res.get("verdict")
+    res["verdict"] = verdict if verdict in ("true", "false", "uncertain") else "uncertain"
+    try:
+        res["confidence"] = max(0, min(100, int(res.get("confidence") or 60)))
+    except Exception:
+        res["confidence"] = 60
+    res["summary"] = _style_fix(str(res.get("summary") or "").strip())[:200]
+    res["reasons"] = [_style_fix(str(x).strip())[:300]
+                      for x in (res.get("reasons") or []) if str(x).strip()][:5]
+    claims_out = []
+    for c in (res.get("claims") or [])[:4]:
+        chk = c.get("check")
+        claims_out.append({"point": str(c.get("point") or "").strip()[:120],
+                           "check": chk if chk in ("true", "false", "uncertain") else "uncertain",
+                           "note": _style_fix(str(c.get("note") or "").strip())[:200]})
+    res["claims"] = claims_out
+    res["fallacies"] = [str(x).strip()[:20] for x in (res.get("fallacies") or [])
+                        if str(x).strip()][:4]
+    refs = _norm_evidence(evidence, set(res.get("evidence_used") or []) or None)
+    res["evidence_used"] = [e["id"] for e in refs]
+    res["offline"] = not evidence
+    return res, refs
+
+
+# ---------------- 三段式对线生成(一句话/一段话/长篇, 每段产出后立刻推送) ----------------
+
+_LEN_TIER = {"1": 1, "2": 2, "3": 3, "短": 1, "中": 2, "长": 3}   # 后三个为旧档位兼容
+_SEG_SPEC = {
+    "lines": ("一句话", 40,
+              "每条只写一句话, 不超过30字, 不带编号、不带前缀、不带解释"),
+    "paras": ("一段话", 170,
+              "每条写一段话, 80到140字, 2到4句, 至少把一个证据里的具体数字、名称或时间写进句子"),
+    "long":  ("长篇", 520,
+              "写一整篇长的, 250到400字, 3到5句: 先把对方的知识误区与逻辑谬误整体驳一遍, "
+              "再逐条拆掉最要命的两三个, 收尾甩一句狠话"),
+}
+_SEG_MAX = {"lines": 4, "paras": 4, "long": 1}   # 长篇最多 1 条
+_SEG_ORDER = ("lines", "paras", "long")
+
+
+def assist_len_n():
+    """输出档位 → 条数(1/2/3)。档位只调节条数: 一句话与一段话各 N 条, 长篇恒 1 条。"""
+    return _LEN_TIER.get(str(sget("assist_len") or "2").strip(), 2)
+
+
+# 风格档位: 有代入感的人设名(参考怼怼侠的做法: 档位要有名字才好挑)。
+# 旧值 温和/毒舌/阴阳 自动折算到新档位, 老存档不用改。
+_SAVAGE_TIER = {"冷静理性": "冷静理性", "毒舌律师": "毒舌律师", "阴阳怪气": "阴阳怪气",
+                "温和": "冷静理性", "毒舌": "毒舌律师", "阴阳": "阴阳怪气"}
+_SAVAGE_TEMP = {"冷静理性": 0.6, "毒舌律师": 0.85, "阴阳怪气": 0.95}
+# 身份档位: 决定「我」拿什么当武器。与语气风格解耦——风格是说话方式, 身份是底气来源。
+_PERSONA_TIER = ("不设", "理工科", "行业老手", "数据党", "路人")
+_PERSONA_LINE = {
+    "理工科": "你的底气来自原理与机制: 讲清事情怎么运转、因果链哪一环被对方说反了, "
+              "用「按原理说」「这个机制是」这类口吻。",
+    "行业老手": "你的底气来自一线经验: 用行业惯例、真实流程、干过才知道的细节压对方, "
+                "用「我在这行干过」「实际流程是」这类口吻。",
+    "数据党": "你的底气来自数据与出处: 盯住统计口径、样本范围、发布机构, "
+              "用「这个数谁发布的」「口径覆盖哪些」这类口吻。",
+    "路人": "你的底气来自常识与生活经验: 用大白话讲常理, "
+            "用「常识上」「过日子的人都明白」这类口吻。",
+}
+# 自定义人设预设(参考 Persona-Forge 的做法: 把身份拆成结构化字段存本地, 可随时切换)
+# 存 settings.assist_personas, 形如 [{"name","identity","weapon","taboo"}]
+_PERSONA_MAX = 12
+_PERSONA_FIELD = (("identity", "身份", 40), ("weapon", "底气/武器", 40), ("taboo", "绝不", 30))
+
+
+def persona_presets():
+    """读自定义人设预设。坏数据一律当空处理(不能因为一条脏 JSON 让整个对线功能挂掉)。"""
+    raw = sget("assist_personas")
+    try:
+        arr = json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw or [])
+    except Exception:
+        return []
+    out = []
+    for it in (arr if isinstance(arr, list) else [])[:_PERSONA_MAX]:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name") or "").strip()[:12]
+        if not name or name in _PERSONA_TIER:
+            continue   # 名字空或撞内置档位 → 丢弃(否则身份行会出现两个同名按钮)
+        row = {"name": name}
+        for k, _lbl, lim in _PERSONA_FIELD:
+            row[k] = str(it.get(k) or "").strip()[:lim]
+        out.append(row)
+    return out
+
+
+def persona_presets_save(items):
+    """整表覆盖保存, 返回保存后的条数。"""
+    clean = []
+    for it in (items or [])[:_PERSONA_MAX]:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name") or "").strip()[:12]
+        if not name or name in _PERSONA_TIER:
+            continue
+        row = {"name": name}
+        for k, _lbl, lim in _PERSONA_FIELD:
+            row[k] = str(it.get(k) or "").strip()[:lim]
+        if any(row[k] for k, _l, _x in _PERSONA_FIELD):
+            clean.append(row)   # 只有名字没有内容的预设没用, 不收
+    sset("assist_personas", json.dumps(clean, ensure_ascii=False))
+    return len(clean)
+
+
+def _savage_key(savage):
+    """风格档位折算(旧值 温和/毒舌/阴阳 → 新的人设名)。"""
+    return _SAVAGE_TIER.get(str(savage or "").strip(), "毒舌律师")
+
+
+def _persona_valid(persona):
+    """档位名合法: 内置身份, 或用户自定义预设名。"""
+    p = str(persona or "").strip()
+    return p in _PERSONA_TIER or any(pp["name"] == p for pp in persona_presets())
+
+
+def _persona_key(persona):
+    p = str(persona or "").strip()
+    return p if _persona_valid(p) else "不设"
+
+
+def _persona_line(persona):
+    """身份设定文案: 内置档位取内置文案, 自定义预设按用户填的字段拼。"""
+    p = _persona_key(persona)
+    if p == "不设":
+        return ""
+    if p in _PERSONA_LINE:
+        return _PERSONA_LINE[p]
+    for pp in persona_presets():
+        if pp["name"] == p:
+            seg = []
+            if pp.get("identity"):
+                seg.append("你的身份是" + pp["identity"] + "。")
+            if pp.get("weapon"):
+                seg.append("你的底气来自" + pp["weapon"] + "。")
+            if pp.get("taboo"):
+                seg.append("你绝不" + pp["taboo"] + "。")
+            return "".join(seg)
+    return ""
+
+
+def _savage_line(savage):
+    return {"冷静理性": "语气克制, 平静指出对方错在哪, 不讽刺; 但仍然是第一人称直接对线, 不做旁观点评。",
+            "阴阳怪气": "大量反讽与阴阳怪气(假装夸赞、捧杀式讽刺), 用贴吧对线的辛辣用语"
+                        "(就这、绷不住、乐、你开心就好、建议回炉重造、先把基础补上), 刻薄值拉满。"}.get(
+        _savage_key(savage), "犀利刻薄带讽刺, 像贴吧评论区真人直接开怼, 句子短、节奏快、不留情面。")
+
+
+def _rebut_system(savage, persona="不设"):
+    pl = _persona_line(persona)
+    return ("你是这场网络对线的当事人。第一人称「我」直接对着对方「你」说话, 拿自己的立场"
+            "和对方吵到底; 不许当旁观顾问, 不许出现「你可以这样回复」「建议你这么说」"
+            "「你可以告诉他」这类替第三方出主意的话。每一条都必须带出「我」的立场"
+            "(我拿数据跟你说话、我劝你别急着下结论、我看到的是、我这儿的数据是), "
+            "对手一律称「你」, 不许写成没有主语的旁白或客观陈述。"
+            + (("你的身份设定: " + pl + " ") if pl else "")
+            + "语气要求: %s "
+            "禁止脏话、歧视、攻击外貌与家人、编造数据。"
+            "只输出一个JSON对象, 不要输出任何其它文字。" % _savage_line(savage))
+
+
+def _rebut_context(text, evidence, claims, think):
+    """三段共用的上下文: 对方言论 + 拆解论点 + 网络证据 + 参考话术 + 写作硬规则。"""
+    think_line = {"快": "\n(用户选了快速模式: 直接开怼, 不要展开推理过程。)",
+                  "深挖": "\n(用户选了深挖模式: 每条都交叉核对证据, 拿准了再开口。)"}.get(think, "")
+    cb = _claims_block(claims)
+    cseg = ("【对方言论拆解出的论点】\n%s\n\n" % cb) if cb else ""
     talk_pool = fetch_talk_templates()
     sampled = (random.sample(talk_pool, min(8, len(talk_pool))) if talk_pool else []) + \
         random.sample(_BUILTIN_TALK, 5)
     random.shuffle(sampled)
-    talk_block = ""
-    if sampled:
-        talk_block = ("【参考对线模板】(只借鉴句式和语气, 禁止照抄原句, 事实必须来自上面的证据)\n"
-                      + "\n".join("- " + t for t in sampled) + "\n\n")
-    ask = ("逐个击破对方每个论点, 每个论点给一条能直接当评论发出去的回复:\n"
-           "- reply 只打对方原话: 从说法本身的漏洞入手(绝对化表述/隐含前提/参照系/适用条件/以偏概全), "
-           "别攻击对方没出示过的证据, 别脑补对方没说过的观点; 你搜到的证据是自己的弹药, 不是对方的罪证\n"
-           "- reply: %s像评论区真人老哥的口吻, 不是写作文; 按参考对线模板润色, 每条换一条路线"
-           "(反问/只摆事实/阴阳怪气/短平快戳一点各来一条), 句子长短要错落\n"
-           "- 去AI味(最重要): 回复里禁止出现任何引号(「」“”‘’统统不要)和书名号——真人打字懒得加引号, "
-           "提到某个词就直接说出来; 套话黑名单(整版合计最多出现1次): 标准的、典型的、压根不是而是、"
-           "谁主张谁举证、建议你、别拿当; 少用顿号列举和破折号长链; "
-           "禁止说教式收尾(建议你/要学会/记住); 允许口语碎片(就离谱/绷不住/这也能信), 别堆烂梗\n"
-           "- 把具体事实(数字/名称/公开常识)自然融进句子里, 别列清单; "
-           "绝对不要出现[E1]这类证据编号——读评论的人看不到编号\n"
-           "- basis: 一句话写这条回复的事实依据(引用证据编号如[E1]), 只给用户自己核实, 不会出现在回复里\n"
-           "- 证据和论点对不上时不要硬扯该证据, 依据写「公开常识/数据」即可\n"
-           "- 戳的是具体错误, 不是纯骂街\n" + fallacy_line +
-           "- 如果这条言论根本没有可回怼的点(正常反馈/客观陈述/感谢/闲聊), 不要硬造: "
-           "只输出 {\"no_target\": true, \"reason\": \"为什么没有可回怼点(一句话)\"}\n"
-           "否则最后给一句 finale: 同样可直接粘贴的总收尾, 不超过30字, 别和正文用同一个句式, 同样不要引号。%s\n"
-           "只输出JSON: {\"points\": [{\"point\": \"对方论点\", \"reply\": \"可粘贴的回复\", "
-           "\"basis\": \"依据(引用[E1])\", \"fallacy\": \"谬误名或空字符串\", "
-           "\"evidence_used\": [\"E1\"]}], "
-           "\"finale\": \"总收尾\", \"stance_note\": \"一句话说明证据整体倾向\"}"
-           ) % (len_line, think_line)
+    talk_block = ("【参考对线模板】(只借鉴句式和语气, 禁止照抄原句, 事实必须来自下面的证据)\n"
+                  + "\n".join("- " + t for t in sampled) + "\n\n") if sampled else ""
     if evidence:
-        user = ("【需要回怼的言论】\n%s\n\n%s【网络证据】(可信度: 权威>可靠>参考; "
-                "参考级为自媒体/论坛, 不得作为结论的唯一依据)\n%s\n\n%s%s"
-                % (text[:_ASSIST_MAX_TEXT], cseg, evidence_block(evidence), talk_block, ask))
+        ev = ("【网络证据】(可信度: 权威>可靠>参考; 优先把权威与可靠级里的具体数字、名称、时间、"
+              "机构名砸进句子里; 参考级是论坛与自媒体, 只能借语气, 不能当论据)\n%s\n\n"
+              % evidence_block(evidence))
     else:
-        user = ("【需要回怼的言论】\n%s\n\n%s%s(网络搜索暂不可用, 基于公开常识逐点回怼)\n%s"
-                % (text[:_ASSIST_MAX_TEXT], cseg, talk_block, ask))
+        ev = "(网络搜索暂不可用, 基于公开常识开怼)\n\n"
+    return ("【对方言论】\n%s\n\n%s%s%s%s%s"
+            % (text[:_ASSIST_MAX_TEXT], cseg, ev, talk_block, _STYLE_RULES, think_line))
+
+
+# 谬误分类体系取自 LOGIC 数据集(EMNLP 2022 Findings, causalNLP/logical-fallacy)的 13 类,
+# 并给每类配一句"判定骨架"(对应原数据集里的 Logical Form 字段): 只给名称时模型容易乱扣帽子,
+# 给它一个可套用的形式, 点名会准得多。
+_FALLACY_TAXONOMY = (
+    ("以偏概全", "少数样本推出整体: 样本只占群体极小一部分, 结论却套到整个群体上"),
+    ("虚假因果", "先后即因果: A 发生在 B 之前, 就断定 A 导致了 B"),
+    ("循环论证", "X 成立因为 Y, Y 成立因为 X, 绕回起点什么都没证明"),
+    ("诉诸流行", "很多人相信 X, 所以 X 成立"),
+    ("人身攻击", "不驳论点, 转而攻击提出论点的人"),
+    ("形式逻辑错误", "肯定后件: 若 A 则 B, B 成立, 就断定 A 成立"),
+    ("诉诸情感", "论点拿不出证据, 改用情绪代替论证"),
+    ("假两难", "只摆两个选项, 而实际还有别的选择: 要么 X 要么 Y"),
+    ("偷换概念", "同一个词在前提和结论里含义不同"),
+    ("稻草人", "把对方观点歪曲夸大成另一个版本, 再打那个版本"),
+    ("无关论据", "拿与论点毫无关系的前提来支持结论"),
+    ("诉诸不可信", "不驳论点, 只说对方不是可靠信源"),
+    ("故意错误论证", "明知主张站不住, 仍用错误的论证硬撑"),
+)
+_FALLACY_LIST = "".join("%d) %s——%s；" % (i, k, d)
+                        for i, (k, d) in enumerate(_FALLACY_TAXONOMY, 1))
+
+_TARGET_ASK = (
+    "先拆对方这段话的问题, 分两类:\n"
+    "一、知识误区: 事实性错误(数字、时间、机构、机制、因果说错了)。\n"
+    "二、逻辑谬误: 只从下面这份清单里挑, 名称照抄, 不要自创名称——\n" + _FALLACY_LIST + "\n"
+    "每条给出: 对方原话里的说法、类型名称(知识误区, 或清单里的名称)、"
+    "一句话说清错在哪(要说明为什么命中该类型的判定骨架)。\n"
+    "硬性要求: 只标真正命中的, 拿不准就不标; 同一句最多标两个类型; 宁少勿滥, "
+    "标错类型比少标更糟。\n"
+    "如果这段话根本没有可怼的点(正常反馈、客观陈述、感谢、闲聊), 输出 "
+    "{\"no_target\": true, \"reason\": \"为什么没有可怼点(一句话)\"}。\n"
+    "只输出JSON: {\"targets\": [{\"point\": \"对方原话里的说法\", \"kind\": \"类型名称\", "
+    "\"note\": \"一句话说清错在哪\"}], \"stance_note\": \"一句话说明证据整体倾向\"}")
+
+
+def _seg_ask(seg, n, targets):
+    label, _limit, spec = _SEG_SPEC[seg]
+    tseg = ("【要打的点】\n" + "\n".join(
+        "%d. %s(%s): %s" % (i, t["point"], t["kind"], t["note"])
+        for i, t in enumerate(targets, 1)) + "\n\n") if targets else ""
+    return (tseg + "现在写 %d 条%s。硬性要求: %s。\n"
+            "每条都直接对着对方「你」说, 第一人称, 一条换一条攻击路线(反问、摆事实、反讽、"
+            "短平快戳一点), 不要条条一个句式。\n"
+            "去AI味: 不许出现引号与书名号, 不许把证据编号写进正文(编号单独放 evidence 字段, "
+            "读评论的人看不到编号), 不许说教式收尾。\n"
+            "只输出JSON: {\"items\": [{\"text\": \"可粘贴的回复\", \"basis\": \"一句话事实依据\", "
+            "\"target\": \"这条打的是哪个误区或谬误\", "
+            "\"evidence\": [\"E1\"等本条实际用到的证据编号, 没用证据就留空数组]}]}" % (n, label, spec))
+
+
+def _norm_targets(raw):
+    """规整误区/谬误清单。"""
+    out = []
+    for t in (raw or [])[:6]:
+        if isinstance(t, str):
+            p, k, nt = str(t).strip()[:80], "", ""
+        else:
+            p = str(t.get("point") or "").strip()[:80]
+            k = _style_fix(str(t.get("kind") or "").strip())[:24]
+            nt = _style_fix(str(t.get("note") or "").strip())[:160]
+        if p or k:
+            out.append({"point": p, "kind": k, "note": nt})
+    return out
+
+
+def _targets_from_text(content):
+    """纯文本兜底解析误区/谬误清单: 每行「对方原话 | 问题类型 | 说明」。"""
+    out = []
+    for ln in (content or "").splitlines():
+        ln = re.sub(r"^[-•·*\d.、)\s]+", "", ln).strip()
+        if len(ln) < 4:
+            continue
+        parts = [p.strip() for p in re.split(r"[|｜\t]+", ln) if p.strip()]
+        if len(parts) >= 3:
+            p, k, nt = parts[0], parts[1], " ".join(parts[2:])
+        elif len(parts) == 2:
+            p, k, nt = parts[0], parts[1], ""
+        else:
+            p, k, nt = ln, "", ""
+        out.append({"point": _style_fix(p)[:80], "kind": _style_fix(k)[:24],
+                    "note": _style_fix(nt)[:160]})
+        if len(out) >= 6:
+            break
+    return out
+
+
+_TARGET_FB = ("改用纯文本回答: 每行一条, 用竖线分隔三个字段——"
+              "对方原话 | 问题类型 | 一句话说清错在哪; 不要编号、不要解释、不要JSON。")
+
+
+def _norm_seg_items(raw, limit, cap):
+    """规整一段的条目: 剥引号、清洗写作硬规则、按段长截断。"""
+    out = []
+    for it in (raw or [])[:cap]:
+        if isinstance(it, str):
+            txt, basis, target, evs = it, "", "", []
+        else:
+            txt = str(it.get("text") or it.get("reply") or "").strip()
+            basis = str(it.get("basis") or "").strip()[:200]
+            target = str(it.get("target") or "").strip()[:60]
+            evs = [str(x).strip().upper()[:8] for x in (it.get("evidence") or [])
+                   if str(x).strip()][:4]
+        txt = _style_fix(_deflavor(txt))
+        if len(txt) < 4:
+            continue
+        out.append({"text": txt[:limit], "basis": _style_fix(_deflavor(basis)),
+                    "target": target, "evidence": evs})
+    return out
+
+
+def _seg_from_text(content, limit, cap):
+    """纯文本兜底: 一行一条。"""
+    out = []
+    for ln in (content or "").splitlines():
+        t = _style_fix(_deflavor(re.sub(r"^[-•·*\d.、)\s]+", "", ln).strip()))
+        if len(t) >= 4:
+            out.append({"text": t[:limit], "basis": "", "target": ""})
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _seg_call(system, user, seg, n, mt, temp):
+    """生成一段(一句话/一段话/长篇): JSON 两次解析失败 → 纯文本兜底。返回条目列表。"""
+    _label, limit, _spec = _SEG_SPEC[seg]
+    cap = min(n, _SEG_MAX[seg])
     try:
-        res = _assist_llm_json(system, user, int(1800 * mt_mul), 0.8)
+        res = _assist_llm_json(system, user, mt, temp)
+        items = _norm_seg_items(res.get("items"), limit, cap)
+        if items:
+            return items
     except ValueError:
-        fb = ("【需要回怼的言论】\n%s\n\n%s\n\n改用纯文本回答: 对每个论点输出一条可直接粘贴的评论回复, "
-              "每条1~2句、不超过50字、口语化, 不要编号、不要解释、不要JSON。"
-              % (text[:_ASSIST_MAX_TEXT],
-                 ("【网络证据】\n" + evidence_block(evidence)) if evidence
-                 else "(网络搜索暂不可用, 基于已有知识回怼)"))
+        pass
+    try:
         content, _ = call_llm([{"role": "system", "content": system},
-                               {"role": "user", "content": fb}],
-                              max_tokens=1000, temperature=0.8)
-        res = _rebut_from_text(content, evidence)
-    if res.get("no_target"):   # 模型判定无可回怼: 立即止损, 不再触发任何重试
-        return ({"no_target": True,
-                 "reason": str(res.get("reason") or "这条是正常反馈或客观陈述, 没有可回怼的点").strip()[:200],
-                 "points": [], "finale": "", "stance_note": "", "offline": not evidence},
-                _norm_evidence(evidence))
+                               {"role": "user", "content":
+                                user + "\n\n改用纯文本回答: 每条一行, 直接写可粘贴的回复, "
+                                       "不要编号、不要解释、不要JSON, 最多 %d 行。" % cap}],
+                              max_tokens=int(900 * (1.0 if seg != "long" else 1.6)),
+                              temperature=temp)
+        return _seg_from_text(content, limit, cap)
+    except Exception:
+        return []
 
-    def _norm_points(obj):
-        pts = []
-        for p in (obj.get("points") or [])[:5]:
-            reply = str(p.get("reply") or p.get("rebuttal") or p.get("text") or "").strip()[:100]
-            reply = re.sub(r"[「」『』“”‘’\"']", "", reply)   # 真人打评论不加引号, 模型不听话就硬删
-            if not reply:
-                continue
-            ids = set(p.get("evidence_used") or [])
-            pts.append({"point": str(p.get("point") or "").strip()[:120],
-                        "reply": reply,
-                        "basis": str(p.get("basis") or "").strip()[:200],
-                        "fallacy": str(p.get("fallacy") or "").strip()[:20],
-                        "evidence": _norm_evidence(evidence, ids or None)})
-        return pts
 
-    points = _norm_points(res)
-    # 字数档位硬约束: 选了「长」但产出还是一句话 → 带反馈重试一次, 取更长的那版
-    if rlen == "长" and points:
-        avg = sum(len(p["reply"]) for p in points) / len(points)
-        if avg < 45:
-            try:
-                res2 = _assist_llm_json(
-                    system, user + "\n\n你刚才写的回复太短了。重新生成: 每条 reply 严格90字左右、"
-                    "2~3句话, 必须把证据里的具体数字/名称/公开常识写进句子再收尾, 宁长勿短。"
-                    "只输出JSON, 结构不变。", int(2400 * mt_mul), 0.8)
-                pts2 = _norm_points(res2)
-                if pts2 and sum(len(p["reply"]) for p in pts2) / len(pts2) > avg:
-                    points = pts2
-            except ValueError:
-                pass   # 重试失败就保留原结果
-    # 反八股正则: 先替换式清洗, AI腔命中过多(≥2)再带命中清单重写一次
-    hits = 0
-    for p in points:
-        p["reply"] = _deflavor(p["reply"])
-        p["basis"] = _deflavor(p["basis"])
-        hits += len(_AIFLAVOR_DETECT.findall(p["reply"]))
-    if hits >= 2:
-        bad = "、".join(sorted({m for p in points for m in _AIFLAVOR_DETECT.findall(p["reply"])}))[:80]
-        try:
-            res2 = _assist_llm_json(
-                system, user + "\n\n你刚才那版AI八股味太重, 出现了这些腔调: %s。"
-                "重写一版: 像真人随手打的评论, 句式参差、用词具体, 套话黑名单见前文, 字数要求不变。"
-                "只输出JSON, 结构不变。" % bad, int(2000 * mt_mul), 0.8)
-            pts2 = _norm_points(res2)
-            hits2 = 0
-            for p in pts2:
-                p["reply"] = _deflavor(p["reply"])
-                p["basis"] = _deflavor(p["basis"])
-                hits2 += len(_AIFLAVOR_DETECT.findall(p["reply"]))
-            if pts2 and hits2 < hits:
-                points = pts2   # 重写更干净才采纳
-        except ValueError:
-            pass
-    # 论点回填: 模型偷懒没写 point 时, 用拆解出的分论点补上
-    for i, p in enumerate(points):
-        if not p["point"] and i < len(claims):
-            p["point"] = claims[i]["point"]
+def _seg_has_specifics(items, evidence=()):
+    """段落里有没有把具体东西砸进去(数字, 或证据标题里的专名)。
+    没有证据时无从判断, 一律算通过。"""
+    if not evidence:
+        return True
+    joined = " ".join(it["text"] for it in items)
+    if re.search(r"\d", joined):
+        return True
+    terms = set()
+    for e in evidence:
+        for w in re.findall(r"[A-Za-z][A-Za-z0-9.\-]{1,}|[\u4e00-\u9fff]{2,6}",
+                            str(e.get("title") or "")):
+            terms.add(w)
+    return any(t in joined for t in terms)
+
+
+def _seg_score(items, evidence=()):
+    """一段的质量分(越小越好): 人称失守 > 写作硬规则 > 空话 > AI八股。"""
+    texts = [it["text"] for it in items]
+    person = (0 if any("我" in t for t in texts) else 1) + (0 if any("你" in t for t in texts) else 1)
+    return (person, len(_style_violations(*texts)),
+            0 if _seg_has_specifics(items, evidence) else 1,
+            sum(len(_AIFLAVOR_DETECT.findall(t)) for t in texts))
+
+
+def _judge_system():
+    """裁判角色: 与写手分开一个角色, 只看稿子不写稿(同一个角色自查容易顺着自己第一版附和)。"""
+    return ("你是这场网络对线的裁判, 立场中立, 不替任何一方写稿, 也不重写。"
+            "只判断这一版稿子能不能直接拿去用, 并指出最该改的地方。\n"
+            "淘汰标准(命中任意一条就判 revise):\n"
+            "1) 人称失守: 整段没有第一人称「我」, 或没有第二人称「你」, "
+            "或写成没有主语的旁白, 或出现替第三方出主意的口气;\n"
+            "2) 踩了写作硬规则;\n"
+            "3) AI 腔: 套话、排比、总分结构、说教式收尾;\n"
+            "4) 空话: 没有任何具体数字、机构名、时间、机制, 只是气势汹汹; "
+            "或者打的点跟交给写手的【要打的点】对不上。\n"
+            "只输出JSON: {\"verdict\": \"pass\"或\"revise\", "
+            "\"problems\": [\"最该改的地方, 最多4条, 每条一句话\"], "
+            "\"weakest\": \"哪一条最站不住, 为什么\"}。不要重写, 不要给替代文案。")
+
+
+def _seg_judge(ask, items, mt):
+    """请裁判过一遍稿子。返回 {"verdict","problems","weakest"} 或 None(裁判没答上来)。"""
+    draft = "\n".join("%d. %s" % (i, it["text"]) for i, it in enumerate(items, 1))
+    try:
+        res = _assist_llm_json(
+            _judge_system(),
+            "【交给写手的要求】\n%s\n\n【写手交上来的稿子】\n%s\n\n请裁判。"
+            % ((ask or "")[-1600:], draft),
+            min(mt, 900), 0.2)
+    except Exception:
+        return None
+    if not isinstance(res, dict):
+        return None
+    problems = [_style_fix(str(p).strip())[:120]
+                for p in (res.get("problems") or []) if str(p).strip()][:4]
+    return {"verdict": str(res.get("verdict") or "").strip().lower(),
+            "problems": problems,
+            "weakest": _style_fix(str(res.get("weakest") or "").strip())[:160]}
+
+
+def _seg_polish(system, user, seg, items, n, mt, temp, ask="", evidence=()):
+    """独立裁判复核: 机械检查过了就直接放行; 没过就请裁判点名, 再让写手按裁判意见重写一版,
+    最后用机械分择优(裁判的审美不管用, 分低的那版一律不采纳)。"""
+    _label, limit, _spec = _SEG_SPEC[seg]
+    if not items:
+        return items
+    cap = min(n, _SEG_MAX[seg])
+    texts = [it["text"] for it in items]
+    bad = _style_violations(*texts)
+    # 人称失守: 对线必须是我对你说, 整段没有第一人称或没有第二人称都算没站住
+    if not any("我" in t for t in texts):
+        bad = bad + ["整段没有第一人称我"]
+    if not any("你" in t for t in texts):
+        bad = bad + ["整段没有第二人称你"]
+    flavor = sorted({m for t in texts for m in _AIFLAVOR_DETECT.findall(t)})
+    hits = sum(len(_AIFLAVOR_DETECT.findall(t)) for t in texts)
+    # 一句话本来就短, 不强求塞数字; 一段话与长篇不砸具体东西就算空话
+    thin = seg != "lines" and not _seg_has_specifics(items, evidence)
+    if not bad and hits < 2 and not thin:
+        return items   # 机械检查全过就不请裁判, 省一次调用
+    problems = list(bad) + list(flavor)
+    if thin:
+        problems.append("通篇没有具体数字、机构名或时间, 全是空话")
+    judge = _seg_judge(ask, items, mt)
+    if judge:
+        problems += judge["problems"]
+        if judge.get("weakest"):
+            problems.append("最弱的一条: " + judge["weakest"])
+        if judge["verdict"] == "pass" and not bad and not thin:
+            return items
+    listed = "、".join(dict.fromkeys(p for p in problems if p))[:400]
+    try:
+        res = _assist_llm_json(
+            system, user + "\n\n裁判意见: %s。按裁判意见重写一版, 条数与JSON结构不变, "
+            "被点名的问题全部改掉, 像真人随手打的评论。只输出JSON。" % listed, mt, temp)
+        items2 = _norm_seg_items(res.get("items"), limit, cap)
+    except ValueError:
+        return items
+    if not items2:
+        return items
+    return items2 if _seg_score(items2, evidence) < _seg_score(items, evidence) else items
+
+
+def assist_rebut(text, evidence, claims=(), emit=None, only=None, targets=()):
+    """三段式对线: 知识误区与逻辑谬误分析 → n 条一句话 → n 条一段话 → 1 条长篇。
+    每段生成完立即通过 emit(kind, payload) 推送, 用户马上就能看到并复制。
+    only 指定某一段时只重跑那一段(「换一批」用), 论点沿用 targets, 证据沿用调用方给的。"""
+    n = assist_len_n()
+    think = sget("assist_think")
+    savage = _savage_key(sget("assist_savage"))
+    persona = _persona_key(sget("assist_persona"))
+    mt_mul = {"快": 0.6, "标准": 1.0, "深挖": 1.5}.get(think, 1.0)
+    temp = _SAVAGE_TEMP.get(savage, 0.85)
+    system = _rebut_system(savage, persona)
+    ctx = _rebut_context(text, evidence, claims, think)
     refs = _norm_evidence(evidence)
-    finale = _deflavor(str(res.get("finale") or "")).strip()[:100]
-    return ({"points": points, "finale": finale,
-             "stance_note": str(res.get("stance_note") or "").strip()[:200],
-             "offline": not evidence}, refs)
+    out = {"targets": [], "lines": [], "paras": [], "long": [], "stance_note": "",
+           "offline": not evidence}
+    if only:   # 「换一批」: 只重跑这一段, 拆解与取证都沿用上一轮
+        seg = only if only in _SEG_SPEC else "lines"
+        cnt = _SEG_MAX[seg] if seg == "long" else n
+        ask = _seg_ask(seg, cnt, targets)
+        user = ctx + "\n\n" + ask
+        mt = int({"lines": 1200, "paras": 1700, "long": 2400}[seg] * mt_mul)
+        items = _seg_polish(system, user, seg,
+                            _seg_call(system, user, seg, cnt, mt, temp), cnt, mt, temp,
+                            ask=ask, evidence=evidence)
+        out[seg] = items
+        if emit:
+            emit(seg, {"items": items, "regen": True})
+        return out, refs
+    # 一) 知识误区与逻辑谬误分析(常驻, 不再有开关)
+    # 这一步是三段正文的骨架, 给足输出额度: 推理模型在「快」档也容易把JSON写截断
+    mt_t = max(2000, int(1800 * mt_mul))
+    try:
+        res = _assist_llm_json(system, ctx + "\n\n" + _TARGET_ASK, mt_t, 0.4)
+    except ValueError:
+        try:   # JSON 两次都不成 → 纯文本兜底(分析空了三段就没了要打的点)
+            content, _ = call_llm([{"role": "system", "content": system},
+                                   {"role": "user", "content": ctx + "\n\n" + _TARGET_ASK
+                                    + "\n\n" + _TARGET_FB}],
+                                  max_tokens=1200, temperature=0.4)
+            res = {"targets": _targets_from_text(content)}
+        except Exception:
+            res = {}
+    if res.get("no_target"):   # 模型判定无可回怼: 立即止损, 不再触发任何生成
+        out["no_target"] = True
+        out["reason"] = _style_fix(str(res.get("reason") or
+                                       "这条是正常反馈或客观陈述, 没有可回怼的点"))[:200]
+        return out, refs
+    out["targets"] = _norm_targets(res.get("targets"))
+    out["stance_note"] = _style_fix(str(res.get("stance_note") or ""))[:200]
+    if emit:
+        # 顺带把证据摘要推给界面, 后面几段的编号就能点开溯源
+        emit("targets", {"items": out["targets"], "stance_note": out["stance_note"],
+                         "evidence": _evidence_brief(refs)})
+    # 二) 三段正文: 每段独立生成, 生成完立刻推送
+    for seg in _SEG_ORDER:
+        cnt = _SEG_MAX[seg] if seg == "long" else n
+        ask = _seg_ask(seg, cnt, out["targets"])
+        user = ctx + "\n\n" + ask
+        mt = int({"lines": 1200, "paras": 1700, "long": 2400}[seg] * mt_mul)
+        items = _seg_polish(system, user, seg,
+                            _seg_call(system, user, seg, cnt, mt, temp), cnt, mt, temp,
+                            ask=ask, evidence=evidence)
+        out[seg] = items
+        if emit:
+            emit(seg, {"items": items})
+    if not (out["lines"] or out["paras"] or out["long"]):
+        raise RuntimeError("没能生成出可用的回复")
+    return out, refs
+
+
+# ---------------- 回怼结果缓存 + 上一轮上下文(供「换一批」复用论点与证据) ----------------
+
+# 同一段原话 + 同一套档位 → 直接命中, 省掉拆解/取证/四次生成(参考抖音直播助手的 LRU 回复缓存)
+_REBUT_CACHE = {}
+_REBUT_TTL = 1800
+_REBUT_MAX = 24
+_LAST_REBUT = {"key": "", "ts": 0.0, "evidence": [], "claims": [], "targets": []}
+
+
+def _norm_rebut_text(text):
+    return re.sub(r"\s+", "", str(text or ""))[:300]
+
+
+def rebut_cache_key(text):
+    """缓存键必须带上全部档位: 换了身份/风格/条数就是另一份结果, 不能命中旧缓存。"""
+    return "|".join((_norm_rebut_text(text), str(sget("assist_think")),
+                     _savage_key(sget("assist_savage")),
+                     _persona_key(sget("assist_persona")), str(assist_len_n())))
+
+
+def rebut_cache_get(key):
+    hit = _REBUT_CACHE.get(key)
+    if hit and time.time() - hit[0] < _REBUT_TTL:
+        return hit[1]
+    _REBUT_CACHE.pop(key, None)
+    return None
+
+
+def rebut_cache_put(key, payload):
+    if len(_REBUT_CACHE) >= _REBUT_MAX:   # 防膨胀: 超限清掉最旧一半
+        for k in sorted(_REBUT_CACHE, key=lambda k: _REBUT_CACHE[k][0])[:_REBUT_MAX // 2]:
+            _REBUT_CACHE.pop(k, None)
+    _REBUT_CACHE[key] = (time.time(), payload)
+
+
+def last_rebut_remember(text, evidence, claims, targets):
+    _LAST_REBUT.update(key=_norm_rebut_text(text), ts=time.time(),
+                       evidence=list(evidence or []), claims=list(claims or []),
+                       targets=list(targets or []))
+
+
+def last_rebut_recall(text):
+    """取上一次同一条原话的上下文; 原话不同或过期就返回 None。"""
+    if _LAST_REBUT["key"] and _LAST_REBUT["key"] == _norm_rebut_text(text) \
+            and time.time() - _LAST_REBUT["ts"] < _REBUT_TTL:
+        return _LAST_REBUT
+    return None
 
 
 def user_context():
@@ -5332,6 +6205,7 @@ def machine_filter(items):
         max_age = int(sget("ser_max_age_months") or 0)   # 严肃模式独立时间窗(默认30月, 知识内容历史长)
     else:
         max_age = int(sget("m_max_age_months") or 0)
+    pref_age = pref_age_months()   # 偏好内容的独立窗: 宽松档 +6 月, 严格/标准档与设定窗一致
     dedup = sget("m_dedup") == "1"
     emotion = sget("m_emotion") != "0"
     news_fresh = sget("m_news_fresh") != "0"
@@ -5362,10 +6236,13 @@ def machine_filter(items):
             if fm and now - it["pubdate"] > fm * 30.44 * 86400:
                 _funnel_bump("follow_window")
                 continue   # 超出强调月数 → 直接丢弃(单独机制, 不符合规则不进池)
-        if max_age and not it.get("following") and not it.get("pref_kw") \
-                and it["pubdate"] and now - it["pubdate"] > max_age * 30.44 * 86400:
-            _funnel_bump("age")
-            continue   # 只保留最近 N 个月发布的内容(关注的人/偏好词直搜结果豁免一般窗)
+        if not it.get("following"):
+            # 偏好词直搜结果不再豁免时间窗, 只按偏好专属窗判定(宽松档多给6个月, 其余与设定一致);
+            # 关注的人走 bili_follow_months 单独机制(上面已判)。
+            win = pref_age if it.get("pref_kw") else max_age
+            if win and it["pubdate"] and now - it["pubdate"] > win * 30.44 * 86400:
+                _funnel_bump("pref_age" if it.get("pref_kw") else "age")
+                continue   # 只保留最近 N 个月内发布的内容
         if news_fresh and it.get("pubdate") and _is_newsy(it) and now - it["pubdate"] > 86400:
             _funnel_bump("news")
             continue   # 时效分层: 资讯/热点只推24小时内(干货/教程不受此限)
@@ -7456,6 +8333,39 @@ def ui_version():
     return h.hexdigest()[:12]
 
 
+# 「定位悬浮球」的一次性信号: 前端点按钮 -> 服务端计数 +1 -> 悬浮球心跳打
+# /api/ball_recall 把 n 读回去比对 -> 变了就执行定位。
+# 用内存标志而不是文件: 它只在同一次运行里有意义, 进程重启就该忘掉。
+#
+# !!! 这个计数只活在 **HTTP 服务进程** 里 !!!
+# 悬浮球是 float_ball_spawn() 用 subprocess 拉起来的**独立进程**(--float-ball),
+# 它 import 本模块时会重新执行这一行、拿到自己的 _BALL_RECALL = {"n": 0}。
+# 所以球那边**绝不能**直接读 _BALL_RECALL 来判断有没有新信号 —— 它自己的计数
+# 永远是 0, 而服务端的计数它看不见, 比出来的结果永远是「没有新信号」,
+# 按钮点了没反应就是这个原因。球只能从 /api/ball_recall 的**响应体**里取 n。
+#
+# n   = 累计请求次数(前端每点一次 +1)
+# ack = 球已经执行到的 n(球跑完 recall_ball 后回调 /api/ball_recall_ack 回执)
+# 前端拿 ack >= n 判定「球确实响应了」, 从而能明确区分「已定位」和「球没响应」——
+# 否则用户只能对着一个没有反馈的按钮猜, 这正是「点了没反应」这类报障的来源。
+_BALL_RECALL = {"n": 0, "ack": 0}
+
+
+def ball_recall_request():
+    """请求把球拉回屏幕右侧(前端「定位悬浮球」按钮调用)。"""
+    _BALL_RECALL["n"] += 1
+    return _BALL_RECALL["n"]
+
+
+def ball_recall_ack(n):
+    """悬浮球执行完定位后的回执(球进程调用), 供前端确认「球真的动了」。"""
+    try:
+        _BALL_RECALL["ack"] = max(_BALL_RECALL["ack"], int(n))
+    except (TypeError, ValueError):
+        pass
+    return _BALL_RECALL["ack"]
+
+
 def item_by_key(key):
     row = db().execute("SELECT json FROM items WHERE key=?", (key,)).fetchone()
     return json.loads(row[0]) if row else None
@@ -7465,24 +8375,43 @@ def item_by_key(key):
 
 _BALL_LOCK = threading.Lock()
 _BALL_PROC = None   # 悬浮球子进程(独立进程承载 tkinter, 避免在服务线程里跑 GUI)
+_BALL_JOB = None    # Windows Job 句柄(kill-on-close): 服务进程无论怎么死, 球都会被系统连带回收
 
 _BALL_TRANSPARENT = "#010101"   # 悬浮球画布透明键色(近黑, 避开真实配色)
 _BALL_ACCENT = "#fb7299"        # 默认强调色(主界面切换强调色时会推送覆盖)
+
+# 悬浮球窗口边长(逻辑px)。球体装甲本身只占 0.54*BALL, 剩下的边距是留给**外发光**和
+# **全息环阵**的 —— 这两样都得画在球体外圈, 窗口给不够就只能贴着边裁掉, 看着像被切了一刀。
+# 窗口整体是颜色键控透明的, 透明区域的鼠标事件会穿透到下层(Windows 分层窗口的行为),
+# 所以窗口比球大不会挡住桌面点击。实测 112 逻辑px(@150% = 168 物理px)在桌面上的观感合适。
+_BALL_SIZE = 112
 
 
 def _ball_pos_path():
     return os.path.join(DATA_DIR, "float_ball.json")
 
 
-def float_ball_supported():
-    """悬浮窗仅 Windows 桌面可用(需要 tkinter; Android 的 Chaquopy 没有 tkinter)。"""
+def float_ball_env():
+    """悬浮窗运行环境体检: 返回 {ok, reason, hint, python}。
+    分开报告原因, 免得「环境不支持」这种笼统提示让人查不出到底是系统不对还是 Python 缺库。"""
+    py = "%s (%s)" % (sys.executable, sys.version.split()[0])
     if os.name != "nt":
-        return False
+        return {"ok": False, "python": py,
+                "reason": "当前系统不是 Windows（悬浮窗依赖 Windows 桌面窗口）",
+                "hint": "悬浮窗只在 Windows 电脑版可用。"}
     try:
         import tkinter   # noqa: F401  仅探测可用性, 不建窗口
-    except Exception:
-        return False
-    return True
+    except Exception as e:
+        return {"ok": False, "python": py,
+                "reason": "当前 Python 环境缺少 tkinter 图形库（%s）" % type(e).__name__,
+                "hint": "启动本程序的 Python 没有自带 tcl/tk。请改用 python.org 官方安装包"
+                        "（安装时保持勾选 tcl/tk and IDLE），或直接运行打包好的 exe 版本。"}
+    return {"ok": True, "python": py, "reason": "", "hint": ""}
+
+
+def float_ball_supported():
+    """悬浮窗仅 Windows 桌面可用(需要 tkinter; Android 的 Chaquopy 没有 tkinter)。"""
+    return float_ball_env()["ok"]
 
 
 def float_ball_running():
@@ -7490,10 +8419,41 @@ def float_ball_running():
         return bool(_BALL_PROC and _BALL_PROC.poll() is None)
 
 
+_BALL_ERR = {"msg": ""}   # 最近一次拉起悬浮球失败的原因(供界面直接显示)
+
+
+def float_ball_last_error():
+    """最近一次悬浮球启动失败原因。优先用内存里的记录, 其次读球进程留下的错误日志
+    (windowed exe 没有 stdout, 崩溃栈会落在 DATA_DIR/float_ball_err.log)。"""
+    if _BALL_ERR["msg"]:
+        return _BALL_ERR["msg"]
+    try:
+        p = os.path.join(DATA_DIR, "float_ball_err.log")
+        if os.path.exists(p):
+            with open(p, encoding="utf-8", errors="replace") as f:
+                txt = f.read().strip()
+            if txt:
+                last = [l for l in txt.splitlines() if l.strip()][-1]
+                return "悬浮球进程启动后异常退出: " + last[:160]
+    except Exception:
+        pass
+    return ""
+
+
 def float_ball_spawn(port):
-    """拉起悬浮球进程(幂等)。frozen 单文件 exe 直接再入自身。返回是否成功。"""
-    global _BALL_PROC
-    if not float_ball_supported():
+    """拉起悬浮球进程(幂等)。frozen 单文件 exe 直接再入自身。返回是否成功。
+    失败原因写进 _BALL_ERR, 界面据此给出可操作的提示。"""
+    global _BALL_PROC, _BALL_JOB
+    _BALL_ERR["msg"] = ""
+    try:   # 清掉上次的崩溃日志, 否则会把旧错误当成这次的原因报出来
+        _lg = os.path.join(DATA_DIR, "float_ball_err.log")
+        if os.path.exists(_lg):
+            os.remove(_lg)
+    except Exception:
+        pass
+    env = float_ball_env()
+    if not env["ok"]:
+        _BALL_ERR["msg"] = env["reason"] + "。" + env["hint"]
         return False
     with _BALL_LOCK:
         if _BALL_PROC and _BALL_PROC.poll() is None:
@@ -7507,9 +8467,46 @@ def float_ball_spawn(port):
                 cmd, stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 creationflags=0x08000000 if os.name == "nt" else 0)   # CREATE_NO_WINDOW 防闪黑框
-        except Exception:
+        except Exception as e:
             _BALL_PROC = None
+            _BALL_ERR["msg"] = "拉起悬浮球进程失败: %s" % str(e)[:120]
             return False
+        if os.name == "nt":
+            try:   # Job kill-on-close: 服务被强杀/崩溃时, 系统自动连带回收球进程(心跳是慢兜底)
+                import ctypes
+
+                class _IO(ctypes.Structure):
+                    _fields_ = [(n, ctypes.c_int64) for n in
+                                ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                                 "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+                class _LIM(ctypes.Structure):
+                    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                                ("PerJobUserTimeLimit", ctypes.c_int64),
+                                ("LimitFlags", ctypes.c_uint32),
+                                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                                ("ActiveProcessLimit", ctypes.c_uint32),
+                                ("Affinity", ctypes.c_size_t),
+                                ("PriorityClass", ctypes.c_uint32),
+                                ("SchedulingClass", ctypes.c_uint32),
+                                ("IoCounters", _IO)]
+
+                k32 = ctypes.windll.kernel32
+                from ctypes import wintypes
+                k32.CreateJobObjectW.restype = wintypes.HANDLE
+                k32.CreateJobObjectW.argtypes = [wintypes.LPCWSTR, wintypes.LPVOID]
+                k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                        ctypes.c_void_p, ctypes.c_uint32]
+                k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+                if not _BALL_JOB:
+                    _BALL_JOB = k32.CreateJobObjectW(None, None)
+                    lim = _LIM()
+                    lim.LimitFlags = 0x2000   # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                    k32.SetInformationJobObject(_BALL_JOB, 9, ctypes.byref(lim), ctypes.sizeof(lim))
+                k32.AssignProcessToJobObject(_BALL_JOB, int(_BALL_PROC._handle))
+            except Exception:
+                pass   # 挂不上 Job 也不影响主流程: 还有心跳自毁兜底
         return True
 
 
@@ -7543,9 +8540,21 @@ def _kill_stale_ball():
         return
     try:
         flags = 0x08000000 if os.name == "nt" else 0   # CREATE_NO_WINDOW
-        out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"],
-                             capture_output=True, text=True, timeout=10,
-                             creationflags=flags).stdout or ""
+        # 注意: 中文 Windows 的 tasklist 输出是 GBK, 不是 UTF-8。若用 text=True 会让
+        # subprocess 按 UTF-8 解码而在读线程里抛 UnicodeDecodeError(表现为启动日志里
+        # 一段 _readerthread 异常), 结果 tasklist 永远拿不到结果 → 孤儿球清不掉。
+        # 所以这里拿 bytes 自己按 OEM 代码页解, 解不开就退 UTF-8 且忽略坏字节。
+        r = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"],
+                           capture_output=True, timeout=10, creationflags=flags)
+        raw = r.stdout or b""
+        for enc in ("gbk", "utf-8"):
+            try:
+                out = raw.decode(enc)
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+        else:
+            out = raw.decode("utf-8", "replace")
         img = out.strip().split(",")[0].strip('"') if out.strip() else ""
         if "python" not in img.lower() and "洞鉴虚明" not in img:
             return   # pid 已被其他程序复用 → 不动它
@@ -7660,7 +8669,18 @@ class Handler(BaseHTTPRequestHandler):
                                            "unread": xhh_unread,
                                            "url": "https://www.xiaoheihe.cn/message/home/comment"}})
         if path == "/api/ui_version":
+            # 悬浮球心跳打这里(兼作「定位悬浮球」通道); 前端也用它检测更新
             return self.send_json({"version": ui_version()})
+        if path == "/api/ball_recall":
+            # 悬浮球心跳打这里(兼取「定位悬浮球」信号): 球从响应体读 n 与自己记的比对。
+            # 前端也打这里等 ack, 判断球到底响应了没有。
+            return self.send_json({"ok": True, "n": _BALL_RECALL["n"],
+                                   "ack": _BALL_RECALL["ack"]})
+        if path == "/api/ball_recall_go":
+            return self.send_json({"ok": True, "n": ball_recall_request()})
+        if path == "/api/ball_recall_ack":
+            return self.send_json({"ok": True,
+                                   "ack": ball_recall_ack(qs.get("n", ["0"])[0])})
         if path == "/api/status":
             last = sget("fetch_last")
             st = day_stats()
@@ -7822,7 +8842,7 @@ class Handler(BaseHTTPRequestHandler):
             if not r.get("ok"):
                 return self.send_json(r)
             # 导航到吧列表页(浏览器无风控, 能加载)
-            with urllib.request.urlopen(
+            with local_open(
                     "http://127.0.0.1:%d/json/list" % _CDP_PORT, timeout=3) as resp:
                 targets = json.loads(resp.read().decode())
             page = next((t for t in targets if t.get("type") == "page"), None)
@@ -7982,15 +9002,26 @@ class Handler(BaseHTTPRequestHandler):
                                                         "ai_enabled", "disclaimer_version")}
                                   | {"ai_ok": ai_ok(), "ai_on": ai_on()})
         if path == "/api/floatball":
-            return self.send_json({"ok": True, "supported": float_ball_supported(),
+            env = float_ball_env()
+            return self.send_json({"ok": True, "supported": env["ok"],
+                                   "reason": env["reason"], "hint": env["hint"],
+                                   "python": env["python"],
                                    "enabled": sget("float_ball") == "1",
                                    "running": float_ball_running(),
+                                   "spawn_error": float_ball_last_error(),
                                    "accent": sget("float_ball_accent") or "#fb7299",
                                    "light": sget("float_ball_light") == "1",
-                                   "prefs": {"think": sget("assist_think"),
-                                             "savage": sget("assist_savage"),
-                                             "len": sget("assist_len"),
-                                             "fallacy": "开" if sget("assist_fallacy") == "1" else "关"}})
+                                   "prefs": _floatball_prefs()})
+        if path == "/api/rebut/saved":
+            # 对线收藏夹: q 非空时按原话或正文模糊搜索
+            return self.send_json({"ok": True,
+                                   "items": rebut_saved_list((qs.get("q", [""])[0] or ""))})
+        if path == "/api/personas":
+            # 自定义人设预设: 内置档位 + 用户自建
+            return self.send_json({"ok": True, "builtin": list(_PERSONA_TIER),
+                                   "fields": [{"key": k, "label": lbl, "limit": lim}
+                                              for k, lbl, lim in _PERSONA_FIELD],
+                                   "max": _PERSONA_MAX, "items": persona_presets()})
         self.send_error(404)
 
     def do_POST(self):
@@ -8071,7 +9102,7 @@ class Handler(BaseHTTPRequestHandler):
             # 从窗口抓当前贴吧列表页内容(浏览器通道, 绕开服务端403封锁)
             if not _CDP_PROC or _CDP_PROC.poll() is not None:
                 return self.send_json({"ok": False, "error": "窗口未打开(请先点「在窗口中打开贴吧页」)"})
-            with urllib.request.urlopen(
+            with local_open(
                     "http://127.0.0.1:%d/json/list" % _CDP_PORT, timeout=3) as resp:
                 targets = json.loads(resp.read().decode())
             page = next((t for t in targets if t.get("type") == "page"), None)
@@ -8311,6 +9342,17 @@ class Handler(BaseHTTPRequestHandler):
             conv_delete(body.get("id"))
             return self.send_json({"ok": True})
 
+        if path == "/api/rebut/save":
+            rid = rebut_save(body.get("source") or body.get("text") or "",
+                             body.get("seg") or "", body.get("content") or "")
+            return self.send_json({"ok": bool(rid), "id": rid})
+        if path == "/api/rebut/delete":
+            return self.send_json({"ok": rebut_saved_delete(body.get("id"))})
+        if path == "/api/personas":
+            # 整表覆盖保存自定义人设预设
+            n = persona_presets_save(body.get("items") or [])
+            return self.send_json({"ok": True, "count": n, "items": persona_presets()})
+
         if path == "/api/floatball":
             theme = body.get("theme")
             if isinstance(theme, dict):
@@ -8324,12 +9366,13 @@ class Handler(BaseHTTPRequestHandler):
                 # 悬浮窗调节档位: 白名单校验, 非法值不落库
                 if prefs_in.get("think") in ("快", "标准", "深挖"):
                     sset("assist_think", prefs_in["think"])
-                if prefs_in.get("savage") in ("温和", "毒舌", "阴阳"):
-                    sset("assist_savage", prefs_in["savage"])
-                if prefs_in.get("len") in ("短", "中", "长"):
-                    sset("assist_len", prefs_in["len"])
-                if prefs_in.get("fallacy") in ("开", "关"):
-                    sset("assist_fallacy", "1" if prefs_in["fallacy"] == "开" else "0")
+                if _persona_valid(prefs_in.get("persona")):
+                    sset("assist_persona", _persona_key(prefs_in["persona"]))
+                if str(prefs_in.get("savage")) in _SAVAGE_TIER:
+                    sset("assist_savage", _savage_key(prefs_in["savage"]))   # 旧值折算后落库
+                if str(prefs_in.get("len")) in _LEN_TIER:
+                    sset("assist_len", str(_LEN_TIER[str(prefs_in["len"])]))   # 统一存 1/2/3
+                # 注: 老的 prefs.hover(悬停自动展开开关)已不再受理 —— 功能整体移除。
             if "enabled" in body:
                 enabled = bool(body.get("enabled"))
                 sset("float_ball", "1" if enabled else "0")
@@ -8337,21 +9380,25 @@ class Handler(BaseHTTPRequestHandler):
                     float_ball_spawn(_server_port())
                 else:
                     float_ball_stop()
-            return self.send_json({"ok": True, "supported": float_ball_supported(),
+            env = float_ball_env()
+            return self.send_json({"ok": True, "supported": env["ok"],
+                                   "reason": env["reason"], "hint": env["hint"],
+                                   "python": env["python"],
                                    "running": float_ball_running(),
+                                   "spawn_error": float_ball_last_error(),
                                    "accent": sget("float_ball_accent") or "#fb7299",
                                    "light": sget("float_ball_light") == "1",
-                                   "prefs": {"think": sget("assist_think"),
-                                             "savage": sget("assist_savage"),
-                                             "len": sget("assist_len"),
-                                             "fallacy": "开" if sget("assist_fallacy") == "1" else "关"}})
+                                   "prefs": _floatball_prefs()})
 
         if path == "/api/ai/assist":
             # AI 悬浮窗对话窗: 验证真实性/生成回怼(联网取证 + LLM 结构化输出)
             mode = body.get("mode") or "verify"
             text = (body.get("text") or "").strip()
+            seg_only = str(body.get("seg") or "").strip() or None   # 指定则只重跑这一段(换一批)
             if mode not in ("verify", "rebut"):
                 return self.send_json({"ok": False, "error": "未知模式"}, 400)
+            if seg_only and seg_only not in _SEG_SPEC:
+                return self.send_json({"ok": False, "error": "未知的段落"}, 400)
             if not text:
                 return self.send_json({"ok": False, "error": "内容不能为空"}, 400)
             if not ai_on():
@@ -8369,24 +9416,74 @@ class Handler(BaseHTTPRequestHandler):
 
             t0 = time.time()
             _COST_TL.in_tokens = _COST_TL.out_tokens = _COST_TL.calls = 0   # 本次请求用量清零
+
+            def emit(kind, payload):
+                # 三段式对线: 每段生成完立刻推送(seg 事件), 用户不用等整轮结束
+                sse("seg", dict(payload, kind=kind))
+
+            def push_all(res, refs):
+                """缓存命中时把整轮结果按同样的顺序补推一遍, 前端渲染逻辑不用分叉。"""
+                emit("targets", {"items": res.get("targets") or [],
+                                 "stance_note": res.get("stance_note") or "",
+                                 "evidence": _evidence_brief(refs)})
+                for k in ("lines", "paras", "long"):
+                    emit(k, {"items": res.get(k) or []})
+
             try:
-                sse("phase", {"stage": "search", "label": "正在拆解论点、联网搜集证据与话术模板…"})
-                claims, queries = assist_plan(text)
-                if not queries:
-                    queries = [text.strip()[:64]]   # 拆解失败: 按原文整体检索
-                evidence = gather_evidence(text, queries)
-                hint = ("逐点取证完成" if claims else "取证完成") if evidence else "未搜到网络证据"
-                sse("phase", {"stage": "think",
-                              "label": ("已核对 %d 个来源(%s), AI %s中…" %
-                                        (len(evidence), hint,
-                                         "逐个击破" if mode == "rebut" else "分析"))
-                              if evidence else "未搜到网络证据, AI 仅凭已有知识分析…"})
-                res, refs = assist_result(mode, text, evidence, claims)
+                if mode == "rebut" and seg_only:
+                    # 「换一批」: 只重跑这一段, 论点与证据沿用上一轮(不再拆解与取证)
+                    memo = last_rebut_recall(text)
+                    if memo:
+                        sse("phase", {"stage": "regen", "label": "这一段换一批中…"})
+                        res, refs = assist_rebut(text, memo["evidence"], memo["claims"],
+                                                 emit=emit, only=seg_only,
+                                                 targets=memo["targets"])
+                    else:
+                        sse("phase", {"stage": "search",
+                                      "label": "上下文已过期, 正在重新拆解与取证…"})
+                        claims, queries = assist_plan(text)
+                        evidence = gather_evidence(text, queries or [text.strip()[:64]])
+                        res, refs = assist_rebut(text, evidence, claims, emit=emit,
+                                                 only=seg_only)
+                elif mode == "rebut":
+                    key = rebut_cache_key(text)
+                    hit = rebut_cache_get(key)
+                    if hit:
+                        # 同一条原话 + 同一套档位 → 直接命中, 不再拆解/取证/生成
+                        sse("phase", {"stage": "cache", "label": "同一条原话刚生成过, 直接给出上次结果…"})
+                        res, refs = hit
+                        push_all(res, refs)
+                    else:
+                        sse("phase", {"stage": "search", "label": "正在拆解论点、联网搜集证据与话术模板…"})
+                        claims, queries = assist_plan(text)
+                        if not queries:
+                            queries = [text.strip()[:64]]   # 拆解失败: 按原文整体检索
+                        evidence = gather_evidence(text, queries)
+                        hint = ("逐点取证完成" if claims else "取证完成") if evidence else "未搜到网络证据"
+                        sse("phase", {"stage": "think",
+                                      "label": ("已核对 %d 个来源(%s), 正在找对方的知识误区与逻辑谬误…"
+                                                % (len(evidence), hint))
+                                      if evidence else "未搜到网络证据, 仅凭已有知识开怼…"})
+                        res, refs = assist_rebut(text, evidence, claims, emit=emit)
+                        if not res.get("no_target"):
+                            rebut_cache_put(key, (res, refs))
+                            last_rebut_remember(text, evidence, claims, res.get("targets"))
+                else:
+                    sse("phase", {"stage": "search", "label": "正在拆解论点、联网搜集证据…"})
+                    claims, queries = assist_plan(text)
+                    if not queries:
+                        queries = [text.strip()[:64]]
+                    evidence = gather_evidence(text, queries)
+                    sse("phase", {"stage": "think",
+                                  "label": ("已核对 %d 个来源, AI 分析中…" % len(evidence))
+                                  if evidence else "未搜到网络证据, 仅凭已有知识判断…"})
+                    res, refs = assist_result(mode, text, evidence, claims)
                 sse("done", {"ok": True, "mode": mode, "result": res, "evidence": refs,
+                             "regen": seg_only or "",
                              "usage": _assist_usage_snapshot(),
                              "elapsed": round(time.time() - t0, 1)})
             except Exception as e:
-                sse("done", {"ok": False, "mode": mode,
+                sse("done", {"ok": False, "mode": mode, "regen": seg_only or "",
                              "error": "AI 这次没能给出有效回复(%s)，请再试一次" % str(e)[:80]})
             return
 
@@ -8746,19 +9843,398 @@ _VERDICT_STYLE = {"true": ("真实 ✓", "#67c23a"), "false": ("虚假 ✕", "#f
 
 _EVQ = queue.Queue()   # 聊天工作线程 → tkinter 主线程 的事件队列
 
+# 球体绘制性能探针(设 DJXM_BALL_PROF=1 时每 5s 往 stdout 打一行):
+# [是否开启, 帧数, 累计耗时, 上一帧图元数, 上次打印时刻]。悬浮球是常驻小窗, 帧率×单帧成本
+# 就是它常驻占用的 CPU, 改动画参数前应该先量一下, 别凭"看着不卡"下结论。
+_BALL_PROF = [os.environ.get("DJXM_BALL_PROF") == "1", 0, 0.0, 0, 0.0]
+# 极简档(只在测量/低配机器上用): 关掉大面积抖动泛光, 只留棱芯(扫描线已整块移除)。用来分离
+# "抖动光栅化的代价"和"分层窗口合成的固定代价"。
+_BALL_LEAN = [os.environ.get("DJXM_BALL_LEAN") == "1"]
+
+
+def _hex_mix(c1, c2, t):
+    """两色线性混合(t=0 取 c1, t=1 取 c2)。用于从强调色派生出球体的明暗面。"""
+    try:
+        a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+        b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    except Exception:
+        return c1
+    t = max(0.0, min(1.0, float(t)))
+    return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+# ---------------------------------------------------------------- 全息实心体几何
+# 球体形态 = **真·三维线框全息**(正二十面体: 12 顶点 / 30 棱 / 20 个三角面)。
+# 上一轮画的是"切角八边形装甲 + 六边形环阵", 用户判词: 「这个八角形好丑」「像个钱币」,
+# 并且明确要「正20面体 + 3D 效果 + 泛光」。所以这里彻底换掉: 顶点真的在三维里转、
+# 真的分正/背面、真的按深度排序遮挡, 泛光靠"轮廓外泛光 + 正面棱多层描边"堆出来。
+#
+# 为什么这次敢把 30 条棱画在 112px 上(上一版注释里写过"30 条边会糊成一团所以只用六边形"):
+# 那时**只画线**, 前后棱全叠在一起当然读不出结构。现在按画家算法先铺**面**(抖动填充,
+# 近亮远暗), 面把背面的棱压下去, 于是可见棱收敛成 ~15 条; 再叠深度衰减 + 泛光, 结构就立住了。
+# 另外全是直线段: 颜色键控抠边不吃抗锯齿, 没有圆形的锯齿问题。
+_BALL_CORE = "diamond"     # 中心徽记: "diamond"(嵌套菱形+横杠+四角刻度, 默认)
+                           # | "ripple"(只留菱形+涟漪) | "reticle"(四角括号瞄具) | "none"
+_BALL_SOLID = "dode"       # "dode"=正十二面体(12 个**五边形**面 / 20 顶点 / 30 棱) —— 用户要的形状,
+                           # 与附件那份「伪3d全息.shader」同形 | "ico"=正二十面体(20 三角面)
+                           # | "trunc"=截角二十面体(足球形: 20 六边形 + 12 五边形)
+
+_SOLID_CACHE = {}
+
+
+def _vsub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _vcross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+
+
+def _vdot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _vnorm(a):
+    n = math.sqrt(_vdot(a, a)) or 1.0
+    return (a[0] / n, a[1] / n, a[2] / n)
+
+
+def _ico_geo():
+    """正二十面体: 12 顶点 / 30 棱 / 20 三角面。
+
+    顶点取 (0,±1,±φ) 的三个循环置换(φ=黄金比, 12 个点全在外接球上);
+    棱按「距离 = 棱长 2」筛出来(手写 30 条边太容易错一位);
+    面 = 两两相邻的三元组 —— 二十面体图里这样的三元组恰好 20 个, 与 20 个面一一对应。
+    """
+    phi = (1 + 5 ** 0.5) / 2
+    v = []
+    for a in (-1, 1):
+        for b in (-1, 1):
+            v += [(0, a, b * phi), (a, b * phi, 0), (a * phi, 0, b)]
+    e = [(i, j) for i in range(12) for j in range(i + 1, 12)
+         if abs(math.dist(v[i], v[j]) - 2.0) < 1e-6]
+    adj = {i: set() for i in range(12)}
+    for i, j in e:
+        adj[i].add(j)
+        adj[j].add(i)
+    f = [(i, j, k) for i in range(12) for j in range(i + 1, 12)
+         for k in range(j + 1, 12) if j in adj[i] and k in adj[i] and k in adj[j]]
+    return v, e, f
+
+
+def _dode_solid_geo():
+    """正十二面体(20 顶点 / 30 棱 / 12 个五边面): 顶点/棱/面表照抄用户那份
+    「伪3d全息.shader」, 这样"我那个 shader 长这样"能一比一复现。默认不用它, 留作切换。"""
+    phi = (1 + 5 ** 0.5) / 2
+    ip = 1.0 / phi
+    v = [(1, 1, 1), (1, 1, -1), (1, -1, 1), (1, -1, -1),
+         (-1, 1, 1), (-1, 1, -1), (-1, -1, 1), (-1, -1, -1),
+         (0, ip, phi), (0, ip, -phi), (0, -ip, phi), (0, -ip, -phi),
+         (ip, phi, 0), (ip, -phi, 0), (-ip, phi, 0), (-ip, -phi, 0),
+         (phi, 0, ip), (phi, 0, -ip), (-phi, 0, ip), (-phi, 0, -ip)]
+    e = [(0, 8), (0, 12), (0, 16), (1, 9), (1, 12), (1, 17), (2, 10), (2, 13), (2, 16),
+         (3, 11), (3, 13), (3, 17), (4, 8), (4, 14), (4, 18), (5, 9), (5, 14), (5, 19),
+         (6, 10), (6, 15), (6, 18), (7, 11), (7, 15), (7, 19), (8, 10), (9, 11),
+         (12, 14), (13, 15), (16, 17), (18, 19)]
+    f = [(0, 8, 10, 2, 16), (1, 9, 11, 3, 17), (4, 8, 0, 12, 14), (5, 9, 1, 12, 14),
+         (6, 10, 2, 13, 15), (7, 11, 3, 13, 15), (0, 16, 17, 1, 12), (2, 16, 17, 3, 13),
+         (4, 18, 19, 5, 14), (6, 18, 19, 7, 15), (5, 19, 7, 11, 9), (4, 18, 6, 10, 8)]
+    return v, e, f
+
+
+def _trunc_ico_geo():
+    """截角二十面体: 60 顶点 / 90 棱 / 32 面 = **20 个六边形 + 12 个五边形**。
+
+    用户要「20 面体、每个面是六边形」: 正二十面体本身是 20 个**三角**面, 面上是六边形的是它的
+    截角体 —— 截掉 12 个顶点: 每个顶点变成一个五边形, 每个三角面变成一个六边形。这就是足球
+    (也是富勒烯 C60) 的形状。注意**不可能只由六边形围成球**: 欧拉公式逼着必须有 12 个五边形
+    (每个六边形贡献 3 条棱, 12 个五边形 + 20 个六边形正好凑出 90 条棱、60-90+32=2)。
+
+    不从 60 个点里"凑面"(3.4 万个三元组逐个判定法线, 起球会卡好几秒), 而是**从二十面体截**:
+      · 每条棱上取 1/3 与 2/3 两个截点(共 12×5=60 个);
+      · 五边形 = 某个顶点周围那 5 个 1/3 点(邻居按环绕角排序);
+      · 六边形 = 某个三角面三条棱上的 6 个截点。
+    面与棱都是构造出来的, 没有数值判定误差。
+    """
+    v, e, f = _ico_geo()
+    adj = {i: set() for i in range(len(v))}
+    for i, j in e:
+        adj[i].add(j)
+        adj[j].add(i)
+    P, pts = {}, []
+
+    def pid(i, j):
+        if (i, j) not in P:
+            P[(i, j)] = len(pts)
+            pts.append(tuple(v[i][k] + (v[j][k] - v[i][k]) / 3.0 for k in range(3)))
+        return P[(i, j)]
+
+    for i, j in e:
+        pid(i, j)
+        pid(j, i)
+    pents = []
+    for i in range(len(v)):
+        nb, base, n0 = list(adj[i]), v[i], v[list(adj[i])[0]]
+        e1 = _vsub(n0, base)
+        e2 = _vcross(e1, base)          # 面内基底 → 按极角排出邻居的环绕顺序
+        nb.sort(key=lambda j: math.atan2(_vdot(_vsub(v[j], base), e2),
+                                         _vdot(_vsub(v[j], base), e1)))
+        pents.append([pid(i, j) for j in nb])
+    hexs = [[pid(a, b), pid(b, a), pid(b, c), pid(c, b), pid(c, a), pid(a, c)]
+            for (a, b, c) in f]
+    faces = pents + hexs
+    ed = set()
+    for face in faces:
+        for k in range(len(face)):
+            x, y = face[k], face[(k + 1) % len(face)]
+            ed.add((min(x, y), max(x, y)))
+    return pts, sorted(ed), faces
+
+
+def _prep_solid(v, f):
+    """顶点归一化到单位球 + 每个面排成「从外面看逆时针」并给出外向法线。
+
+    shader 的面表只给顶点集合, 顺序不定; 画多边形必须按环绕顺序连, 判正/背面又必须靠法线,
+    所以统一在这里做一次: 建面内基底按极角排序 → 法线朝内就整体反转。
+    """
+    nv = [_vnorm(p) for p in v]
+    faces, nrm = [], []
+    for face in f:
+        c = tuple(sum(nv[i][k] for i in face) / float(len(face)) for k in range(3))
+        n = _vcross(_vsub(nv[face[1]], nv[face[0]]), _vsub(nv[face[2]], nv[face[0]]))
+        if _vdot(n, c) < 0:                       # 法线朝内 → 反向
+            face = tuple(reversed(face))
+            n = (-n[0], -n[1], -n[2])
+        n = _vnorm(n)
+        e1 = _vnorm(_vsub(nv[face[0]], c))
+        e2 = _vcross(n, e1)
+        face = tuple(sorted(face, key=lambda i: math.atan2(_vdot(_vsub(nv[i], c), e2),
+                                                           _vdot(_vsub(nv[i], c), e1))))
+        faces.append(face)
+        nrm.append(n)
+    return nv, faces, nrm
+
+
+def _solid_geo():
+    """当前要画的实心体: (单位顶点, 棱表, 面表(逆时针朝外), 面向外法线, 每条棱所在的面)。
+
+    最后一项是给**隐藏线消除**用的: 一条棱被几个"正面朝前的面"用到 ——
+    2 个 = 内部前棱; 1 个 = **轮廓棱**(剪影, 最亮最粗); 0 个 = 背面棱(最暗最细)。
+    凸体靠这个就能得到正确的遮挡关系, 不需要画任何填充面。
+    """
+    if _BALL_SOLID not in _SOLID_CACHE:
+        if _BALL_SOLID == "dode":
+            v, e, f = _dode_solid_geo()
+        elif _BALL_SOLID == "ico":
+            v, e, f = _ico_geo()
+        else:
+            v, e, f = _trunc_ico_geo()
+        v, f, n = _prep_solid(v, f)
+        ef = {}
+        for fi, face in enumerate(f):
+            for k in range(len(face)):
+                a, b = face[k], face[(k + 1) % len(face)]
+                ef.setdefault((min(a, b), max(a, b)), []).append(fi)
+        efaces = [ef.get((min(i, j), max(i, j)), []) for i, j in e]
+        _SOLID_CACHE[_BALL_SOLID] = (v, e, f, n, efaces)
+    return _SOLID_CACHE[_BALL_SOLID]
+
+
+def _rot3(p, ax, ay, az):
+    """三轴旋转。照那份 shader 的转法(X/Y/Z 同时缓慢翻滚): 只绕一根轴转像"转盘",
+    三轴一起转才有"全息体浮在空气里翻"的立体感。"""
+    x, y, z = p
+    ca, sa = math.cos(ax), math.sin(ax)
+    cb, sb = math.cos(ay), math.sin(ay)
+    cc, sc = math.cos(az), math.sin(az)
+    x1, z1 = x * cb + z * sb, -x * sb + z * cb
+    y1, z2 = y * ca - z1 * sa, y * sa + z1 * ca
+    return (x1 * cc - y1 * sc, x1 * sc + y1 * cc, z2)
+
+
+def _solid_project(pts, ax, ay, az, cx, cy, r, persp=0.24, radii=None):
+    """三轴旋转 + 透视投影 → [(sx, sy, depth, rx, ry, rz)]。
+
+    depth ∈ [-1,1], 1 = 离观察者最近 —— 后面所有"近亮远暗"都靠它(那份 shader 的
+    applyDepthBrightness/applyDepthColor 就是这套)。返回旋转后的三维坐标是为了算法线光照,
+    没有它面就只能靠深度涂色, 看着像塑料片而不是有体积的实体。
+    radii 是逐顶点的半径系数(顶点呼吸波动用), None 就都取 r。
+    """
+    out = []
+    for i, p in enumerate(pts):
+        rr = r * (radii[i] if radii else 1.0)
+        rx, ry, rz = _rot3(p, ax, ay, az)
+        f = 1.0 / (1.0 - persp * rz) if persp else 1.0
+        out.append((cx + rx * rr * f, cy + ry * rr * f, rz, rx, ry, rz))
+    return out
+
+
+def _hull2d(pts):
+    """二维凸包(单调链)。线框的**外泛光**要贴着实心体轮廓往外散: 逐条棱铺光晕太贵
+    (30 棱 × 3 层 = 90 个图元), 一个凸包多边形铺 4 层就够, 而且形状天然是"光的轮廓"。"""
+    pts = sorted(set(pts))
+    if len(pts) < 3:
+        return pts
+
+    def half(seq):
+        h = []
+        for p in seq:
+            while len(h) >= 2 and ((h[-1][0] - h[-2][0]) * (p[1] - h[-2][1])
+                                   - (h[-1][1] - h[-2][1]) * (p[0] - h[-2][0])) <= 0:
+                h.pop()
+            h.append(p)
+        return h
+    lo = half(pts)
+    up = half(list(reversed(pts)))
+    return lo[:-1] + up[:-1]
+
+
+_DODE_CACHE = []
+
+
+def _dode_geo():
+    """正十二面体: 20 顶点 / 30 边。
+
+    顶点用标准坐标(8 个 (±1,±1,±1) + 3 组各 4 个黄金比例坐标); 边不手写表, 直接按
+    「两点距离 = 棱长 2/φ」把所有棱筛出来 —— 手写 30 条边太容易错一位。
+    """
+    if _DODE_CACHE:
+        return _DODE_CACHE[0]
+    phi = (1 + 5 ** 0.5) / 2
+    v = [(a, b, c) for a in (-1, 1) for b in (-1, 1) for c in (-1, 1)]
+    for a in (-1, 1):
+        for b in (-1, 1):
+            v += [(0, a / phi, b * phi), (a / phi, b * phi, 0), (a * phi, 0, b / phi)]
+    el, e = 2.0 / phi, []
+    for i in range(len(v)):
+        for j in range(i + 1, len(v)):
+            if abs(math.dist(v[i], v[j]) - el) < 1e-6:
+                e.append((i, j))
+    _DODE_CACHE.append((v, e))
+    return _DODE_CACHE[0]
+
+
+def _dode_project(pts, ax, ay, cx, cy, r, persp=0.18):
+    """绕 Y/X 旋转 + 透视投影。返回 [(sx, sy, depth)], depth∈[-1,1], 1 = 离观察者最近。
+
+    depth 是后面做**深度亮度衰减**用的: 近处的棱画亮、远处的棱画暗, 这是那份全息 shader
+    里 applyDepthBrightness 的核心, 也是让线框看起来有体积感(而不是一堆平面线条)的关键。
+    """
+    ca, sa = math.cos(ax), math.sin(ax)
+    cb, sb = math.cos(ay), math.sin(ay)
+    out = []
+    for x, y, z in pts:
+        x1, z1 = x * cb + z * sb, -x * sb + z * cb
+        y1, z2 = y * ca - z1 * sa, y * sa + z1 * ca
+        f = 1.0 / (1.0 - persp * z2) if persp else 1.0
+        out.append((cx + x1 * r * f, cy + y1 * r * f, z2))
+    return out
+
+
+# (原 _hline_span 已删: 它只为扫描线服务 —— 求水平线与球体轮廓的交集跨度。
+#  扫描线移除后没有别的调用点, 留着就是死代码。)
+
+
+# 全息打光方向: 左上前方(与"泛光最强在左上"的视觉习惯一致)。面亮度 = max(0, N·L),
+# 没有它面只能按深度涂色, 看着像塑料片而不是有体积的实体。
+_HOLO_LIGHT = _vnorm((-0.42, -0.58, 0.70))
+
+
+def _vin_step(prev, now, inside, l, r, px=0, py=0, click_s=0.8, move_px=5):
+    """悬浮球的**轮询式**输入状态机(纯函数, 便于单测): (上一状态, 本帧输入) → (动作, 新状态)。
+
+    为什么需要它: 球窗是颜色键控的异形窗, **透明像素穿透点击**(实测圆内只有 15.6% 的点能落到
+    球上, 其余全穿到桌面)。以前球是实心装甲球所以不觉得, 换成镂空线框后"点不到"就成了主要问题。
+    消息既然根本不会送到那些像素上, 就自己读全局键态判按下/抬起。
+
+    动作语义:
+      "press" 指针在命中圆内按下(开始可能的拖拽/单击)
+      "drag"  按住并移动超过 move_px
+      "click" 按住→抬起, 没移动且耗时 < click_s  → 单击(展开)
+      "drop"  按住→抬起, 但移动过(拖拽结束: 落盘 + 判贴边收起)
+      "rmenu" 右键按下且指针在命中圆内
+      None    什么都不做
+    状态字段: down(按住) / moved(移动过) / t(按下时刻) / ox,oy(按下时的指针) / r(右键已处理)
+              pl(上一帧左键态 —— 用来区分"在球内刚按下"和"在别处按着拖过来")
+    """
+    s2 = dict(prev)
+    fresh = l and not prev.get("pl")      # 左键**这一帧刚按下**(而不是一直按着)
+    s2["pl"] = l
+    if fresh and not prev["down"]:
+        if not inside:
+            return None, s2
+        s2.update(down=True, moved=False, t=now, ox=px, oy=py)
+        return "press", s2
+    if prev["down"]:
+        if l:
+            if not s2["moved"] and abs(px - s2["ox"]) + abs(py - s2["oy"]) > move_px:
+                s2["moved"] = True
+            return ("drag" if s2["moved"] else None), s2
+        s2["down"] = False
+        if s2["moved"]:
+            return "drop", s2
+        return ("click" if now - prev["t"] < click_s else "drop"), s2
+    if r and not prev["r"]:
+        s2["r"] = True
+        return ("rmenu" if inside else None), s2
+    if not r:
+        s2["r"] = False
+    return None, s2
+
 
 def _ball_palette(accent, light):
-    """面板配色: 跟随主界面强调色/深浅主题(主界面切换时经 /api/floatball 推送到这里)。"""
+    """面板配色: 跟随主界面强调色/深浅主题(主界面切换时经 /api/floatball 推送到这里)。
+    除了原有的 bg/card/txt/sub/line/input/accent, 再多派生几个球体与阴影要用的色:
+    ac_lit/ac_dark 是强调色的亮面与暗面(球体渐变), ring 是描边, glow 是光晕,
+    hover 是悬停时的整体提亮色, danger 是「隐藏/退出」这类破坏性动作的提示色。
+
+    后面这一组(armor/well/mark/glow_src/holo/core/deep/cool/warm)是**全息线框**专用的:
+      armor/well 面的填充底色(远面用 armor, 近面用 well, 都压得很暗, 只负责"挡住背后的棱")
+      mark     顶点节点(线框的 12 个顶点)的颜色。**浅色主题下必须是强调色**: 原来固定用白色,
+               球底变浅之后白点等于看不见
+      glow_src 外泛光(轮廓光晕)的源色。**用强调色本身而不是混向背景** —— 混向背景在浅色桌面上
+               是一圈脏点、深色桌面上又看不见; 饱和色两种桌面上都读得出"在发光"
+      holo     棱的基色(亮面强调色), 泛光的中间层也用它
+      core     棱芯/最近棱的颜色(接近白), 泛光最亮的那层
+      deep     最远那批棱的颜色(压到接近黑), 深度差全靠它和 core 拉出来
+      cool/warm 深度色调偏移: 远=偏冷(青), 近=偏暖 —— 直接抄那份 shader 的 applyDepthColor
+    """
+    ac_lit = _hex_mix(accent, "#ffffff", 0.34)
+    ac_dark = _hex_mix(accent, "#000000", 0.24)
     if light:
+        # 浅色主题: 桌面是浅的, 线框要**压深**才看得见(强调色本身做棱色), 光晕才用浅色
         return {"bg": "#f2f4f9", "card": "#ffffff", "txt": "#20242f", "sub": "#5d6675",
-                "line": "#dfe3ec", "input": "#f4f6fa", "accent": accent}
+                "line": "#dfe3ec", "input": "#f4f6fa", "accent": accent, "light": True,
+                "ac_lit": ac_lit, "ac_dark": ac_dark,
+                "ring": _hex_mix(accent, "#ffffff", 0.55), "glow": _hex_mix(accent, "#f2f4f9", 0.72),
+                "hover": _hex_mix(accent, "#000000", 0.1), "danger": "#d9534f",
+                "armor": _hex_mix(accent, "#ffffff", 0.86),
+                "well": _hex_mix(accent, "#ffffff", 0.94),
+                "mark": accent, "glow_src": _hex_mix(accent, "#ffffff", 0.30),
+                "holo": _hex_mix(accent, "#000000", 0.12),
+                "core": _hex_mix(accent, "#000000", 0.34),
+                "deep": _hex_mix(accent, "#ffffff", 0.62),
+                "cool": _hex_mix(accent, "#2f7fd0", 0.40),
+                "warm": _hex_mix(accent, "#d2761f", 0.22)}
     return {"bg": "#161920", "card": "#1a1d24", "txt": "#e8eaf0", "sub": "#8a91a0",
-            "line": "#2a2e38", "input": "#0d0f14", "accent": accent}
+            "line": "#2a2e38", "input": "#0d0f14", "accent": accent, "light": False,
+            "ac_lit": ac_lit, "ac_dark": ac_dark,
+            "ring": _hex_mix(accent, "#ffffff", 0.3), "glow": _hex_mix(accent, "#161920", 0.78),
+            "hover": _hex_mix(accent, "#ffffff", 0.14), "danger": "#f56c6c",
+            "armor": _hex_mix(accent, "#0b0d12", 0.62),
+            "well": _hex_mix(accent, "#05060a", 0.80),
+            "mark": "#ffffff", "glow_src": accent,
+            "holo": _hex_mix(accent, "#ffffff", 0.42),
+            "core": _hex_mix(accent, "#ffffff", 0.78),
+            "deep": _hex_mix(accent, "#05060a", 0.72),
+            "cool": _hex_mix(accent, "#6fd6ff", 0.45),
+            "warm": _hex_mix(accent, "#ffcf8a", 0.35)}
 
 
 def _ball_theme(port):
     try:
-        with urllib.request.urlopen("http://127.0.0.1:%d/api/floatball" % port, timeout=3) as r:
+        with local_open("http://127.0.0.1:%d/api/floatball" % port, timeout=3) as r:
             d = json.loads(r.read().decode("utf-8"))
         acc = d.get("accent") or _BALL_ACCENT
         if not re.match(r"^#[0-9a-fA-F]{6}$", acc):
@@ -8768,14 +10244,39 @@ def _ball_theme(port):
         return _ball_palette(_BALL_ACCENT, False)
 
 
-def _ball_worker(port, mode, text, holder):
-    """后台线程: 调 /api/ai/assist 并解析 SSE, 事件投递给 tkinter 主线程(tkinter 非线程安全)。"""
+def _ball_prefs_fetch(port):
+    """取服务端已存的悬浮窗档位(思考/身份/风格/条数/悬停)。失败返回空字典。"""
     try:
+        with local_open("http://127.0.0.1:%d/api/floatball" % port, timeout=3) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        p = d.get("prefs") or {}
+        return {k: str(v) for k, v in p.items() if v not in (None, "")}
+    except Exception:
+        return {}
+
+
+def _personas_fetch(port):
+    """取用户自定义人设预设列表。失败返回空列表(界面上就只显示内置身份)。"""
+    try:
+        with local_open("http://127.0.0.1:%d/api/personas" % port, timeout=3) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        return d.get("items") or []
+    except Exception:
+        return []
+
+
+def _ball_worker(port, mode, text, holder, seg=None):
+    """后台线程: 调 /api/ai/assist 并解析 SSE, 事件投递给 tkinter 主线程(tkinter 非线程安全)。
+    seg 非空时只重跑该段(「换一批」)。"""
+    try:
+        payload = {"mode": mode, "text": text}
+        if seg:
+            payload["seg"] = seg
         req = urllib.request.Request(
             "http://127.0.0.1:%d/api/ai/assist" % port,
-            data=json.dumps({"mode": mode, "text": text}).encode("utf-8"),
+            data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=180) as resp:
+        with local_open(req, timeout=180) as resp:
             if "json" in (resp.headers.get("Content-Type") or ""):
                 # AI 未配置等场景: 后端回普通 JSON 而非 SSE
                 try:
@@ -8800,6 +10301,8 @@ def _ball_worker(port, mode, text, holder):
                                 pass
                     if ev == "phase":
                         _EVQ.put(("phase", holder, data.get("label") or ""))
+                    elif ev == "seg":
+                        _EVQ.put(("seg", holder, data))   # 每段生成完立刻推给界面
                     elif ev == "done":
                         _EVQ.put(("done", holder, data))
     except Exception as e:
@@ -8831,8 +10334,26 @@ def run_float_ball(port):
         scale = max(1.0, root.winfo_fpixels("1i") / 96.0)   # 像素尺寸按 DPI 缩放(字体是磅值会自动缩放)
     except Exception:
         scale = 1.0
-    BALL = int(56 * scale)
+    BALL = int(_BALL_SIZE * scale)
     PW, PH = int(_BALL_PANEL_W * scale), int(_BALL_PANEL_H * scale)
+    RB = BALL * 0.270   # 「球体」半径: 收边/定位/拖拽钳制都按它算球体的边(与绘制无关)
+    RF = BALL * 0.400   # 全息外圈弧的半径(悬停/生成时的两段锁定弧贴在这里)
+    # 窗口四边到球体外缘的透明边距。窗口比球体大这一圈, 于是所有「球应该在哪」的换算
+    # (默认落点/拖拽钳制/贴边判据/展开对齐)都得把 PAD 补回来 —— 直接沿用旧公式会让球
+    # 系统性偏移 PAD 像素(实测 PAD≈39 物理px, 肉眼看得出来"没回到位")。
+    PAD = BALL / 2.0 - RB
+
+    def _ball_win(sw):
+        """让**球体本身**离屏幕右缘 96px 的窗口 x。
+
+        96 这个数是修「找不到球」时定的: 贴到最右缘那条会被任务栏通知区/置顶小窗盖住。
+        换成窗口坐标后要减去 PAD, 否则球实际会离边缘 96+PAD ≈ 135px, 比原来远一截。
+        """
+        return int(max(0, sw - 96 - BALL + PAD))
+
+    def _ball_top(sh, frac=0.28):
+        """让**球体本身**落在屏幕上 frac 处的窗口 y(默认位置/定位都用它)。"""
+        return int(max(0, min(sh * frac - PAD, sh - BALL)))
     C = _ball_theme(port)   # 当前配色(展开时刷新)
 
     # ---------------- 容器: 球(圆形画布) ⇄ 面板(聊天) 共用同一个置顶窗口 ----------------
@@ -8840,21 +10361,354 @@ def run_float_ball(port):
     container.pack(fill="both", expand=True)
     ballcv = tk.Canvas(container, width=BALL, height=BALL, bg=_BALL_TRANSPARENT,
                        highlightthickness=0)
-    oval = ballcv.create_oval(3, 3, BALL - 3, BALL - 3, fill=C["accent"],
-                              outline=C["accent"], width=2)
-    ballcv.create_text(BALL // 2, BALL // 2, text="AI", fill="#ffffff",
-                       font=(_FONT, 14, "bold"))
+
+    # 球体画法(当前形态 = 「正二十面体线框全息」): 真三维顶点/面/棱 + 深度排序 + 轮廓泛光。
+    # 全部几何在 _holo_draw 里每帧重画 —— 它在转, 没有静态层可留(旧版"装甲/发光静态 + 环阵动态"
+    # 的分层是因为那时只有环在动; 现在整颗都在转, 分层没有意义)。
+    #
+    # 特效在 tkinter 里的三条可行路径(都实测过, 见 _probe_fx.py):
+    #   ① stipple(gray12/25/50/75) + -transparentcolor = 逐像素真半透明, 不依赖任何 Win32 调用。
+    #      实测 gray75/gray50 盖在纯灰上的均值与理论 alpha 混合只差 ±2/255 —— 所以光晕、面填充、
+    #      扫描线全用抖动做, 这是本方案最核心的一招(也是"泛光"在没有模糊的前提下唯一的实现方式)。
+    #   ② Canvas 没有 alpha 通道、没有渐变、没有模糊、没有 shader, 所以「径向渐变」只能靠
+    #      同心多边形一层层叠出来, 不能指望 fill 支持渐变。
+    #   ③ SetWindowCompositionAttribute 的亚克力(真毛玻璃)与颜色键控**互相冲突**: 一开亚克力,
+    #      -transparentcolor 就失效, 整个窗口变成不透明矩形(实测方差从 16217 掉到 13, 说明
+    #      背景被整块盖住而不是透出来)。球的异形透明全靠颜色键控, 所以毛玻璃只能放弃 ——
+    #      要真模糊就走「截屏 → StretchBlt HALFTONE 降采样再升采样」, 那是面板那边的事。
+    def _ball_skin_state():
+        """当前该用哪套球体皮肤。优先级: 拖拽 > 生成中 > 有未读 > 悬停 > 静止。
+
+        集中算一处, 而不是让 press/done/poll 各自去改状态 —— 那些地方互相覆盖, 迟早会出现
+        「结果都出来了球还在转圈」这种状态残留。
+        """
+        if st.get("skin_force"):   # 测试钩子 --ball-skin-demo 用: 直接钉住某个状态
+            return st["skin_force"]
+        if st.get("drag"):
+            return "drag"
+        if sending["on"]:
+            return "busy"
+        if st.get("unread"):
+            return "unread"
+        if st.get("hover"):
+            return "hover"
+        return "idle"
+
+    def sync_skin():
+        """把皮肤状态同步成当前该有的样子; 变了才重画 fx 层。"""
+        sk = _ball_skin_state()
+        if sk != st.get("skin"):
+            st["skin"] = sk
+            if st["view"] == "ball" and not st["hidden"]:
+                try:
+                    draw_ball_fx()
+                except Exception:
+                    pass
+        return sk
+
+    # ---------------- 球体: 正二十面体线框全息(真三维, 整颗每帧重画) ----------------
+    def _holo_state():
+        """皮肤状态 → 全息参数。集中一处: 以前各状态分散在各自分支里改绘制, 迟早互相覆盖。"""
+        return {
+            # idle 的 spin 从 0.30 降到 0.18: 转速慢下来之后, 提帧率才看得出"稳"而不是"快"。
+            # 两者要一起动 —— 只提帧率会变成"转得更快的匀速转盘", 只降转速会变成"一卡一卡的慢转"。
+            "idle":   {"spin": 0.18, "br": 0.88, "glow": 0.78, "wave": 0.030},
+            "hover":  {"spin": 0.60, "br": 1.06, "glow": 1.05, "wave": 0.045},
+            "busy":   {"spin": 1.02, "br": 1.00, "glow": 1.00, "wave": 0.055},
+            "unread": {"spin": 0.20, "br": 0.94, "glow": 0.86, "wave": 0.035},
+            "drag":   {"spin": 0.52, "br": 1.06, "glow": 1.10, "wave": 0.038},
+        }[st.get("skin", "idle")]
+
+    _GLYPH_SCALE = 1.3   # 中心徽记放大系数: 原半径约 12 物理px, 在 167px 的球上偏小,
+    # 扫一眼认不出"这是个标记"。菱形/涟漪/四角括号一律乘它, 保持同一套构造比例。
+
+    def _core_glyph(cx, cy, br, t, dim, fl):
+        """中心徽记。形态取自方舟系 identity glyph: 嵌套菱形 + 横贯亮杠 + 四角刻度 + 菱形涟漪。
+
+        画序有讲究(自下而上): 涟漪 → 外菱形 → **键色挖洞** → 内核实心 → 横杠 → 四角刻度。
+        · 挖洞用窗口键色填: 键控窗里这就是真透明, 顺带把穿过徽记的线框棱清干净(旧版"内井"同招);
+        · 横杠放在洞**之后**画, 否则会被洞一起挖掉;
+        · 斜线一律做成**实心菱形**而不是 1px 描边: 键控下斜线没有抗锯齿, 描边会成锯齿。
+        """
+        g = st.get("core", _BALL_CORE)
+        if g == "none":
+            return
+        R = BALL * 0.070 * _GLYPH_SCALE       # 外菱形半径(×1.3; 原约 12 物理px, 与官方 14px 标记同量级)
+        bright = min(1.35, br + fl)
+        lit = dim(C["core"], 1.0 - min(1.0, 0.50 + 0.50 * bright))
+        mid = dim(C["holo"], 1.0 - min(1.0, 0.42 + 0.46 * bright))
+        glow = dim(C["glow_src"], 0.68 - 0.34 * min(1.0, bright))
+
+        def dia(r, **kw):
+            ballcv.create_polygon(cx, cy - r, cx + r, cy, cx, cy + r, cx - r, cy, **kw)
+
+        # 中心泛光: 两层抖动菱形(比描边便宜, 也不会出现锯齿斜线)。
+        # **别做大**: 试过 2.7R/1.8R, 铺出来是一大块点阵, 把穿过中心的线框棱全压没了 ——
+        # 中心是"标记"不是"面板"。瞄具档更是只要一层。
+        for k, stp in (((1.95, "gray12"), (1.45, "gray25")) if g == "reticle"
+                       else ((1.95, "gray12"), (1.45, "gray25"), (1.15, "gray50"))):
+            dia(R * k, fill=glow, outline="", stipple=stp, tags="ball_fx")
+        if g == "reticle":     # 四角**不相接**的括号 = 瞄具语言；闭合框 + 中心徽记才像奖章
+            L, W = BALL * 0.052 * _GLYPH_SCALE, max(1, int(BALL * 0.010 * _GLYPH_SCALE))
+            for sx, sy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+                x0, y0 = cx + sx * R * 1.02, cy + sy * R * 1.02
+                ballcv.create_line(x0, y0, x0 + sx * L, y0, fill=mid, width=W, tags="ball_fx")
+                ballcv.create_line(x0, y0, x0, y0 + sy * L, fill=mid, width=W, tags="ball_fx")
+            dia(R * 0.30, fill=lit, outline="", tags="ball_fx")
+            return
+        # 菱形涟漪: 每 ~1.6s 生一个环(向外扩 + 淡出)。**不加挖洞** —— 挖洞会把球体线框一起清掉,
+        # 用抖动填充就够读出"波纹"了(而且更便宜)。
+        ph = (t * (0.85 if st.get("skin") == "busy" else 0.52)) % 1.0
+        # 涟漪最外圈**锁死在放大前的绝对半径**(BALL*0.203): 徽记放大是为了让"标记"更醒目,
+        # 不是让它的涟漪跟着一起长大 —— 涨到 2.9R 就快贴上球体轮廓(RB≈0.27*BALL),
+        # 抖动点阵会糊到线框棱上, 中心看着就脏了。
+        dia(min(R * (1.05 + 1.85 * ph), BALL * 0.203),
+            fill=dim(C["glow_src"], 0.30 + 0.55 * ph),
+            outline="", stipple="gray25" if ph < 0.45 else "gray12", tags="ball_fx")
+        # 嵌套菱形: 外实心 → 键色挖洞 → 内核实心。**内环是断开的**(左右两个人字),
+        # 不是闭合的一圈: 同心闭合环 + 中心点正好是奖章/硬币的构造, 读起来像徽章。
+        dia(R, fill=mid, outline="", tags="ball_fx")
+        hr = R * 0.40
+        for sx in (-1, 1):
+            ballcv.create_polygon(cx + sx * R * 0.60, cy, cx, cy - hr, cx, cy + hr,
+                                  fill=_BALL_TRANSPARENT, outline="", tags="ball_fx")
+        dia(R * 0.30, fill=lit, outline="", tags="ball_fx")
+        if g != "ripple":
+            # 横贯亮杠: 「鉴」那个意象, 也让徽记不是纯旋转对称(对称=徽章感)
+            ballcv.create_line(cx - R * 1.60, cy, cx + R * 1.60, cy, fill=lit,
+                               width=max(1, int(BALL * 0.009)), tags="ball_fx")
+            # 四角刻度: 轴对齐小方块 —— 斜置刻度在这个尺寸会糊
+            for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+                q = BALL * 0.011
+                px, py = cx + dx * R * 1.36, cy + dy * R * 1.36
+                ballcv.create_rectangle(px - q, py - q, px + q, py + q,
+                                        fill=mid, outline="", tags="ball_fx")
+
+    def _holo_draw():
+        """画整颗全息球。
+
+        画序每一步都有理由, 别随手调:
+          ① 轮廓泛光: 沿实心体凸包描 3 层**粗抖动线**(不是填充)。填充版实测会把整个轮廓罩成
+             一块点阵圆盘, 线框立刻糊掉 —— 泛光要"从轮廓往外散", 不是"给球垫个底"。
+          ② 背面: 面极淡填充 + 棱一条暗虚线(偏冷)。全息必须能看穿, 但背面必须明显更暗,
+             深浅一拉开, 体积感就出来了(那份 shader 的 applyDepthBrightness)。
+          ③ 正面面: 按法线·光向分 4 档**平坦亮度桶**(不是连续渐变: 112px 下 4 档读起来更立体,
+             连续插值反而糊成一片)。面把背面的棱压下去 —— 这才是 30 条棱在小尺寸下能读出来的原因。
+          ④ 正面棱: 三层描边(宽而淡的光晕 / 中间层 / 近白棱芯)。**近白棱芯是"在发光"的关键**:
+             眼睛会把最亮最细的那条当成光源, 外面宽的淡层是它的溢出。这就是双半径辉光
+             (text-shadow 0 0 24px + 0 0 60px)在没有模糊时等价的做法。
+          ⑤ 顶点节点: 完整菱形亮点(近大远小), 呼应方舟那套"菱形身份标记"。
+          ⑥ 扫描线**已整块移除**(横贯球体的虚线在浅色底上像"屏幕脏了", 且每帧求交白搭 CPU);
+             顶替它的是 ①b 的半透明体色 —— 白底上真正救场的是体色, 不是再多加几根线。
+          ⑦ 状态特效: 悬停/生成时才出现的两段**断开**外弧(断开=仪表读数, 闭合=奖章),
+             未读呼吸点, 定位时的轮廓亮边。
+
+        图元数 ≈ 100/帧, 实测 11~22fps 能扛。转速是**匀速**的(不缓动): 缓动转起来像转硬币,
+        匀速才像扫描仪。
+        """
+        ballcv.delete("ball_art")
+        ballcv.delete("ball_fx")
+        prof = _BALL_PROF[0]
+        if prof:
+            _BALL_PROF[1] += 1
+            _t_prof = time.perf_counter()
+        sk = st.get("skin", "idle")
+        P = _holo_state()
+        t = st.get("skin_t", 0.0)
+        fl = st.get("flash", 0.0)              # 「定位悬浮球」的闪三下: 叠在亮度上
+        DIM = "#f2f4f9" if C.get("light") else "#000000"
+
+        def dim(col, k):
+            """压暗(深色主题混向黑) / 压淡(浅色主题混向白) —— 同一套参数两种主题都成立。"""
+            return _hex_mix(col, DIM, max(0.0, min(1.0, k)))
+
+        br = min(1.7, P["br"] + fl)
+        # 全息闪烁: 两层不同频率的正弦叠加, 避免"呼吸"那种规律感(规律=假)
+        flick = 0.93 + 0.05 * math.sin(t * 9.3) + 0.02 * math.sin(t * 23.7)
+        v, ed, faces, fnorm, efaces = _solid_geo()
+        cx = cy = BALL / 2.0
+        RS = BALL * 0.340          # 实心体外接半径(外面还要留一圈泛光, 不能顶满窗口)
+        # 顶点呼吸(照 shader 的 _WaveAmount): 顶点各自轻微起伏, 线框就"活"了
+        radii = [1.0 + P["wave"] * math.sin(t * 1.6 + i * 1.9) for i in range(len(v))]
+        # 三轴翻滚: 起步角与转速比照 shader(45°/30°/15° 起, 30/45/20 的转速比)
+        a = t * P["spin"]
+        ax, ay, az = 0.62 + a * 0.52, 0.42 + a * 0.86, 0.26 + a * 0.36
+        proj = _solid_project(v, ax, ay, az, cx, cy, RS, radii=radii)
+        # 信号抖动: 每 ~2.4s 抽一下(横向错位 1~2px), 只加在正面棱的中间层上 —— 整颗乱抖会晕
+        gph = (t * 0.42) % 1.0
+        gx = (BALL * 0.016 * math.sin(t * 41.0)) if gph < 0.05 else 0.0
+
+        # ① 轮廓只用来给扫描线求跨度, 不画描边: 沿凸包画的"泛光边"和真实线框轮廓错开一层,
+        #    读起来就是一圈重影描边(而且是闭合的 —— 闭合描边 = 奖章/币边, 用户上一轮骂的正是这个)。
+        #    泛光全部交给下面**逐棱**的多层描边, 光才是从结构本身发出来的。
+        hull = _hull2d([(p[0], p[1]) for p in proj])
+        # 这两个开关必须在**所有绘制之前**定下来: 体色层要用 lean 判极简档, 而画序后面的
+        # 棱/顶点也用它们 —— 以前它们定义在 ② 之后, 体色层一插到前面就 UnboundLocalError
+        # (第 10548 行用 lean, 第 10565 行才赋值)。画序敏感的函数里, 凡是多层共用的开关
+        # 一律提到最前面, 别让"后面插一层"变成炸弹。
+        idle = (sk == "idle") or (sk == "unread") or _BALL_LEAN[0]
+        lean = _BALL_LEAN[0]
+
+        # ---- ①b 体色: 交给**独立的玻璃体层**(见 _glass_make), 这里不画 ----
+        #     键控窗只有"全透明/全不透明"两档; 用 stipple 抖动铺出来的"半透明"本质是一堆点阵
+        #     圆点, 浅色桌面上尤其明显(用户点名不要)。真半透明由垫在球下面、带 LWA_ALPHA 的那
+        #     层窗提供: 圆外键色真透明, 圆内由合成器做 alpha 混合; 线框这层保持完全不透明,
+        #     近白棱芯才不会被体色一起冲淡。
+
+        # ---- ② 棱分三类 + 隐藏线消除 ----
+        #      这里**不铺任何面**: 桌面是透明的, 抖动填充铺满轮廓就成一块点阵圆盘(上一版正是
+        #      被这个读成"钱币")。凸体的遮挡关系只用"棱属于几个朝前的面"就能算出来:
+        #        nf=2 内部前棱(中等) · nf=1 **轮廓棱**(剪影, 最亮最粗) · nf=0 背面棱(最暗最细)。
+        #      轮廓比内部线更亮更粗, 是"看起来像个实体"的关键 —— 只画均匀线框会糊成一团。
+        front = [_rot3(fnorm[fi], ax, ay, az)[2] > 0 for fi in range(len(faces))]
+        edraw = []
+        for ei, (i, j) in enumerate(ed):
+            nf = sum(1 for fi in efaces[ei] if front[fi])
+            edraw.append(((proj[i][2] + proj[j][2]) / 2.0, proj[i], proj[j],
+                          2 if nf == 1 else (1 if nf == 2 else 0)))
+        for d, p1, p2, cl in sorted([e for e in edraw if e[3] == 0], key=lambda x: x[0]):
+            # 背棱始终画: 能看穿背面才是"全息投影"而不是"实体网格"。实测这套 1px 抖动线很便宜
+            # (整个极简档也只省 0.5% CPU), 砍它换不到性能, 只会让球看着变实心。
+            # **实线而不是抖动线**: 实测 45 条 1px 抖动线要多吃 ~14% 单核(Tk 把抖动当画刷逐像素铺),
+            # 换成实线几乎免费, 而 1px 暗线本来也读不出"点阵感"。
+            ballcv.create_line(p1[0], p1[1], p2[0], p2[1],
+                               fill=dim(_hex_mix(C["deep"], C["cool"], 0.50),
+                                        0.34 - 0.22 * d), width=1, tags="ball_fx")
+
+        # ---- ③ 正面棱: 远→近, 四层描边(泛光阶梯) ----
+        #    宽度阶梯 9px gray12 → 5px gray25 → 2.5px gray50 → 1px 近白实线。
+        #    **近白棱芯是"在发光"的关键**: 眼睛把最亮最细的那条当光源, 外面宽的淡层是它的溢出。
+        #    这就是双半径辉光(text-shadow 0 0 24px + 0 0 60px)在"没有模糊"时的等价实现。
+        w_core = max(1.0, BALL * 0.0068)
+        for d, p1, p2, cl in sorted([e for e in edraw if e[3] > 0], key=lambda x: x[0]):
+            near = min(1.0, max(0.0, 0.28 + 0.72 * d))
+            sil = (cl == 2)                      # 轮廓棱: 更亮更粗(它是剪影)
+            k = min(1.5, (near + (0.28 if sil else 0.0)) * br * flick)
+            core = _hex_mix(_hex_mix(C["holo"], C["core"], 0.15 + 0.85 * near),
+                            "#ffffff", 0.48 * near * near)
+            glow = _hex_mix(C["glow_src"], C["cool"], 0.30 + 0.34 * near)
+            if sil and not lean:
+                ballcv.create_line(p1[0], p1[1], p2[0], p2[1],
+                                   fill=dim(glow, 0.24 - 0.20 * min(1.0, P["glow"])),
+                                   width=max(2.0, w_core * (5.4 if idle else 7.0)),
+                                   stipple="gray12", tags="ball_fx")
+                if not idle:   # 轮廓的第二层光晕只在交互态出现(静止时一层就够读)
+                    ballcv.create_line(p1[0], p1[1], p2[0], p2[1],
+                                       fill=dim(glow, 0.16 - 0.12 * min(1.0, P["glow"])),
+                                       width=max(2.0, w_core * 3.4), stipple="gray25",
+                                       tags="ball_fx")
+            if sil or not idle:
+                ballcv.create_line(p1[0] + gx, p1[1], p2[0] + gx, p2[1], fill=glow,
+                                   width=max(2.0, w_core * (2.2 if sil else 1.6)),
+                                   stipple="gray50", tags="ball_fx")
+            ballcv.create_line(p1[0], p1[1], p2[0], p2[1], fill=dim(core, 1.0 - k),
+                               width=max(1.0, w_core * (1.35 if sil else 1.0)),
+                               tags="ball_fx")
+
+        # ---- ④ 顶点节点: 完整菱形亮点(背面顶点不画: 正面已经挡着了) ----
+        for p in proj:
+            # 截角体有 60 个顶点, 全画就是一片噪点; 只点最靠前的几颗(静止时更少)
+            if p[2] < (0.55 if not idle else 0.80):
+                continue
+            near = (p[2] + 1.0) / 2.0
+            r = BALL * (0.0075 + 0.008 * near) * (1.0 + 0.35 * fl)
+            col = dim(_hex_mix(C["mark"], C["core"], 0.35),
+                      1.0 - min(1.0, (0.35 + 0.65 * near) * br))
+            ballcv.create_polygon(p[0], p[1] - r * 2.5, p[0] + r * 2.5, p[1],
+                                  p[0], p[1] + r * 2.5, p[0] - r * 2.5, p[1],
+                                  fill=col, outline="", stipple="gray25", tags="ball_fx")
+            ballcv.create_polygon(p[0], p[1] - r, p[0] + r, p[1],
+                                  p[0], p[1] + r, p[0] - r, p[1],
+                                  fill=col, outline="", tags="ball_fx")
+
+        # ⑤ 扫描线整块移除: 横贯球体的一道道虚线在深色壁纸上读起来像"屏幕脏了/有划痕",
+        # 而且每帧要跟凸包求交算跨度, 是纯亏的 CPU。编号留空, 下面的 ⑥⑦ 不动。
+
+        # ---- ⑥ 中心徽记 ----
+        _core_glyph(cx, cy, br, t, dim, fl)
+
+        # ---- ⑦ 状态特效 ----
+        if sk in ("hover", "busy", "drag"):
+            # 两段**断开**的长弧(方舟那套"锁定/读数"语言; 断开才不会读成奖章外圈)。
+            # 只在有交互时出现: 静止时球是干净的, 也省得一直"发光"抢桌面注意力。
+            a0 = (t * (34.0 if sk != "busy" else 90.0)) % 360.0
+            for st_a, ext in ((a0, 42), (a0 + 180, 26)):
+                ballcv.create_arc(cx - RF * 1.06, cy - RF * 1.06, cx + RF * 1.06,
+                                  cy + RF * 1.06, start=st_a, extent=ext, style="arc",
+                                  outline=dim(C["core"], 0.15 + 0.25 * (1 - br)),
+                                  width=max(1, int(BALL * 0.008)), tags="ball_fx")
+        if sk == "unread":      # 右上角呼吸点: 结果回来了但球是收起的, 得让用户看见
+            pr = BALL * 0.034
+            px, py = cx + RS * 0.80, cy - RS * 0.80
+            b = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(t * 2.6))
+            ballcv.create_oval(px - pr * 2.2, py - pr * 2.2, px + pr * 2.2, py + pr * 2.2,
+                               fill=dim(C["glow_src"], 0.30), outline="",
+                               stipple="gray25", tags="ball_fx")
+            ballcv.create_oval(px - pr * b, py - pr * b, px + pr * b, py + pr * b,
+                               fill=C["core"], outline="", tags="ball_fx")
+        if fl > 0.01 and len(hull) >= 3:
+            # 定位提示: 沿真实轮廓闪一圈亮边(以前画的八边形会浮在球外面)
+            ballcv.create_polygon(*[q for x, y in hull for q in (x, y)], fill="",
+                                  outline=C["core"], width=max(2, int(BALL * 0.012)),
+                                  tags="ball_fx")
+        if prof:
+            _BALL_PROF[2] += time.perf_counter() - _t_prof
+            _BALL_PROF[3] = len(ballcv.find_all())
+
+    def draw_ball():
+        """重画整颗球(启动首帧 / 恢复显示 / 主题变化 / 定位闪烁都走它)。"""
+        _holo_draw()
+
+    def draw_ball_fx():
+        """每帧重画整颗球 —— 线框在转, 没有静态层可留。名字沿用旧接口, 调用点不用改。"""
+        _holo_draw()
+
     ballcv.pack(fill="both", expand=True)   # 初始形态=球(不打包的话整个窗口全透明, 球"隐身")
 
     panel = tk.Frame(container, bg=C["bg"])
-    header = tk.Frame(panel, bg=C["card"], height=34)
+    # 面板装饰层: 切角边框 + 刻度 + 线框背景(放在最底层, 其他控件叠在上面)
+    panel_deco = tk.Canvas(panel, bg=C["bg"], highlightthickness=0)
+    panel_deco.place(x=0, y=0, relwidth=1, relheight=1)
+    # 窗口尺寸变了重画装饰。delay 一下: Configure 触发时 panel_deco 的 winfo 还是旧值,
+    # 直接画会用上一次的宽高, 边框会错位一帧。
+    panel.bind("<Configure>", lambda e: panel_deco.after(50, draw_panel_deco))
+    header = tk.Frame(panel, bg=C["card"], height=36)
     header.pack(fill="x")
     header.pack_propagate(False)
+    # 标题栏两端"切角": Canvas 是唯一能画斜边的东西, 用两个小 Canvas 贴在 header 左右,
+    # 画一个底色三角把直角吃掉。比把整条 header 换成 Canvas 简单得多 —— 里面 5 个 Label
+    # 的 pack 逻辑一个字都不用动。切角量与 panel_deco 的外框对齐。
+    _hch = min(16, int(36 * 0.32))
+
+    def _clip_header(_e=None):
+        for _c in (hcut_l, hcut_r):
+            _c.delete("all")
+            _hh = _c.winfo_height()
+            if _hh < 4:
+                continue
+            if _c is hcut_l:   # 左上角: 保留左下, 斜边吃掉右上
+                _c.create_polygon(0, 0, _hch, 0, 0, min(_hch, _hh),
+                                  fill=C["bg"], outline="", tags="cut")
+            else:              # 右上角: 保留右下, 斜边吃掉左上
+                _c.create_polygon(_hch, 0, _hch, min(_hch, _hh), 0, 0,
+                                  fill=C["bg"], outline="", tags="cut")
+    hcut_l = tk.Canvas(header, width=_hch, height=36, bg=C["card"],
+                       highlightthickness=0, bd=0)
+    hcut_r = tk.Canvas(header, width=_hch, height=36, bg=C["card"],
+                       highlightthickness=0, bd=0)
+    hcut_l.pack(side="left", fill="y")
+    hcut_r.pack(side="right", fill="y")
+    _clip_header()
+    header.bind("<Configure>", lambda e: _clip_header())
     dot = tk.Label(header, text="●", bg=C["card"], fg=C["accent"], font=(_FONT, 9))
     dot.pack(side="left", padx=(10, 4))
     title = tk.Label(header, text="AI 助手 · 拖动移动", bg=C["card"],
                      fg=C["txt"], font=(_FONT, 10, "bold"))
     title.pack(side="left")
+    # 头部动作: 从左到右「新对话 · ⚙ · ─ 收起」; 每个按钮带悬停提亮(见 _hoverable)
+    hide_btn = tk.Label(header, text="✕ 隐藏", bg=C["card"], fg=C["sub"],
+                        font=(_FONT, 9), cursor="hand2", padx=8)
+    hide_btn.pack(side="right", fill="y")
     collapse_btn = tk.Label(header, text="─ 收起", bg=C["card"], fg=C["sub"],
                             font=(_FONT, 9), cursor="hand2", padx=8)
     collapse_btn.pack(side="right", fill="y")
@@ -8866,13 +10720,13 @@ def run_float_ball(port):
     new_btn.pack(side="right", fill="y")
 
     modebar = tk.Frame(panel, bg=C["bg"])
-    modebar.pack(fill="x", padx=8, pady=(6, 2))
+    modebar.pack(fill="x", padx=8, pady=(7, 3))
     mode = {"cur": "verify"}
     mode_btns = {}
     for _key, _label in (("verify", "🔍 验证真实性"), ("rebut", "⚔️ 生成回怼")):
         b = tk.Label(modebar, text=_label, bg=C["card"] if _key != "verify" else C["accent"],
                      fg=C["sub"] if _key != "verify" else "#ffffff", cursor="hand2",
-                     font=(_FONT, 9), padx=6, pady=4)
+                     font=(_FONT, 9), padx=6, pady=6)
         b.pack(side="left", fill="x", expand=True, padx=3)
         mode_btns[_key] = b
 
@@ -8882,32 +10736,275 @@ def run_float_ball(port):
             w.config(bg=C["accent"] if on else C["card"],
                      fg="#ffffff" if on else C["sub"])
 
+    def _mode_hover(w, key):
+        """模式按钮悬停: 未选中的亮成 accent 的暗面(不抢当前选中态的存在感)。"""
+        def _in(_e=None):
+            if mode["cur"] != key:
+                w.config(bg=C["ac_dark"], fg="#ffffff")
+        def _out(_e=None):
+            style_modes()
+        w.bind("<Enter>", _in)
+        w.bind("<Leave>", _out)
+
     def switch_mode(e, k):
         mode["cur"] = k
         style_modes()
     for k, w in mode_btns.items():
         w.bind("<Button-1>", lambda e, k=k: switch_mode(e, k))
+        _mode_hover(w, k)
 
-    # ---- 调节抽屉(⚙): 思考/刻薄/字数/谬误分析 档位, 点选即存服务端 ----
-    prefs = {"think": "标准", "savage": "毒舌", "len": "中", "fallacy": "开"}
+    # ---- 调节抽屉(⚙): 思考/身份/风格/条数 档位, 点选即存服务端 ----
+    # 身份(拿什么当武器)与风格(说话方式)分开, 换风格不用丢身份
+    prefs = {"think": "标准", "persona": "不设", "savage": "毒舌律师", "len": "2"}
+    prefs.update({k: v for k, v in _ball_prefs_fetch(port).items() if k in prefs})
+    plocal = {"items": _personas_fetch(port)}   # 自定义人设预设(本地镜像, 免得每次重建都联网)
     prefbar = tk.Frame(panel, bg=C["bg"])
+    segs = tk.Frame(prefbar, bg=C["bg"])   # 档位行独立成框: 重建时不影响下面的提示与工具栏
+    segs.pack(fill="x")
     pref_segs = {}
 
     def _seg_row(label, options, key):
-        row = tk.Frame(prefbar, bg=C["bg"])
+        row = tk.Frame(segs, bg=C["bg"])
         tk.Label(row, text=label, bg=C["bg"], fg=C["sub"], font=(_FONT, 8)).pack(side="left")
         for opt in options:
             b = tk.Label(row, text=opt, bg=C["card"], fg=C["sub"], cursor="hand2",
-                         font=(_FONT, 8), padx=5, pady=2)
-            b.pack(side="left", padx=(3, 0))
+                         font=(_FONT, 8), padx=4, pady=2)
+            b.pack(side="left", padx=(2, 0))
             pref_segs[(key, opt)] = b
             b.bind("<Button-1>", lambda e, k=key, o=opt: set_pref(k, o))
         row.pack(fill="x", padx=6, pady=2)
+        return row
 
-    _seg_row("🧠 思考", ("快", "标准", "深挖"), "think")
-    _seg_row("😈 刻薄", ("温和", "毒舌", "阴阳"), "savage")
-    _seg_row("📏 字数", ("短", "中", "长"), "len")
-    _seg_row("🧩 谬误分析", ("开", "关"), "fallacy")
+    def build_pref_rows():
+        """重建档位行: 自定义人设增删后, 身份行要跟着多出/少掉按钮。"""
+        for w in segs.winfo_children():
+            w.destroy()
+        pref_segs.clear()
+        names = list(_PERSONA_TIER) + [p["name"] for p in plocal["items"]]
+        _seg_row("🧠 思考", ("快", "标准", "深挖"), "think")
+        _seg_row("🎭 身份", names, "persona")
+        _seg_row("😈 风格", ("冷静理性", "毒舌律师", "阴阳怪气"), "savage")
+        _seg_row("📏 条数", ("1", "2", "3"), "len")
+        if prefs.get("persona") not in names:
+            prefs["persona"] = "不设"   # 人设被删掉了 → 退回不设, 免得没有高亮项
+        style_prefs()
+
+    tk.Label(prefbar, text="条数只调节条数：一句话与一段话各 N 条，长篇 1 条；身份决定拿什么当武器",
+             bg=C["bg"], fg=C["sub"], font=(_FONT, 7), anchor="w", justify="left",
+             wraplength=int(350 * scale)).pack(fill="x", padx=8, pady=(0, 2))
+
+    # ---- 自定义人设(结构化字段存本地, 参考 Persona-Forge: 身份/武器/底线分开填) ----
+    def show_personas():
+        win = tk.Toplevel(root)
+        win.title("✎ 自定义人设")
+        win.configure(bg=C["bg"])
+        win.geometry("%dx%d" % (int(404 * scale), int(470 * scale)))
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        tk.Label(win, text="人设决定「我」是谁、拿什么当武器。留空则不写进提示词。",
+                 bg=C["bg"], fg=C["sub"], font=(_FONT, 8), justify="left",
+                 wraplength=int(370 * scale)).pack(fill="x", padx=10, pady=(8, 4))
+        body = tk.Frame(win, bg=C["bg"])
+        body.pack(fill="both", expand=True, padx=10)
+        cv = tk.Canvas(body, bg=C["bg"], highlightthickness=0)
+        sb2 = tk.Scrollbar(body, orient="vertical", command=cv.yview, width=10)
+        cv.configure(yscrollcommand=sb2.set)
+        sb2.pack(side="right", fill="y")
+        cv.pack(side="left", fill="both", expand=True)
+        inn = tk.Frame(cv, bg=C["bg"])
+        cw = cv.create_window((0, 0), anchor="nw", window=inn)
+        inn.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfig(cw, width=e.width))
+        cv.bind("<MouseWheel>", lambda e: cv.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        entries = []
+        cap = [12]
+
+        def add_row(item=None):
+            if cap[0] <= 0:
+                return
+            cap[0] -= 1
+            item = item or {}
+            card = tk.Frame(inn, bg=C["card"])
+            card.pack(fill="x", pady=4)
+            ents = {}
+
+            def _line(key, label, value, width=8):
+                rr = tk.Frame(card, bg=C["card"])
+                rr.pack(fill="x", padx=8, pady=2)
+                tk.Label(rr, text=label, bg=C["card"], fg=C["sub"], font=(_FONT, 8),
+                         width=width, anchor="w").pack(side="left")
+                v = tk.StringVar(value=value)
+                tk.Entry(rr, textvariable=v, bg=C["input"], fg=C["txt"], relief="flat",
+                         insertbackground=C["txt"], font=(_FONT, 9)).pack(
+                    side="left", fill="x", expand=True, ipady=3)
+                ents[key] = v
+
+            _line("name", "名字", str(item.get("name") or ""))
+            for k, lbl, _lim in _PERSONA_FIELD:
+                _line(k, lbl, str(item.get(k) or ""), width=9)
+            dl = tk.Label(card, text="删除这个人设", bg=C["card"], fg="#f56c6c",
+                          cursor="hand2", font=(_FONT, 8), anchor="e")
+            dl.pack(fill="x", padx=8, pady=(2, 6))
+
+            def _del(_e=None, c=card, e=ents):
+                cap[0] += 1
+                if e in entries:
+                    entries.remove(e)
+                c.destroy()
+            dl.bind("<Button-1>", _del)
+            entries.append(ents)
+            cv.after_idle(lambda: cv.configure(scrollregion=cv.bbox("all")))
+
+        for it in plocal["items"]:
+            add_row(it)
+        if not plocal["items"]:
+            add_row()
+
+        bar = tk.Frame(win, bg=C["bg"])
+        bar.pack(fill="x", padx=10, pady=(4, 8))
+
+        def _btn(parent, text, cmd, bg=None, fg=None):
+            b = tk.Label(parent, text=text, bg=bg or C["card"], fg=fg or C["sub"],
+                         cursor="hand2", font=(_FONT, 9), padx=8, pady=4)
+            b.pack(side="left", padx=(0, 6))
+            b.bind("<Button-1>", lambda e: cmd(b))
+            return b
+
+        def _save(btn):
+            items = []
+            for e in entries:
+                items.append({k: (e[k].get() if k in e else "").strip() for k in
+                              ("name",) + tuple(f[0] for f in _PERSONA_FIELD)})
+            _flash(btn, "保存中…")
+
+            def _do():
+                try:
+                    local_open(urllib.request.Request(
+                        "http://127.0.0.1:%d/api/personas" % port,
+                        data=json.dumps({"items": items}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"}), timeout=6)
+                except Exception:
+                    pass
+                plocal["items"] = _personas_fetch(port)
+
+                def _after():
+                    build_pref_rows()
+                    _push_prefs()
+                    win.destroy()
+                root.after(0, _after)
+            threading.Thread(target=_do, daemon=True).start()
+
+        _btn(bar, "＋ 新增人设", lambda b: add_row())
+        _btn(bar, "保存", _save, C["accent"], "#ffffff")
+        _btn(bar, "取消", lambda b: win.destroy())
+
+    # ---- 收藏夹(本地回怼收藏: 可搜索 / 复制 / 删除, 存服务端 SQLite) ----
+    def show_saved():
+        win = tk.Toplevel(root)
+        win.title("⭐ 回怼收藏夹")
+        win.configure(bg=C["bg"])
+        win.geometry("%dx%d" % (int(348 * scale), int(430 * scale)))
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        top = tk.Frame(win, bg=C["bg"])
+        top.pack(fill="x", padx=8, pady=(8, 4))
+        qv = tk.StringVar()
+        qent = tk.Entry(top, textvariable=qv, bg=C["input"], fg=C["txt"], relief="flat",
+                        insertbackground=C["txt"], font=(_FONT, 9))
+        qent.pack(side="left", fill="x", expand=True, ipady=4)
+        box = tk.Frame(win, bg=C["bg"])
+        box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        holder = {"cv": None}
+
+        def refresh(_e=None):
+            for w in box.winfo_children():
+                w.destroy()
+            holder["cv"] = None
+            items = []
+            try:
+                url = "http://127.0.0.1:%d/api/rebut/saved?q=%s" % (
+                    port, urllib.parse.quote(qv.get().strip()))
+                with local_open(url, timeout=6) as r:
+                    items = (json.loads(r.read().decode("utf-8")) or {}).get("items") or []
+            except Exception:
+                pass
+            if not items:
+                tk.Label(box, text=("没有匹配的收藏。\n在回怼结果里点「⭐ 收藏」就会存到这里。"
+                                    if qv.get().strip() else
+                                    "还没有收藏。\n在回怼结果里点「⭐ 收藏」就会存到这里。"),
+                         bg=C["bg"], fg=C["sub"], font=(_FONT, 9), justify="center").pack(
+                    pady=40, fill="x")
+                return
+            cv = tk.Canvas(box, bg=C["bg"], highlightthickness=0)
+            sb2 = tk.Scrollbar(box, orient="vertical", command=cv.yview, width=10)
+            cv.configure(yscrollcommand=sb2.set)
+            sb2.pack(side="right", fill="y")
+            cv.pack(side="left", fill="both", expand=True)
+            inn = tk.Frame(cv, bg=C["bg"])
+            cw = cv.create_window((0, 0), anchor="nw", window=inn)
+            inn.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+            cv.bind("<Configure>", lambda e: cv.itemconfig(cw, width=e.width))
+            cv.bind("<MouseWheel>", lambda e: cv.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+            holder["cv"] = cv
+            for it in items:
+                card = tk.Frame(inn, bg=C["card"])
+                card.pack(fill="x", pady=3)
+                src = (it.get("source") or "").strip()
+                if src:
+                    tk.Label(card, text="原话: " + src[:70], bg=C["card"], fg=C["sub"],
+                             font=(_FONT, 7), wraplength=int(300 * scale), justify="left",
+                             anchor="nw").pack(fill="x", padx=8, pady=(5, 0))
+                tk.Label(card, text=it.get("content") or "", bg=C["card"], fg=C["txt"],
+                         font=(_FONT, 9), wraplength=int(300 * scale), justify="left",
+                         anchor="nw").pack(fill="x", padx=8)
+                acts = tk.Frame(card, bg=C["card"])
+                acts.pack(fill="x", padx=8, pady=(3, 6))
+                _chip(acts, "复制", lambda b, t=it.get("content") or "": _copy_text(b, t))
+
+                def _del(b, rid=it.get("id")):
+                    def _do():
+                        try:
+                            local_open(urllib.request.Request(
+                                "http://127.0.0.1:%d/api/rebut/delete" % port,
+                                data=json.dumps({"id": rid}).encode("utf-8"),
+                                headers={"Content-Type": "application/json"}), timeout=6)
+                        except Exception:
+                            pass
+                        root.after(0, refresh)
+                    threading.Thread(target=_do, daemon=True).start()
+                    _flash(b, "已删除")
+                _chip(acts, "删除", _del, "#f56c6c")
+
+        sbtn = tk.Label(top, text="搜索", bg=C["accent"], fg="#ffffff", cursor="hand2",
+                        font=(_FONT, 9), padx=10)
+        sbtn.pack(side="left", padx=(6, 0), fill="y")
+        sbtn.bind("<Button-1>", lambda e: refresh())
+        qent.bind("<Return>", lambda e: (refresh(), "break")[1])
+        tk.Label(win, text="收藏存在本机数据库里, 关掉悬浮球也不会丢。", bg=C["bg"], fg=C["sub"],
+                 font=(_FONT, 7)).pack(side="bottom", pady=(0, 6))
+        refresh()
+
+    toolrow = tk.Frame(prefbar, bg=C["bg"])
+    toolrow.pack(fill="x", padx=6, pady=(2, 6))
+
+    def _tool_btn(parent, text, cmd):
+        b = tk.Label(parent, text=text, bg=C["card"], fg=C["sub"], cursor="hand2",
+                     font=(_FONT, 8), padx=6, pady=3)
+        b.pack(side="left", padx=(0, 4))
+        b.bind("<Button-1>", lambda e: cmd())
+        return b
+
+    _tool_btn(toolrow, "⭐ 收藏夹", lambda: show_saved())
+    _tool_btn(toolrow, "✎ 人设", lambda: show_personas())
+    _tool_btn(toolrow, "🧹 清空对话", lambda: new_conversation())
+    # 原来的「🖱 悬停展开 开/关」开关随功能移除(用户要求: 鼠标停上去不许自动开, 必须点球)。
+    # 悬停不再有任何开合动作之后, "点一下"这件事就得写在用户看得见的地方, 所以留这句提示。
+    tk.Label(toolrow, text="🖱 单击展开", bg=C["bg"], fg=C["sub"],
+             font=(_FONT, 8)).pack(side="left", padx=(2, 0))
 
     def style_prefs():
         for (k, opt), w in pref_segs.items():
@@ -8915,19 +11012,27 @@ def run_float_ball(port):
             w.config(bg=C["accent"] if on else C["card"],
                      fg="#ffffff" if on else C["sub"])
 
-    def set_pref(k, o):
-        prefs[k] = o
-        style_prefs()
+    def _push_prefs(extra=None):
+        """档位改动推给服务端落库(后台线程, 不卡界面)。"""
+        payload = dict(prefs)
+        payload.update(extra or {})
 
         def _push():
             try:
-                urllib.request.urlopen(urllib.request.Request(
+                local_open(urllib.request.Request(
                     "http://127.0.0.1:%d/api/floatball" % port,
-                    data=json.dumps({"prefs": dict(prefs)}).encode("utf-8"),
+                    data=json.dumps({"prefs": payload}).encode("utf-8"),
                     headers={"Content-Type": "application/json"}), timeout=5)
             except Exception:
                 pass
         threading.Thread(target=_push, daemon=True).start()
+
+    def set_pref(k, o):
+        prefs[k] = o
+        style_prefs()
+        _push_prefs()
+
+    build_pref_rows()   # 档位行首次渲染(此时 set_pref / style_prefs 都已就位)
 
     def toggle_prefs(_e=None):
         if prefbar.winfo_ismapped():
@@ -8941,9 +11046,10 @@ def run_float_ball(port):
     mid = tk.Frame(panel, bg=C["bg"])
     canvas = tk.Canvas(mid, width=int(120 * scale), height=int(60 * scale),
                        bg=C["bg"], highlightthickness=0, bd=0)
-    sb = tk.Scrollbar(mid, orient="vertical", command=canvas.yview, width=10)
+    sb = tk.Scrollbar(mid, orient="vertical", command=canvas.yview, width=9,
+                      relief="flat", bd=0)
     canvas.configure(yscrollcommand=sb.set)
-    sb.pack(side="right", fill="y")
+    sb.pack(side="right", fill="y", padx=(3, 0))
     canvas.pack(side="left", fill="both", expand=True)
     inner = tk.Frame(canvas, bg=C["bg"])
     _win = canvas.create_window((0, 0), anchor="nw", window=inner)
@@ -8957,9 +11063,9 @@ def run_float_ball(port):
     hintbox = {}
 
     def show_hint():
-        hintbox["w"] = tk.Label(inner, text="粘贴内容开始\n「验证」「回怼」「谬误」",
+        hintbox["w"] = tk.Label(inner, text="粘贴对方的话开始\n「验证真实性」或「生成回怼」",
                                 bg=C["bg"], fg=C["sub"], justify="center", font=(_FONT, 9))
-        hintbox["w"].pack(pady=(110, 0), fill="x")
+        hintbox["w"].pack(pady=(100, 0), fill="x")
     show_hint()
 
     inputrow = tk.Frame(panel, bg=C["bg"])
@@ -8968,14 +11074,22 @@ def run_float_ball(port):
                   insertbackground=C["txt"], relief="flat",
                   font=(_FONT, 9), padx=8, pady=5)
     sendbtn = tk.Label(inputrow, text="发送", bg=C["accent"], fg="#ffffff", cursor="hand2",
-                       font=(_FONT, 9, "bold"), padx=14)
+                       font=(_FONT, 9, "bold"), padx=16, pady=6)
     sendbtn.pack(side="right", fill="y", padx=(6, 0))
     inp.pack(side="left", fill="both", expand=True)
-    inputrow.pack(side="bottom", fill="x", padx=8, pady=(2, 8))
-    mid.pack(fill="both", expand=True, padx=8, pady=2)
+    inputrow.pack(side="bottom", fill="x", padx=8, pady=(4, 8))
+    mid.pack(fill="both", expand=True, padx=8, pady=(2, 0))
 
     st = {"view": "ball", "down": False, "moved": False,
-          "ox": 0, "oy": 0, "wx": 0, "wy": 0, "t0": 0.0}
+          "ox": 0, "oy": 0, "wx": 0, "wy": 0, "t0": 0.0,
+          "hidden": False, "peer": None,   # hidden=收进屏幕边缘; peer=隐藏后留的恢复条
+          # 收起时贴的是哪条边: "left"/"right"/"top"/"bottom" —— show_ball 按它决定
+          # 从哪侧把球拉回来, _peer_show 按它决定恢复条横放还是竖放。
+          "edge": "right",
+          # 球体皮肤状态(见 _ball_skin_state): hover/drag/unread 是这里记的, busy 由
+          # sending["on"] 推出来, idle 是兜底。skin_t 是动画相位(秒)。
+          "skin": "idle", "skin_t": 0.0, "hover": False, "drag": False, "unread": False,
+          "flash": 0.0}   # flash: 「定位悬浮球」的闪三下亮度加成(叠到全息亮度上)
     sending = {"on": False}
     gen = {"n": 0}   # 会话代数: 🆕清空后旧请求的事件全部作废
 
@@ -8991,15 +11105,63 @@ def run_float_ball(port):
         except Exception:
             pass
 
+    def draw_panel_deco(_e=None):
+        """画面板装饰: 切角边框 + 四角刻度 + 正十二面体线框背景。
+
+        放在 panel 的底层(place + 最先创建 = 最底的 z-order), 其他控件正常 pack 叠在上面,
+        于是装饰只在**边缘**露出来, 不挡住任何内容。
+        """
+        panel_deco.delete("deco")
+        w = panel_deco.winfo_width()
+        h = panel_deco.winfo_height()
+        if w < 20 or h < 20:
+            return
+        ch = min(16, int(w * 0.025))   # 切角量, 与球体装甲同源
+        # 外框切角八边形
+        pts = [ch, 0, w-ch, 0, w, ch, w, h-ch, w-ch, h, ch, h, 0, h-ch, 0, ch]
+        panel_deco.create_polygon(pts, fill=C["bg"], outline=C["accent"], width=1,
+                                  tags="deco")
+        # 内框细线: 让切角边框有"厚度", 不是一根单薄的描边
+        m = 2
+        pts2 = [ch+m, m, w-ch-m, m, w-m, ch+m, w-m, h-ch-m, w-ch-m, h-m, ch+m, h-m,
+                m, h-ch-m, m, ch+m]
+        panel_deco.create_polygon(pts2, fill="",
+                                  outline=_hex_mix(C["accent"], C["bg"], 0.55),
+                                  width=1, tags="deco")
+        # 四角刻度(准星): 短横 + 短竖, 让四角不至于光秃秃
+        tl = 10
+        for x0, y0, dx, dy in ((0, 0, 1, 1), (w, 0, -1, 1),
+                               (w, h, -1, -1), (0, h, 1, -1)):
+            panel_deco.create_line(x0 + ch*dx, y0, x0 + (ch+tl)*dx, y0,
+                                   fill=C["accent"], width=1, tags="deco")
+            panel_deco.create_line(x0, y0 + ch*dy, x0, y0 + (ch+tl)*dy,
+                                   fill=C["accent"], width=1, tags="deco")
+        # 正十二面体线框背景: 与全息 shader 同一套几何(20 顶点/30 边), 但调得很淡 ——
+        # 面板是阅读区, 背景只是"这里有东西在转"的氛围, 抢戏就输了。
+        v, e = _dode_geo()
+        cx, cy = w / 2.0, h / 2.0
+        r = min(w, h) * 0.28
+        proj = _dode_project(v, 0.25, 0.4, cx, cy, r)
+        for i, j in e:
+            x1, y1, d1 = proj[i]
+            x2, y2, d2 = proj[j]
+            # 深度亮度衰减(取两端棱深的均值): 近处亮、远处暗, 线框才有体积感
+            br = 0.25 + 0.75 * ((d1 + d2) / 2.0 + 1.0) / 2.0
+            panel_deco.create_line(x1, y1, x2, y2,
+                                   fill=_hex_mix(C["bg"], C["holo"], br * 0.18),
+                                   width=1, tags="deco")
+
     def apply_palette():
         in_panel = st["view"] == "panel"
         container.config(bg=C["bg"] if in_panel else _BALL_TRANSPARENT,
                          highlightthickness=1 if in_panel else 0,
                          highlightbackground=C["line"])
-        ballcv.itemconfig(oval, fill=C["accent"], outline=C["accent"])
+        draw_panel_deco()   # 主題色变了, 面板装饰跟着换色
+        _clip_header()      # 标题栏切角落色: 三角要用新的底色
+        draw_ball()   # 主题色变了, 球体的渐变/高光/图标一起重画
         for w, key in ((panel, "bg"), (header, "card"), (dot, "card"), (title, "card"),
                        (modebar, "bg"), (mid, "bg"), (canvas, "bg"), (inner, "bg"),
-                       (inputrow, "bg")):
+                       (inputrow, "bg"), (prefbar, "bg"), (segs, "bg")):
             w.config(bg=C[key])
         title.config(bg=C["card"], fg=C["txt"])
         collapse_btn.config(bg=C["card"], fg=C["sub"])
@@ -9011,7 +11173,7 @@ def run_float_ball(port):
         prefs_btn.config(bg=C["card"], fg=C["sub"])
         new_btn.config(bg=C["card"], fg=C["sub"])
         prefbar.config(bg=C["bg"])
-        style_prefs()
+        build_pref_rows()   # 连档位行一起重画: 主题色变了, 行内按钮底色也得跟着换
         style_modes()
 
     # ---------------- 聊天气泡与结果渲染 ----------------
@@ -9037,7 +11199,21 @@ def run_float_ball(port):
                           anchor="nw")
         status.pack(anchor="w", fill="x")
         scroll_end()
-        return {"card": card, "status": status}
+        return {"card": card, "status": status, "seg_drawn": False}
+
+    def set_status(holder, text, color=None):
+        """状态行: 已经被分段内容顶掉时(置空)按需重建。"""
+        w = holder.get("status")
+        if w is None:
+            w = tk.Label(holder["card"], text="", wraplength=int(280 * scale), justify="left",
+                         bg=C["card"], fg=C["sub"], font=(_FONT, 9), padx=10, pady=8,
+                         anchor="nw")
+            w.pack(anchor="w", fill="x")
+            holder["status"] = w
+        w.config(text=text)
+        if color:
+            w.config(fg=color)
+        scroll_end()
 
     def link_label(parent, text, url):
         lb = tk.Label(parent, text=text, wraplength=int(280 * scale), justify="left",
@@ -9063,7 +11239,7 @@ def run_float_ball(port):
                      bg=C["card"], fg=C["txt"], font=(_FONT, 8), padx=10,
                      anchor="nw").pack(fill="x")
         if res.get("fallacies"):
-            tk.Label(card, text="🧩 识别谬误: " + "、".join(res["fallacies"]),
+            tk.Label(card, text="🧩 知识误区与逻辑谬误: " + "、".join(res["fallacies"]),
                      wraplength=int(280 * scale), justify="left", bg=C["card"], fg=C["accent"],
                      font=(_FONT, 8), padx=10, anchor="nw").pack(fill="x")
         chk_style = {"true": ("✓", "#67c23a"), "false": ("✗", "#f56c6c"),
@@ -9092,55 +11268,160 @@ def run_float_ball(port):
         tk.Label(card, bg=C["card"]).pack(pady=2)
         scroll_end()
 
-    def render_rebut(card, status, res, evidence):
-        status.destroy()
-        points = res.get("points") or []
-        if not points:
-            tk.Label(card, text="这条里没找到可回怼的点——对方可能就是正常陈述", bg=C["card"], fg=C["sub"],
-                     font=(_FONT, 9), padx=10, pady=8).pack(anchor="w")
+    def _copy_btn(parent, txt, label="复制"):
+        """复制按钮(评论直接粘走)。"""
+        b = tk.Label(parent, text=label, bg=C["card"], fg=C["accent"], cursor="hand2",
+                     font=(_FONT, 8), padx=4)
+        b.pack(side="right", anchor="n")
+
+        def on_click(e, t=txt):
+            root.clipboard_clear()
+            root.clipboard_append(t)
+            e.widget.config(text="已复制")
+            root.after(1200, lambda w=e.widget: w.config(text=label))
+        b.bind("<Button-1>", on_click)
+        return b
+
+    _SEG_TITLE = {"lines": "⚡ 一句话", "paras": "📄 一段话", "long": "📜 长篇"}
+
+    def _chip(parent, text, cmd, color=None):
+        """小动作按钮(复制 / 收藏 / 换一批 / 证据编号)。"""
+        b = tk.Label(parent, text=text, bg=C["card"], fg=color or C["accent"], cursor="hand2",
+                     font=(_FONT, 7), padx=3)
+        b.pack(side="left", padx=(4, 0))
+        b.bind("<Button-1>", lambda e: cmd(b))
+        return b
+
+    def _flash(btn, text):
+        old = btn.cget("text")
+        btn.config(text=text)
+        root.after(1200, lambda: btn.config(text=old))
+
+    def _copy_text(btn, txt):
+        root.clipboard_clear()
+        root.clipboard_append(txt)
+        _flash(btn, "已复制")
+
+    def _save_item(btn, source, seg, txt):
+        """收藏这条回怼(存本地, 之后能在收藏夹里翻出来复用)。"""
+        def _do():
+            try:
+                local_open(urllib.request.Request(
+                    "http://127.0.0.1:%d/api/rebut/save" % port,
+                    data=json.dumps({"source": source, "seg": seg,
+                                     "content": txt}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}), timeout=5)
+            except Exception:
+                pass
+        threading.Thread(target=_do, daemon=True).start()
+        _flash(btn, "已收藏")
+
+    def regen_seg(holder, kind, btn):
+        """换一批: 只重跑这一段, 论点与证据沿用上一轮(不再拆解与取证)。"""
+        if sending["on"]:
+            _flash(btn, "先等这轮跑完")
             return
-        for p in points:
-            head = "对方论点: " + p.get("point", "")
-            if p.get("fallacy"):
-                head += "　🧩" + p["fallacy"]
-            tk.Label(card, text=head, wraplength=int(280 * scale),
-                     justify="left", bg=C["card"], fg=C["sub"], font=(_FONT, 8),
-                     padx=10, anchor="nw").pack(fill="x", pady=(6, 0))
-            row = tk.Frame(card, bg=C["card"])
-            row.pack(fill="x", padx=10, pady=(2, 0))
-            tk.Label(row, text=p.get("reply", ""), wraplength=int(230 * scale),
-                     justify="left", bg=C["card"], fg=C["txt"], font=(_FONT, 10),
-                     anchor="nw").pack(side="left", fill="x", expand=True)
-            cp = tk.Label(row, text="复制", bg=C["card"], fg=C["accent"], cursor="hand2",
-                          font=(_FONT, 8), padx=4)
-            cp.pack(side="right", anchor="n")
+        src = holder.get("src") or ""
+        if not src:
+            return
+        sending["on"] = True
+        sendbtn.config(text="…")
+        holder["gen"] = gen["n"]
+        # 记下按钮: 重跑成功后整块被 seg_append 换掉(按钮随之销毁), 失败时靠它把文字恢复
+        holder["regen"] = {"kind": kind, "btn": btn}
+        btn.config(text="换…")
+        threading.Thread(target=_ball_worker, args=(port, "rebut", src, holder, kind),
+                         daemon=True).start()
 
-            def copy_click(e, txt=p.get("reply", "")):
-                root.clipboard_clear()
-                root.clipboard_append(txt)
-                e.widget.config(text="已复制")
-                root.after(1200, lambda w=e.widget: w.config(text="复制"))
-            cp.bind("<Button-1>", copy_click)
-            if p.get("basis"):
-                tk.Label(card, text="依据: " + p["basis"], wraplength=int(280 * scale),
-                         justify="left", bg=C["card"], fg=C["sub"], font=(_FONT, 8),
+    def _regen_done(holder):
+        """收尾: 把「换一批」按钮文字恢复(换批成功时按钮已随旧块销毁, 需要判存活)。"""
+        rg = holder.pop("regen", None)
+        if not rg:
+            return
+        try:
+            if rg["btn"].winfo_exists():
+                rg["btn"].config(text="🔄 换一批")
+        except Exception:
+            pass
+
+    def seg_append(holder, data):
+        """一段生成完就立刻画出来, 用户不用等整轮结束。
+        同一段「换一批」重跑时, 把这一段旧内容整块换掉。"""
+        card = holder["card"]
+        if holder.get("status"):
+            holder["status"].destroy()
+            holder["status"] = None
+        holder["seg_drawn"] = True
+        kind = data.get("kind")
+        items = data.get("items") or []
+        if data.get("evidence"):
+            holder["evmap"] = {e["id"]: e for e in data["evidence"] if e.get("id")}
+        frames = holder.setdefault("segframes", {})
+        if frames.get(kind) is not None:
+            frames[kind].destroy()   # 换一批: 整块换掉这一段
+        if kind == "targets" and not items and not data.get("stance_note"):
+            frames.pop(kind, None)
+            return
+        box = tk.Frame(card, bg=C["card"])
+        box.pack(fill="x")
+        frames[kind] = box
+        src = holder.get("src") or ""
+
+        if kind == "targets":
+            tk.Label(box, text="🎯 知识误区与逻辑谬误", bg=C["card"], fg=C["accent"],
+                     font=(_FONT, 8, "bold"), padx=10).pack(anchor="w", pady=(6, 0))
+            for i, t in enumerate(items, 1):
+                head = "%d. %s" % (i, t.get("point") or "")
+                if t.get("kind"):
+                    head += "　[" + t["kind"] + "]"
+                tk.Label(box, text=head, wraplength=int(280 * scale), justify="left",
+                         bg=C["card"], fg=C["txt"], font=(_FONT, 8, "bold"),
                          padx=10, anchor="nw").pack(fill="x")
-        if res.get("finale"):
-            frow = tk.Frame(card, bg=C["card"])
-            frow.pack(fill="x", padx=10, pady=(6, 0))
-            tk.Label(frow, text="💬 " + res["finale"], wraplength=int(230 * scale),
-                     justify="left", bg=C["card"], fg=C["txt"], font=(_FONT, 9, "bold"),
-                     anchor="nw").pack(side="left", fill="x", expand=True)
-            cf = tk.Label(frow, text="复制", bg=C["card"], fg=C["accent"], cursor="hand2",
-                          font=(_FONT, 8), padx=4)
-            cf.pack(side="right", anchor="n")
+                if t.get("note"):
+                    tk.Label(box, text="　" + t["note"], wraplength=int(275 * scale),
+                             justify="left", bg=C["card"], fg=C["sub"], font=(_FONT, 8),
+                             padx=10, anchor="nw").pack(fill="x")
+            if data.get("stance_note"):
+                tk.Label(box, text="证据倾向: " + data["stance_note"],
+                         wraplength=int(280 * scale), justify="left", bg=C["card"], fg=C["sub"],
+                         font=(_FONT, 8), padx=10, anchor="nw").pack(fill="x")
+            scroll_end()
+            return
 
-            def copy_finale(e, txt=res["finale"]):
-                root.clipboard_clear()
-                root.clipboard_append(txt)
-                e.widget.config(text="已复制")
-                root.after(1200, lambda w=e.widget: w.config(text="复制"))
-            cf.bind("<Button-1>", copy_finale)
+        head = tk.Frame(box, bg=C["card"])
+        head.pack(fill="x", padx=10, pady=(6, 0))
+        tk.Label(head, text=_SEG_TITLE.get(kind, kind or ""), bg=C["card"], fg=C["accent"],
+                 font=(_FONT, 8, "bold")).pack(side="left")
+        _chip(head, "🔄 换一批", lambda b, k=kind: regen_seg(holder, k, b))
+        if not items:
+            tk.Label(box, text="（这一段没生成出内容，点换一批再来）", bg=C["card"], fg=C["sub"],
+                     font=(_FONT, 8), padx=10, anchor="w").pack(fill="x")
+            scroll_end()
+            return
+        evmap = holder.get("evmap") or {}
+        for it in items:
+            txt = it.get("text", "")
+            tk.Label(box, text=txt, wraplength=int(280 * scale), justify="left",
+                     bg=C["card"], fg=C["txt"], font=(_FONT, 10 if kind != "long" else 9),
+                     padx=10, anchor="nw").pack(fill="x")
+            acts = tk.Frame(box, bg=C["card"])
+            acts.pack(fill="x", padx=10, pady=(1, 0))
+            _chip(acts, "复制", lambda b, t=txt: _copy_text(b, t))
+            _chip(acts, "⭐ 收藏", lambda b, t=txt, k=kind: _save_item(b, src, k, t))
+            for x in (it.get("evidence") or []):
+                e = evmap.get(x)
+                if e and e.get("url"):
+                    _chip(acts, "[" + e["id"] + "]", lambda b, u=e["url"]: webbrowser.open(u),
+                          C["sub"])
+            if it.get("basis"):
+                tk.Label(box, text="依据: " + it["basis"], wraplength=int(280 * scale),
+                         justify="left", bg=C["card"], fg=C["sub"], font=(_FONT, 7),
+                         padx=10, anchor="nw").pack(fill="x")
+        scroll_end()
+
+    def rebut_tail(holder, res, evidence):
+        """三段画完后的收尾: 证据链接与离线提示。"""
+        card = holder["card"]
         if res.get("offline"):
             tk.Label(card, text="⚠ 未搜到网络证据, 仅凭模型知识", bg=C["card"], fg="#e6a23c",
                      font=(_FONT, 8), padx=10).pack(anchor="w", pady=(3, 0))
@@ -9163,6 +11444,7 @@ def run_float_ball(port):
         user_bubble(text, {"verify": "查证", "rebut": "回怼"}[cur])
         holder = ai_bubble()
         holder["gen"] = gen["n"]
+        holder["src"] = text   # 「换一批」要拿原话重跑同一段
         holder["status"].config(text="🔍 正在拆解论点、联网搜索证据…")
         sending["on"] = True
         sendbtn.config(text="…")
@@ -9183,6 +11465,92 @@ def run_float_ball(port):
     new_btn.bind("<Button-1>", new_conversation)
     prefs_btn.bind("<Button-1>", toggle_prefs)
 
+    # ---------------- 球体输入层(轮询式) ----------------
+    # 关键事实: 颜色键控的透明像素**收不到鼠标消息**。旧球是实心装甲球, 整块圆都能点; 现在换成
+    # 镂空线框, 只剩那几根线能点(实测球窗圆内 15.6% 可点, 其余穿透到桌面) —— 用户报的
+    # 「我经常点不到」就是它。消息送不到的地方没法用 Tk 绑定, 于是自己轮询全局键态。
+    HIT_R = BALL * 0.44          # 命中圆半径(约 0.44*BALL ≈ 74 物理px): 线框本身只有 ~0.34*BALL,
+                                 # 放大一圈当手感余量, 又不至于把窗口四角也吃掉(角上仍可点桌面)
+    vin = {"down": False, "moved": False, "t": 0.0, "ox": 0, "oy": 0,
+           "wx": 0, "wy": 0, "r": False, "pl": False}
+    # 测试钩子 --ball-fake-click / --ball-fake-drag 的时间线:
+    # [(dt_秒, x, y, 左键, 右键), ...] —— 只覆盖"指针位置 + 键态", **不碰真实鼠标**。
+    fake = {"t0": None, "seq": []}
+
+    def _btn_l():
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)   # VK_LBUTTON
+
+    def _btn_r():
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x02) & 0x8000)   # VK_RBUTTON
+
+    def _hit_xy(px, py, pad=0):
+        """给定指针坐标是否落在**命中圆**里(不是按画出来的线, 也不是按窗口矩形)。"""
+        dx = px - (root.winfo_x() + BALL / 2.0)
+        dy = py - (root.winfo_y() + BALL / 2.0)
+        rr = HIT_R + pad
+        return dx * dx + dy * dy <= rr * rr
+
+    def _hit_circle(pad=0):
+        px, py = root.winfo_pointerxy()
+        return _hit_xy(px, py, pad)
+
+    def _input_now():
+        """读 (左键, 右键, 指针x, 指针y); 测试时间线优先, 否则读真实键鼠。"""
+        px, py = root.winfo_pointerxy()
+        if fake["t0"] is None:
+            return _btn_l(), _btn_r(), px, py
+        cur = None
+        for it in fake["seq"]:
+            if time.time() - fake["t0"] >= it[0]:
+                cur = it
+        return (bool(cur[3]), bool(cur[4]), cur[1], cur[2]) if cur else \
+               (_btn_l(), _btn_r(), px, py)
+
+    def _release_settle():
+        """松手结算(球形态): 落盘 + 拖到屏幕缘就收起。与面板头部那条路径同一套判据。"""
+        if not st["hidden"]:
+            save_pos(root.winfo_x(), root.winfo_y())
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        near = min((root.winfo_x() + PAD, "left"),
+                   (sw - root.winfo_x() - BALL + PAD, "right"),
+                   (root.winfo_y() + PAD, "top"),
+                   (sh - root.winfo_y() - BALL + PAD, "bottom"))
+        if st["view"] == "ball" and st["moved"] and near[0] <= 1:
+            st["edge"] = near[1]
+            hide_ball()
+
+    def virtual_input():
+        """轮询式输入。返回 True = 指针在球上或正在操作 → 调用方把轮询间隔提到 30ms。"""
+        if st["view"] != "ball" or st["hidden"]:
+            vin.update(down=False, moved=False, r=False)
+            return False
+        l, r, px, py = _input_now()
+        inside = _hit_xy(px, py, 6)
+        act, s2 = _vin_step(vin, time.time(), inside, l, r, px=px, py=py)
+        vin.update(s2)
+        if act == "press":
+            vin["wx"], vin["wy"] = root.winfo_x(), root.winfo_y()
+            st.update(down=True, moved=False, drag=True, t0=time.time())
+        elif act == "drag":
+            st["moved"] = True
+            # 钳制按**球体**算(与面板头部拖拽一致): 允许窗口越出屏幕 PAD 像素, 球体才贴得到边
+            nx = max(int(-PAD), min(vin["wx"] + px - vin["ox"],
+                                    int(root.winfo_screenwidth() - BALL + PAD)))
+            ny = max(int(-PAD), min(vin["wy"] + py - vin["oy"],
+                                    int(root.winfo_screenheight() - BALL + PAD)))
+            _geo(BALL, BALL, nx, ny)
+            return True
+        elif act == "click":
+            st.update(down=False, drag=False)
+            expand()          # 单击(命中圆内任意位置) = 展开成对话面板
+        elif act == "drop":
+            st.update(down=False, drag=False)
+            _release_settle()
+        elif act == "rmenu":
+            on_right(at=(px, py))
+        return bool(act) or inside or vin["down"]
+
     def poll():
         try:
             while True:
@@ -9190,61 +11558,260 @@ def run_float_ball(port):
                 if holder.get("gen") != gen["n"]:
                     continue   # 🆕 清空后的旧请求事件作废
                 if kind == "phase":
-                    holder["status"].config(text=data or "…")
-                    scroll_end()
+                    set_status(holder, data or "…")
+                elif kind == "seg":
+                    seg_append(holder, data or {})
                 elif kind == "done":
                     sending["on"] = False
                     sendbtn.config(text="发送")
                     d = data or {}
+                    regen = str(d.get("regen") or "")
+                    _regen_done(holder)
+                    # 球是收起状态时结果出来了 → 右上角点个呼吸点。用户可能已经把面板收起来了,
+                    # 不给这个提示的话, 结果出来了球还是原样, 完全看不出有东西回来。
+                    if st["view"] == "ball" and not regen:
+                        st["unread"] = True
                     if d.get("ok"):
-                        card, status = holder["card"], holder["status"]
+                        card = holder["card"]
                         r0 = d.get("result") or {}
-                        if r0.get("no_target"):   # 模型判定无可回怼: 说明原因即可
-                            status.config(text="🤷 " + (r0.get("reason") or "这条没有可回怼的点"))
+                        if regen:
+                            pass   # 换一批: 这一段已由 seg 事件就地替换, 不再补画收尾
+                        elif r0.get("no_target"):   # 模型判定无可回怼: 说明原因即可
+                            set_status(holder, "🤷 " + (r0.get("reason") or "这条没有可回怼的点"))
                         elif d.get("mode") == "verify":
-                            render_verify(card, status, r0, d.get("evidence") or [])
+                            if holder.get("status"):
+                                render_verify(card, holder["status"], r0, d.get("evidence") or [])
+                                holder["status"] = None
                         else:
-                            render_rebut(card, status, r0, d.get("evidence") or [])
+                            ev = d.get("evidence") or []
+                            if not holder.get("seg_drawn"):   # 没收到分段(异常) → 一次性补齐
+                                seg_append(holder, {"kind": "targets",
+                                                    "items": r0.get("targets") or [],
+                                                    "stance_note": r0.get("stance_note") or "",
+                                                    "evidence": ev})
+                                for _k in ("lines", "paras", "long"):
+                                    seg_append(holder, {"kind": _k, "items": r0.get(_k) or []})
+                            rebut_tail(holder, r0, ev)
                         u = d.get("usage") or {}
-                        if u.get("calls"):   # 本次花费小字(同样计入主界面每日成本)
+                        if u.get("calls") and not regen:   # 本次花费小字(同样计入主界面每日成本)
                             tk.Label(card, text="⏱ %ss · %s 次调用 · ¥%s" % (
                                 d.get("elapsed", "?"), u["calls"], u.get("cost", 0)),
                                 bg=C["card"], fg=C["sub"], font=(_FONT, 8), padx=10,
                                 anchor="w").pack(fill="x")
                     else:
-                        holder["status"].config(text="⚠ " + (d.get("error") or "失败"), fg="#f56c6c")
+                        set_status(holder, "⚠ " + (d.get("error") or "失败"), "#f56c6c")
                     scroll_end()
                 elif kind == "error":
                     sending["on"] = False
                     sendbtn.config(text="发送")
-                    holder["status"].config(text="⚠ " + str(data), fg="#f56c6c")
-                    scroll_end()
+                    _regen_done(holder)
+                    set_status(holder, "⚠ " + str(data), "#f56c6c")
         except queue.Empty:
             pass
-        root.after(90, poll)
-
-    # ---------------- 球 ⇄ 面板 形态切换(原地展开/收回) ----------------
-    def expand(_e=None):
-        if st["view"] != "ball":
-            return
-        C.update(_ball_theme(port))   # 展开时取最新强调色/主题
-        try:   # 同步最新档位设置(思考/刻薄/字数/谬误分析)
-            with urllib.request.urlopen("http://127.0.0.1:%d/api/floatball" % port, timeout=3) as r:
-                _d = json.loads(r.read().decode("utf-8"))
-            for _k in ("think", "savage", "len", "fallacy"):
-                if (_d.get("prefs") or {}).get(_k):
-                    prefs[_k] = _d["prefs"][_k]
+        try:
+            # 球的高亮**只**是视觉反馈, 不驱动任何开合: 面板一律靠单击球展开(见 virtual_input),
+            # 靠「─ 收起」/右键菜单收回 —— 悬停自动展开/离开自动收起已按用户要求整体移除。
+            if st["view"] == "ball" and not st["hidden"] and not st["down"]:
+                st["hover"] = _ptr_on_ball(6)
+            else:
+                st["hover"] = False
+            sync_skin()    # 球体皮肤跟着「生成中/有未读/悬停」走
         except Exception:
             pass
-        style_prefs()
-        apply_palette()
+        try:
+            # 输入层要在最后调: 它可能触发展开/收边, 那些动作会改 view/hidden
+            active = virtual_input()
+        except Exception:
+            active = False
+        # 指针在球上(或正在拖拽)时把轮询提到 30ms —— 单击最短也就几十毫秒, 90ms 会漏。
+        # 只有"手在球上"这一小段时间是密的, 平时仍是 90ms, 不额外吃 CPU。
+        root.after(30 if active else 90, poll)
+
+    # ---------------- 球体动效驱动 ----------------
+    # 静止 150ms 一帧(约 6.7fps)、交互 45ms 一帧(约 22fps)。
+    # 为什么静止敢放到 150ms: 静止转速只有 0.30rad/s, 每帧转 2.6°, 这个幅度看不出台阶; 而
+    # 帧率直接决定 CPU —— 悬浮球是常驻小窗, 用户还会在同一台机器上打游戏, 实测(见
+    # DJXM_BALL_PROF 探针)每帧 cost×帧率就是它占的核数, 11fps 下能吃掉 31% 单核。
+    # 相位用**真实时间差**累加而不是每帧加固定值: 定时器被拖动/被系统节流时不会突然变慢。
+    anim = {"t0": time.time()}
+
+    def ball_anim():
+        now = time.time()
+        _glass_sync()          # 玻璃体跟着球走(拖动/收边/展开都在这一处兜住)
+        dt = min(0.5, max(0.0, now - anim["t0"]))
+        anim["t0"] = now
+        st["skin_t"] = st.get("skin_t", 0.0) + dt
+        if st["view"] == "ball" and not st["hidden"]:
+            _tg0 = time.perf_counter()
+            try:
+                _glass_draw()      # 下层: 半透明的面(真 alpha 那层)
+            except Exception as _ge:
+                if os.environ.get("DJXM_GLASS_DEBUG"):
+                    print("[glass] 画失败: %r" % (_ge,), flush=True)
+            _tg = time.perf_counter() - _tg0
+            try:
+                draw_ball_fx()     # 上层: 线框(不透明, 保持清晰)
+            except Exception:
+                pass
+            if _BALL_PROF[0]:      # 玻璃层的耗时/图元也计进来, 否则探针数字虚低
+                _BALL_PROF[2] += _tg
+                _BALL_PROF[3] += len(glass["cv"].find_all())
+        if _BALL_PROF[0] and now - _BALL_PROF[4] >= 5.0:
+            n = max(1, _BALL_PROF[1])
+            print("[ball-prof] %.1fms/帧 · %d 图元 · %.1f 帧/s"
+                  % (1000.0 * _BALL_PROF[2] / n, _BALL_PROF[3], n / (now - _BALL_PROF[4])),
+                  flush=True)
+            _BALL_PROF[1] = _BALL_PROF[2] = 0
+            _BALL_PROF[4] = now
+        # 帧率统一 33ms(~30fps): 探针实测单帧球 1.2ms + 玻璃层 0.6ms, 满帧也就 ~5% 单核。
+        # 原来 idle 走 150ms(6.7fps)"省 CPU"是白省 —— 省下的不到 1%, 代价是肉眼可见的顿;
+        # 交互态也一并统一, 免得出现"静止比悬停还顺"这种自相矛盾的观感。
+        root.after(33, ball_anim)
+
+    # ---------------- 玻璃体: 真半透明的一层(独立窗, 垫在球**下面**) ----------------
+    # 为什么要单独一层: 球的键控窗(-transparentcolor)只有全透明/全不透明两档, Tk 的 -alpha
+    # 又是**整窗统一** alpha, 而且跟键色互斥(后设的顶掉前者, 实测窗口变成不透明矩形)。要
+    # "体色真半透明 + 线框仍然清晰", 只能分层 —— 下面这层用一次 Win32 调用把
+    # LWA_COLORKEY|LWA_ALPHA **一起**给(实测 GetLayeredWindowAttributes 返回 flags=3):
+    # 圆外键色真透明(所以不是一块矩形), 圆内由合成器做 alpha 混合(所以没有点阵)。
+    _GLASS_ALPHA = 108      # 体色不透明度(0~255): 108 ≈ 42%。想更浓/更淡改这一个数
+    glass = {"w": None, "cv": None, "oval": None, "shown": False, "col": None}
+
+    def _top_hwnd(w):
+        """Tk 的 winfo_id() 给的是内层子窗, 分层属性在**顶层窗**上(它的父窗)。"""
+        try:
+            return ctypes.windll.user32.GetParent(w.winfo_id()) or w.winfo_id()
+        except Exception:
+            return 0
+
+    def _glass_alpha_on(w):
+        try:
+            _hw = _top_hwnd(w)
+            ctypes.windll.user32.SetLayeredWindowAttributes(
+                _hw, 0x010101,              # COLORREF(BGR) = 键色 #010101
+                _GLASS_ALPHA, 3)            # 3 = LWA_COLORKEY|LWA_ALPHA
+            if os.environ.get("DJXM_GLASS_DEBUG"):
+                # 自检开关: 回读分层属性, 确认"键色+真 alpha"真的同时生效(flags 必须是 3)。
+                # 光看代码"应该生效"是不够的 —— 这台机器上 Tk 的 -alpha 就曾经把键色顶掉。
+                _cr, _al, _fl = (ctypes.c_uint32(), ctypes.c_ubyte(),
+                                 ctypes.c_uint32())
+                _q = ctypes.windll.user32.GetLayeredWindowAttributes(
+                    _hw, ctypes.byref(_cr), ctypes.byref(_al), ctypes.byref(_fl))
+                print("[glass] hwnd=%s ok=%s alpha=%d flags=%d (3=键色+alpha)"
+                      % (hex(_hw), _q, _al.value, _fl.value), flush=True)
+        except Exception as _e:
+            if os.environ.get("DJXM_GLASS_DEBUG"):
+                print("[glass] 失败: %r" % (_e,), flush=True)
+
+    def _ball_front():
+        """把球窗压在玻璃体**上面**(后建的窗默认在上面)。NOACTIVATE: 不抢焦点。"""
+        try:
+            ctypes.windll.user32.SetWindowPos(_top_hwnd(root), -1, 0, 0, 0, 0,
+                                              0x0001 | 0x0002 | 0x0010)
+        except Exception:
+            pass
+
+    def _glass_make():
+        w = tk.Toplevel(root)
+        w.overrideredirect(True)
+        w.attributes("-topmost", True)
+        w.geometry("%dx%d+%d+%d" % (BALL, BALL, root.winfo_x(), root.winfo_y()))
+        w.attributes("-transparentcolor", _BALL_TRANSPARENT)
+        cv = tk.Canvas(w, width=BALL, height=BALL, bg=_BALL_TRANSPARENT,
+                       highlightthickness=0)
+        cv.pack()
+        w.update_idletasks()
+        glass.update(w=w, cv=cv, shown=True)
+        _glass_alpha_on(w)
+        _ball_front()
+
+    def _glass_sync():
+        """玻璃层跟着球: 位置同步 + 该不该出现(展开成面板/收进边缘时不出现)。"""
+        w = glass.get("w")
+        if w is None:
+            return
+        want = (st["view"] == "ball" and not st["hidden"])
+        try:
+            if want:
+                if not glass["shown"]:
+                    w.deiconify()
+                    glass["shown"] = True
+                    _glass_alpha_on(w)      # 重新显示后分层属性要重设
+                    _ball_front()
+                # 位置没变就别再设 geometry: 每帧都调会白白吃掉几毫秒(实测拖累帧率),
+                # 拖动时位置当然每帧都变, 那是该设的。
+                _pos = (root.winfo_x(), root.winfo_y())
+                if glass.get("pos") != _pos:
+                    w.geometry("%dx%d+%d+%d" % (BALL, BALL, _pos[0], _pos[1]))
+                    glass["pos"] = _pos
+            elif glass["shown"]:
+                w.withdraw()
+                glass["shown"] = False
+        except Exception:
+            pass
+
+    def _glass_draw():
+        """把**正面朝前的每个面**铺在这层上 —— 半透明的是面, 不是背后一个圆。
+
+        为什么面必须画在这层: 球窗是键控窗(只有全透明/全不透明两档), 面铺上去就是实心塑料片;
+        这层是 LWA_COLORKEY|LWA_ALPHA, 面交给合成器做**真 alpha**混合 —— 于是"每个面半透明、
+        线框依然清晰"(线框在不透明的上层)。
+
+        颜色: **所有面同一个中间调**(armor↔holo 的中值), 不再按深度压暗。有了真半透明, 层次
+        本来就由"面和桌面的混合 + 上层线框的近亮远暗"承担了; 再叠一层人为压暗只会把整颗球
+        拖暗(用户反馈"亮度有点低")。armor 在深色主题里是压到近黑的底色, 单独用它必然发闷,
+        和 holo(亮面强调色)对半混出来才是"玻璃"该有的中间调 —— 浅色主题下同理成立。
+        背面不铺(全息要能看穿)。轮廓用同色 outline 描一圈: 相邻面共享边, 不描会露出发丝缝。
+        """
+        cv = glass.get("cv")
+        if cv is None:
+            return
+        cv.delete("gf")
+        t = st.get("skin_t", 0.0)
+        P = _holo_state()
+        v, ed, faces, fnorm, efaces = _solid_geo()
+        cx = cy = BALL / 2.0
+        RS = BALL * 0.340
+        radii = [1.0 + P["wave"] * math.sin(t * 1.6 + i * 1.9) for i in range(len(v))]
+        a = t * P["spin"]
+        ax, ay, az = 0.62 + a * 0.52, 0.42 + a * 0.86, 0.26 + a * 0.36
+        proj = _solid_project(v, ax, ay, az, cx, cy, RS, radii=radii)
+        col = _hex_mix(C["armor"], C["holo"], 0.50)
+        for fi, f in enumerate(faces):
+            if _rot3(fnorm[fi], ax, ay, az)[2] <= 0:
+                continue                                   # 背面不铺
+            cv.create_polygon(*[q for i in f for q in (proj[i][0], proj[i][1])],
+                              fill=col, outline=col, width=1, tags="gf")
+
+    _glass_make()
+
+    # ---------------- 球 ⇄ 面板 形态切换(原地展开/收回) ----------------
+    def expand(_e=None, focus=True):
+        if st["view"] != "ball":
+            return
+        if st["hidden"]:   # 收边态没有"原地"可展开: 先把球拉回屏内, 否则面板会开在屏幕外
+            show_ball()
+            return
+        C.update(_ball_theme(port))   # 展开时取最新强调色/主题
+        try:   # 同步最新档位设置(思考/身份/风格/条数)与自定义人设
+            _sp = _ball_prefs_fetch(port)
+            for _k in ("think", "persona", "savage", "len"):
+                if _sp.get(_k):
+                    prefs[_k] = str(_sp[_k])
+            plocal["items"] = _personas_fetch(port)
+        except Exception:
+            pass
+        apply_palette()   # 里面会重建档位行(主题色 + 自定义人设都在这一步生效)
         bx, by = root.winfo_x(), root.winfo_y()
+        st["unread"] = False   # 面板打开了, 结果就在眼前, 未读提示该撤了
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        tx = bx + BALL - PW   # 面板右上角贴着球 → 默认往左展开
+        # 面板右上角贴**球体**右缘(不是窗口右缘): 窗口那圈透明边距不参与构图, 拿窗口算
+        # 会让面板和球之间空出 PAD 像素的缝。
+        tx = bx + BALL - PAD - PW   # 默认往左展开
         if tx < 4:
             tx = min(bx, sw - PW - 4)   # 左边放不下 → 往右展开
         tx = max(4, tx)
-        ty = max(4, min(by - 40, sh - PH - 4))
+        ty = max(4, min(by + PAD - 40, sh - PH - 4))
         ballcv.pack_forget()
         panel.pack(fill="both", expand=True)
         for i in (1, 2, 3):   # 快速展开动画
@@ -9254,23 +11821,31 @@ def run_float_ball(port):
                                            int(bx + (tx - bx) * t), int(by + (ty - by) * t)))
             root.update_idletasks()
             time.sleep(0.02)
-        root.geometry("%dx%d+%d+%d" % (PW, PH, tx, ty))
+        _geo(PW, PH, tx, ty)   # 收尾帧: 走 _geo 确保落地
         try:
             root.attributes("-topmost", True)
         except Exception:
             pass
         st["view"] = "panel"
-        save_pos(tx, ty)
-        inp.focus_set()
+        # 位置文件记的**永远是球的落点**, 不是面板的左上角 —— 展开时窗口虽然变成了面板,
+        # 但下次启动要按"球该在哪儿"来摆。原来这里写的 (tx, ty) 是面板坐标, 语义串了,
+        # 会让下次启动的球落在按面板尺寸算出来的怪位置。展开前的 (bx, by) 才是球位。
+        save_pos(bx, by)
+        if focus:
+            inp.focus_set()   # 展开=用户点了球, 直接把光标给输入框; focus=False 留给测试钩子
 
     def collapse(_e=None):
         if st["view"] != "panel":
             return
         x, y = root.winfo_x(), root.winfo_y()
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        # 球收回面板右上角(与展开时"面板右上角贴着球"对称), 而不是跳到面板左上角
-        tx = max(4, min(x + PW - BALL, sw - BALL - 4))
-        ty = max(4, min(y + 40, sh - BALL - 4))
+        # 球收回面板右上角(与展开时"面板右上角贴着球"对称), 而不是跳到面板左上角。
+        # 右侧要留 96px 边距: 贴到最右缘那条会被任务栏通知区/置顶小窗盖住, 用户展开一次
+        # 再收起就"又找不到球"了(左缘没有这个问题, 仍留 4px)。
+        # 加减 PAD 是为了抵消窗口的透明边距, 让**球体**落在该落的地方(与 expand 严格互逆:
+        # expand 里 tx = bx + BALL - PAD - PW, 这里反解回去正好还原 bx)。
+        tx = max(4, min(x + PW - BALL + PAD, _ball_win(sw)))
+        ty = max(4, min(y + 40 - PAD, sh - BALL + PAD - 4))
         panel.pack_forget()
         container.config(bg=_BALL_TRANSPARENT, highlightthickness=0)
         ballcv.pack(fill="both", expand=True)
@@ -9280,7 +11855,7 @@ def run_float_ball(port):
                                            int(x + (tx - x) * t), int(y + (ty - y) * t)))
             root.update_idletasks()
             time.sleep(0.02)
-        root.geometry("%dx%d+%d+%d" % (BALL, BALL, tx, ty))
+        _geo(BALL, BALL, tx, ty)   # 收尾帧: 走 _geo 确保落地
         try:
             root.attributes("-topmost", True)
         except Exception:
@@ -9289,87 +11864,558 @@ def run_float_ball(port):
         save_pos(tx, ty)
     collapse_btn.bind("<Button-1>", lambda e: collapse())
 
+    # ---------------- 隐藏 ⇄ 显示 ----------------
+    # 「隐藏」= 球横向滑出屏幕, 只在贴边处留一条 4px 的恢复条(hover 变宽并显示箭头)。
+    # 不真销毁窗口: 一下午的调用记录/档位都在这个进程里, 销毁就得重来;
+    # 也不做成"最小化成 1px", 那样用户找不到恢复入口。收边比 full-hide 更好用。
+    def _anim(seq, dur=0.012, step=None):
+        """按 (w,h,x,y) 序列逐帧改窗口几何; 每帧 update_idletasks 让画面真的动起来。"""
+        for geo in seq:
+            root.geometry("%dx%d+%d+%d" % geo)
+            root.update_idletasks()
+            time.sleep(dur)
+
+    def _geo(w, h, x, y):
+        """瞬间改窗口几何, 并**把请求刷下去**(等价于 _anim 的单帧)。
+
+        为什么必须有那一句 update_idletasks: `root.geometry(...)` 只是**登记**一个几何
+        请求, 真正落到窗口上要等 Tk 跑 idle 任务。普通回调里这几乎立刻发生, 但悬浮球是
+        overrideredirect + 颜色键控的**分层窗口**, 实测这里会**一直不生效** ——
+        调完 geometry 之后 winfo_x/y 还是旧值, 外部 GetWindowRect 量出来也纹丝不动
+        (t=9.9s 调 geometry, 之后 16 秒窗口一动不动)。
+
+        这正是用户报的「按了『定位悬浮球』, 提示说球移到右侧了, 可球根本没动」的根子:
+        位置算对了, save_pos 也写对了, **只有"挪窗口"这一步没落地**。
+        `_anim` 每帧都跟一句 update_idletasks, 所以收展/收边这些动效一直是好的 ——
+        偏偏这几个"瞬间跳位"的路径漏了。
+        """
+        root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        root.update_idletasks()
+
+    def _ease(t):
+        """缓出: 起步快收尾慢, 比线性更像"物理"的收展。"""
+        return 1.0 - (1.0 - t) ** 3
+
+    def _nearest_edge(x, y):
+        """球体(窗口左上角 x,y)离哪条屏幕边最近: "left"/"right"/"top"/"bottom"。
+
+        收起方向必须跟用户实际把球扔到的那条边一致: 拖到下缘松手却往左收, 球会横着飞过
+        半个屏幕, 恢复条也贴在错的边上。四缘统一按**球体边缘**到屏幕边的距离取最近。
+        """
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        return min((x + PAD, "left"),
+                   (sw - x - BALL + PAD, "right"),
+                   (y + PAD, "top"),
+                   (sh - y - BALL + PAD, "bottom"))[1]
+
+    def hide_ball(_e=None):
+        """把球收进屏幕边缘, 留一条恢复条。已在隐藏态则忽略。"""
+        if st["hidden"]:
+            return
+        if st["view"] == "panel":
+            collapse()
+        C.update(_ball_theme(port))
+        if hintbox.get("w"):
+            hintbox["w"].destroy()
+            hintbox["w"] = None
+        x, y = root.winfo_x(), root.winfo_y()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        # 靠哪条边就往哪条边收。没拖拽过直接调本函数时(隐藏按钮/自动收边钩子)按当前位置
+        # 算最近边; 默认位在右侧 → 收右边, 与从前一致。
+        edge = _nearest_edge(x, y)
+        e_px = 4
+        # 收边只挪坐标, **窗口尺寸保持不变**: 球体只占窗口中间那块, 把窗口缩到 4px 会把球
+        # 一起裁掉, 屏幕上什么都看不见(以前窗口=球, 缩窄才对)。
+        #
+        # 目标是「球体**滑出屏幕**, 只在缘上留 4px」, 不是「球体贴着缘站好」。
+        # 球体 = 窗口内缩 PAD 的那一圈: 球体左缘 = 窗口x + PAD, 球体右缘 = 窗口x + BALL - PAD,
+        # 于是"留 4px"= 球体**内侧**那条边落在离缘 e_px 处, 其余全在屏幕外:
+        #   左(往左滑): 球体右缘 = e_px        →  x = e_px - BALL + PAD
+        #   右(往右滑): 球体左缘 = sw - e_px   →  x = sw - e_px - PAD
+        #   上(往上滑): 球体底缘 = e_px        →  y = e_px - BALL + PAD
+        #   下(往下滑): 球体顶缘 = sh - e_px   →  y = sh - e_px - PAD
+        #
+        # 用户报的「出现恢复条, 球却没隐藏」就是这四条写反了语义: 原来写的是"球体**外缘**贴缘"
+        # (左: x = e_px - BALL/2 + RB, 右: x = sw - e_px - BALL/2 - RB, ...), 球体完整停在
+        # 离缘 4px 的屏内 —— 收起后球和恢复条同时在桌上, 那条 4px 细线只是紧挨着球, 看着就是
+        # "点了隐藏但没隐藏"。球体露出的那 ≤4px 正好被恢复条(同缘、同中点、4px 厚)盖住。
+        # 取整方向必须"往外推": 左/上往负方向 floor, 右/下往正方向 ceil。PAD = BALL/2 - RB
+        # 不是整数, 用 int() 截断时右侧会少挪 0.6px —— 球体于是比恢复条多露一截(实测露出
+        # 4.6px vs 条厚 4px), 条的下沿会漏出一条 1px 的球体亮线。
+        if edge in ("left", "right"):
+            tx = (math.floor(e_px - BALL + PAD) if edge == "left"
+                  else math.ceil(sw - e_px - PAD))
+            ty = max(int(-PAD), min(y, int(sh - BALL + PAD)))
+        else:
+            ty = (math.floor(e_px - BALL + PAD) if edge == "top"
+                  else math.ceil(sh - e_px - PAD))
+            tx = max(int(-PAD), min(x, int(sw - BALL + PAD)))
+        tx, ty = int(tx), int(ty)
+        _anim([(BALL, BALL, int(x + (tx - x) * _ease(i / 6.0)),
+                int(y + (ty - y) * _ease(i / 6.0))) for i in range(1, 7)])
+        _geo(BALL, BALL, tx, ty)   # 收尾一帧: 必须走 _geo, 否则末位可能不落地
+        st["hidden"] = True
+        st["edge"] = edge
+        st["hover"] = False
+        # 收边后**把球体画布清空**: 球体虽然滑出去了, 它的外发光/全息环阵半径比球体大一圈
+        # (最外到 RF*1.24 ≈ 0.5*BALL), 屏内那一侧还会留下几十像素高的抖动光晕 —— 实测
+        # 条下面 1~14px 能看到稀稀拉拉的强调色亮点, 读起来还是"球没走干净"。
+        # 清空之后屏上只剩恢复条本身(窗口那点余量是透明键色, 连点击都会穿透)。
+        # show_ball 开头会重新 draw_ball(), 所以不需要在这里保存任何东西。
+        try:
+            ballcv.delete("all")
+        except Exception:
+            pass
+        # 恢复条按**球心**对齐: 竖条贴左右缘(y 居中对球心), 横条贴上下缘(x 居中对球心)
+        # 先把球窗重新压成置顶, 再建恢复条: 球体那 4px 余量现在正好在条下面, 顺序反了
+        # (先建条、后给球设 -topmost)会把球抬到条上面, 屏上露出的就是球体的斜角切片而不是条。
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        _peer_show(edge, int(tx + BALL / 2.0), int(ty + BALL / 2.0))
+
+    def _peer_show(edge, cx, cy):
+        """恢复条: 独立小窗, 贴在球收进去的那条边上。默认 4px 细线, 指针靠近时变宽并显箭头。
+
+        长边按**球体**取而不是按窗口取: 窗口比球大一圈透明边距, 照窗口高画出来的条会比球
+        长一截, 看着不像"球收进去了", 像贴了根不相干的胶带。
+
+        四缘通用: 左右缘是**竖条**(沿 y 长), 上下缘是**横条**(沿 x 长), 长边中点对齐球心。
+        """
+        w = st.get("peer")
+        if w is not None:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        p = tk.Toplevel(root)
+        p.overrideredirect(True)
+        horiz = edge in ("top", "bottom")     # 横条(上下缘)还是竖条(左右缘)
+        LONG = max(8, int(RB * 2.6))          # 条子长边(比球体略高一点, 好瞄准)
+        THIN = 4                              # 收起态露出的厚度
+        cv = tk.Canvas(p, width=(LONG if horiz else THIN),
+                       height=(THIN if horiz else LONG),
+                       bg=C["accent"], highlightthickness=0)
+        cv.pack()
+        try:
+            p.attributes("-topmost", True)
+            p.attributes("-alpha", 0.92)
+            p.lift()   # 必须压在球窗(也是置顶)之上: 条薄到 4px 时正盖着球体的余量
+        except Exception:
+            pass
+        peer = {"w": p, "cv": cv, "edge": edge, "open": False,
+                "by": int(cy - LONG / 2.0), "bh": LONG, "busy": False,
+                "ww": THIN}   # ww=当前露出的厚度, _peer_tick 的"保持展开"判据要用
+
+        def _draw(ww):
+            """按当前厚度 ww 重画恢复条: 底 + 内缘亮线 + 三根刻度 + 箭头。"""
+            cv.delete("all")
+            if horiz:
+                cv.config(width=LONG, height=ww)
+                cv.create_rectangle(0, 0, LONG, ww,
+                                    fill=_hex_mix(C["accent"], "#000000", 0.28),
+                                    outline="")
+                # 朝向屏幕内侧的那条亮边 —— 让 4px 细条也有一点"科技感", 不是一根纯色胶带
+                iy = ww - 1 if edge == "top" else 0
+                cv.create_line(0, iy, LONG, iy, fill=C["accent"], width=1)
+                if ww >= 8:
+                    for k in (0.24, 0.5, 0.76):
+                        xx = int(LONG * k)
+                        cv.create_line(xx, 2, xx, ww - 3,
+                                       fill=_hex_mix(C["accent"], "#ffffff", 0.45), width=1)
+                if ww >= 12:
+                    cv.create_text(LONG // 2, ww // 2,
+                                   text="︿" if edge == "top" else "﹀",
+                                   fill="#ffffff", font=(_FONT, 8, "bold"))
+            else:
+                cv.config(width=ww, height=LONG)
+                cv.create_rectangle(0, 0, ww, LONG,
+                                    fill=_hex_mix(C["accent"], "#000000", 0.28),
+                                    outline="")
+                ix = ww - 1 if edge == "left" else 0
+                cv.create_line(ix, 0, ix, LONG, fill=C["accent"], width=1)
+                if ww >= 8:
+                    for k in (0.24, 0.5, 0.76):
+                        yy = int(LONG * k)
+                        cv.create_line(2, yy, ww - 3, yy,
+                                       fill=_hex_mix(C["accent"], "#ffffff", 0.45), width=1)
+                if ww >= 12:
+                    cv.create_text(ww // 2, LONG // 2, text="‹" if edge == "left" else "›",
+                                   fill="#ffffff", font=(_FONT, 8, "bold"))
+
+        def _place(ww):
+            """按当前厚度 ww 摆窗口(贴边 + 长边居中对齐球心)并重画。"""
+            peer["ww"] = ww
+            if horiz:
+                py = 0 if edge == "top" else (root.winfo_screenheight() - ww)
+                p.geometry("%dx%d+%d+%d" % (LONG, ww, int(cx - LONG / 2.0), py))
+            else:
+                px = 0 if edge == "left" else (root.winfo_screenwidth() - ww)
+                p.geometry("%dx%d+%d+%d" % (ww, LONG, px, int(cy - LONG / 2.0)))
+            _draw(ww)
+            p.update_idletasks()
+
+        _place(THIN)   # 初始 4px 细条
+
+        def _resize(tw):
+            for i in range(1, 6):
+                _place(int(THIN + (tw - THIN) * _ease(i / 5.0)))
+                time.sleep(0.012)
+
+        THICK = int(15 * scale)
+
+        def _expand_peer():
+            if peer["busy"] or peer["open"]:
+                return
+            peer["busy"] = True
+            try:
+                _resize(THICK)
+                peer["open"] = True
+            finally:
+                peer["busy"] = False
+
+        def _shrink_peer():
+            if peer["busy"] or not peer["open"]:
+                return
+            peer["busy"] = True
+            try:
+                for i in range(4, -1, -1):
+                    _place(int(THIN + (THICK - THIN) * _ease(i / 5.0)))
+                    time.sleep(0.012)
+                peer["open"] = False
+            finally:
+                peer["busy"] = False
+
+        def _peer_tick():
+            if not st["hidden"]:
+                return
+            # 指针贴近屏幕边缘那条 4px → 展开恢复条给个明确的"看得见"的抓手; 移开 → 缩回细线。
+            # **缩回这一半原来漏了**: 展开后 peer["open"] 为真, 判据写成了
+            # `if not peer["open"] and st["hidden"]` —— 一展开就短路, _shrink_peer 再没人调用,
+            # 条子只要变宽一次就永远宽着(用户报的"移走之后没有恢复成窄条")。
+            px_, py_ = root.winfo_pointerxy()
+            sw_, sh_ = root.winfo_screenwidth(), root.winfo_screenheight()
+            # 保持判据比展开判据宽一截(滞后): 条展开到 22px 后, 指针往里挪到十几 px 处明明
+            # 还压在条上, 判据仍是"离屏缘<=6"的话条会立刻缩回, 用户根本点不到它。
+            reach = 6 if not peer["open"] else peer["ww"] + 8
+            if horiz:
+                near = ((py_ <= reach) if edge == "top" else (py_ >= sh_ - reach)) \
+                    and (cx - LONG / 2 - 10) <= px_ < (cx + LONG / 2 + 10)
+            else:
+                near = ((px_ <= reach) if edge == "left" else (px_ >= sw_ - reach)) \
+                    and (cy - LONG / 2 - 10) <= py_ < (cy + LONG / 2 + 10)
+            if near:
+                if not peer["open"]:
+                    _expand_peer()
+            elif peer["open"]:
+                _shrink_peer()
+            p.after(160, _peer_tick)
+        p.after(200, _peer_tick)
+        cv.bind("<Button-1>", lambda e: show_ball())
+        cv.config(cursor="hand2")
+        st["peer"] = p
+
+    def _peer_hide():
+        w = st.get("peer")
+        st["peer"] = None
+        if w is not None:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+    def show_ball(_e=None, notify=True):
+        """从屏幕边缘把球拉回来(恢复条还在时点它也能回来)。"""
+        if not st["hidden"]:
+            return
+        _peer_hide()
+        C.update(_ball_theme(port))
+        draw_ball()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        x, y = root.winfo_x(), root.winfo_y()
+        edge = st.get("edge", "right")
+        # 恢复落点跟启动默认位保持一致(球体离右缘 96px, 不贴边): 贴到最右缘那条会被
+        # 任务栏通知区/置顶小窗盖住, 用户刚把球拉回来就"又找不到了"。
+        # 左/上缘没有这个问题, 让球体边落在 24px 处; 下缘要避开任务栏, 同样收 96px。
+        if edge == "left":
+            tx, ty = int(24 - PAD), max(int(-PAD), min(y, int(sh - BALL + PAD)))
+        elif edge == "right":
+            tx, ty = _ball_win(sw), max(int(-PAD), min(y, int(sh - BALL + PAD)))
+        elif edge == "top":
+            tx, ty = max(int(-PAD), min(x, int(sw - BALL + PAD))), int(24 - PAD)
+        else:   # bottom: 球体底缘落在离屏幕底 96px, 避开任务栏
+            tx, ty = max(int(-PAD), min(x, int(sw - BALL + PAD))), int(sh - 96 - BALL + PAD)
+        # 窗口尺寸全程不变, 只挪 x/y —— 窗口比球大一圈, 缩宽度会把球裁掉(见 hide_ball)
+        _anim([(BALL, BALL, int(x + (tx - x) * _ease(i / 6.0)),
+                int(y + (ty - y) * _ease(i / 6.0))) for i in range(1, 7)])
+        _geo(BALL, BALL, tx, ty)   # 收尾帧: 走 _geo 确保落地
+        st["hidden"] = False
+        save_pos(tx, ty)
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+
+    hide_btn.bind("<Button-1>", lambda e: hide_ball())
+
+    # ---------------- 开合只认点击(悬停自动展开已移除) ----------------
+    # 用户明确要求: 鼠标停在球上**不许**自动打开面板, 必须点球才开。原来这里有一整套轮询
+    # 指针位置的展开/收起逻辑(悬停 0.35s 自动展开、离开 1.2s 自动收起, 面板抽屉里还有个开关),
+    # 已整体删除 —— 拖着球松手时指针正好停在球心, 面板会在 0.35 秒后自己弹出来, 既像
+    # "球没点就开了", 也让"贴边隐藏"变难(手一停就展开)。现在:
+    #   展开 = 单击球(on_release 里 not moved 且按下<0.8s) / 右键菜单「打开 AI 助手」
+    #   收起 = 面板头部「─ 收起」/ 右键菜单「收起为悬浮球」
+    #   隐藏 = 拖到屏幕边缘松手 / 面板头部「✕ 隐藏」/ 右键菜单; 恢复 = 点屏幕缘的恢复条
+    # 悬停只保留**视觉**反馈(球体提亮 + 外圈弧, 见 poll 里的 _ptr_on_ball)。
+    # 注意: 这套逻辑被删干净了 —— 源码里不应再出现它的名字(回归闸在 test_smoke 里),
+    # 所以后面所有注释也只用中文描述, 不再写那些标识符。
+
+
     # ---------------- 拖拽(球面与面板头部通用) ----------------
     def on_press(e):
         st.update(down=True, moved=False, ox=e.x_root, oy=e.y_root,
                   wx=root.winfo_x(), wy=root.winfo_y(), t0=time.time())
+        if st["view"] == "ball":
+            st["drag"] = True   # 皮肤换成"拖拽中"(见 _ball_skin_state)
 
     def on_move(e):
         if not st["down"]:
             return
         if abs(e.x_root - st["ox"]) + abs(e.y_root - st["oy"]) > 5:
             st["moved"] = True
-        nx = max(0, min(st["wx"] + e.x_root - st["ox"],
-                        root.winfo_screenwidth() - root.winfo_width()))
-        ny = max(0, min(st["wy"] + e.y_root - st["oy"],
-                        root.winfo_screenheight() - root.winfo_height()))
+        # 钳制按**球体**算: 窗口比球大一圈透明边距, 用窗口宽钳会让球永远够不到屏幕边,
+        # 「拖到边上松手 = 收起」就废了。允许窗口越出屏幕 PAD 像素, 正好让球体贴到边。
+        nx = max(int(-PAD), min(st["wx"] + e.x_root - st["ox"],
+                                int(root.winfo_screenwidth() - BALL + PAD)))
+        ny = max(int(-PAD), min(st["wy"] + e.y_root - st["oy"],
+                                int(root.winfo_screenheight() - BALL + PAD)))
         root.geometry("+%d+%d" % (nx, ny))
+        root.update_idletasks()
 
     def on_release(_e):
         if not st["down"]:
             return
         st["down"] = False
-        save_pos(root.winfo_x(), root.winfo_y())
+        st["drag"] = False
+        if not st["hidden"]:
+            # 收边态的窗口坐标在屏外, 存下来没有意义(只会让下次启动白走一遍贴边纠正)。
+            # 恢复/拖出来之后各有自己的落点写入(见下面两个分支)。
+            save_pos(root.winfo_x(), root.winfo_y())
+        # 拖到屏幕最边上松手 = 想收起来(与大多数贴边工具一致), 自动隐藏。
+        # 判据同样是球体边缘而不是窗口边缘, 且**四缘都判**: 上下缘漏判是最早的回归 ——
+        # 拖到上/下缘松手, 球就完整停在那儿, 因为没有任何一条分支认得这两个方向。
+        # 取离得最近的那条边, 贴上了(<=1px)就往那个方向收。
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        near = min((root.winfo_x() + PAD, "left"),
+                   (sw - root.winfo_x() - BALL + PAD, "right"),
+                   (root.winfo_y() + PAD, "top"),
+                   (sh - root.winfo_y() - BALL + PAD, "bottom"))
+        if st["hidden"] and not st["moved"]:
+            # 收边态下点到球体 = "把它拉回来", 而不是在**屏幕外**原地展开面板。
+            # 原来这里会直接走下面的单击展开: 面板在屏外摆开、hidden 还是 True ——
+            # 恢复条继续挂着, 球却已经不在那条边上了, 状态自相矛盾。
+            show_ball()
+            return
+        if st["hidden"]:
+            # 从收边态把球**拖**了出来: 先解除隐藏(撤掉恢复条), 再按正常拖拽结算 ——
+            # 拖到中间就是"拿出来放这儿", 又拖到缘上松手则下面那条会再把它收进去。
+            st["hidden"] = False
+            _peer_hide()
+            save_pos(root.winfo_x(), root.winfo_y())
+        if st["view"] == "ball" and st["moved"] and near[0] <= 1:
+            st["edge"] = near[1]
+            hide_ball()
+            return
         if st["view"] == "ball" and not st["moved"] and time.time() - st["t0"] < 0.8:
-            expand()   # 原地快速松手 = 单击 → 展开成对话面板
+            expand()   # 原地快速松手 = 单击 → 展开成对话面板(悬停不会展开, 只有点它才开)
 
-    def on_right(e):
+    def recall_ball():
+        """把球拉回屏幕右侧一个明确可见的位置 —— 「我找不到球了」的兜底入口。
+        不做动画、不离开屏幕, 就是稳稳放到右侧中间偏上(球体离右缘 96px, 避开任务栏通知区),
+        然后置顶闪一下。用户点设置栏的「找不到球？点这里定位」或右键菜单走的就是这里:
+        前端 -> GET /api/ball_recall_go(服务端计数 +1) -> 球的**心跳**打
+        /api/ball_recall 读到计数变了 -> 调本函数。"""
+        if st["hidden"]:
+            show_ball()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        tx = _ball_win(sw)
+        ty = _ball_top(sh)
+        if st["view"] == "panel":
+            collapse()
+            root.update_idletasks()
+        # 必须走 _geo: 光调 root.geometry 在这类分层窗口上不落地(见 _geo 的注释),
+        # 表现就是"提示说球移回来了, 球却还在原地"。
+        _geo(BALL, BALL, tx, ty)
+        save_pos(tx, ty)
+        try:
+            root.attributes("-topmost", True)
+            root.lift()
+        except Exception:
+            pass
+        draw_ball()
+        st["unread"] = False
+        # 闪三下: 整颗球亮度抬起来 + 沿轮廓闪一圈亮边(比以前画个八边形准确得多, 因为现在
+        # 的轮廓是实心体投影出来的凸包, 贴着球体走)。闪的是球自己, 不再另画"球外的一圈"。
+        flash = {"n": 0}
+
+        def _tick():
+            if flash["n"] >= 6:
+                st["flash"] = 0.0
+                draw_ball_fx()
+                return
+            st["flash"] = 0.55 if flash["n"] % 2 == 0 else 0.0
+            draw_ball_fx()
+            flash["n"] += 1
+            root.after(180, _tick)
+        _tick()
+
+    def on_right(e=None, at=None):
+        """右键菜单。at=(x,y) 给虚拟输入层用(那条路径没有 Tk 事件)。"""
         menu = tk.Menu(root, tearoff=0)
         if st["view"] == "ball":
             menu.add_command(label="打开 AI 助手", command=expand)
         else:
             menu.add_command(label="收起为悬浮球", command=collapse)
+        menu.add_command(label="定位悬浮球（拉回屏幕右侧）", command=recall_ball)
+        menu.add_command(label="隐藏悬浮球（收进屏幕边缘）", command=hide_ball)
         menu.add_separator()
         menu.add_command(label="退出悬浮球", command=root.destroy)
         try:
-            menu.tk_popup(e.x_root, e.y_root)
+            menu.tk_popup(at[0] if at else e.x_root, at[1] if at else e.y_root)
         finally:
             menu.grab_release()
 
-    for w in (ballcv, header, dot, title):
+    def _hoverable(w, base="card", hover_key="accent"):
+        """给头部按钮加悬停反馈: 指针进入时底色转强调色、字变白, 离开还原。
+        tkinter 的 Label 没有 :hover, 只能自己绑 Enter/Leave。"""
+        def _in(_e=None):
+            w.config(bg=C[hover_key], fg="#ffffff")
+        def _out(_e=None):
+            w.config(bg=C[base], fg=C["sub"])
+        w.bind("<Enter>", _in)
+        w.bind("<Leave>", _out)
+
+    for w in (header, dot, title):
         w.bind("<Button-1>", on_press)
         w.bind("<B1-Motion>", on_move)
         w.bind("<ButtonRelease-1>", on_release)
         w.bind("<Button-3>", on_right)
+    for _w in (collapse_btn, prefs_btn, new_btn):
+        _hoverable(_w)
+    _hoverable(hide_btn)
+    # 球的悬停提亮改由 poll 里的**圆形**指针测试驱动(见 _ptr_on_ball), 不再用 <Enter>/<Leave>:
+    # 窗口比球体大一圈, 而且外发光是抖动画的(只有一部分像素不透明), 指针扫过光晕时
+    # Enter/Leave 会随抖动的点疯狂触发, 亮一下灭一下。轮询 90ms 一次反而稳。
+    # 球面**不绑 Tk 鼠标事件**: 键控窗里只有画了东西的像素能收到消息(圆内 15.6%), 绑了也是
+    # "偶尔生效"; 而且虚拟输入层同时在拖拽, 两条路径叠加会让球以两倍速度跑。球面交互一律走
+    # virtual_input(); 面板头部是实心窗, 绑定照旧(见上面 header 那几个 bind)。
     ballcv.config(cursor="hand2")
+
+    def _ptr_on_ball(pad=0):
+        """指针是否贴在球体上(按圆判, 半径含全息环阵)。"""
+        try:
+            px, py = root.winfo_pointerxy()
+        except Exception:
+            return False
+        cx = root.winfo_x() + BALL / 2.0
+        cy = root.winfo_y() + BALL / 2.0
+        rr = HIT_R + pad   # 与输入层的命中圆同一个半径: 看到"球亮了"的地方就一定能点到
+        return (px - cx) ** 2 + (py - cy) ** 2 <= rr * rr
 
     # ---------------- 初始位置 / 心跳 / 主循环 ----------------
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-    x, y = sw - BALL - 24, int(sh * 0.3)   # 默认停在主屏右侧中上部
+    # 默认停在**右侧中间偏上**, 不要贴到最右缘: 最右缘正好是任务栏通知区/收起图标那一带,
+    # 球贴在那儿很容易被别的置顶窗口或任务栏弹出面板盖住, 用户就"找不到球"。
+    # 留出 96px 边距, 让球落在空白桌面上, 一眼就能看见。
+    x, y = _ball_win(sw), _ball_top(sh)
     try:
         with open(_ball_pos_path(), encoding="utf-8") as f:
             pos = json.load(f)
         x, y = int(pos.get("x", x)), int(pos.get("y", y))
     except Exception:
         pass
-    x, y = max(0, min(x, sw - BALL)), max(0, min(y, sh - BALL))
-    root.geometry("%dx%d+%d+%d" % (BALL, BALL, x, y))
+    x, y = max(int(-PAD), min(x, int(sw - BALL + PAD))), \
+        max(int(-PAD), min(y, int(sh - BALL + PAD)))
+    # 位置文件是在**另一个会话/另一种屏幕布局**下写的时, 存下来的坐标可能落在当前屏幕之外,
+    # 或贴着边缘(换显示器、拔掉外接屏、改缩放都会这样)。贴着右缘/上缘的球会被任务栏通知区、
+    # 聊天软件贴边条、各种置顶小窗盖住 —— 用户就"找不到球"。所以只要贴边就主动往里挪。
+    #
+    # 判据分两档, 覆盖「越界」「贴边」和「越界后钳制恰好落回边缘」三种情况:
+    #   a) 越界(x/y 超出屏幕) → 钳制之后一定紧贴边缘, 于是也满足下面的贴边判据;
+    #   b) 贴边(离右缘不足一个球宽 / 顶上不足一个球高) → 挪到舒适位置。
+    # 注意 y 要单独看「球顶离屏幕上缘」: y=4 这种几乎是贴着屏幕最上沿的, 会被顶部的
+    # 各种悬浮工具条压住, 也该挪下来(实测用户上一次存的正是 (1967, 4))。
+    #
+    # 判据一律按**球体本身**算, 不按窗口矩形: 窗口比球体大一圈透明边距, 拿窗口判会把
+    # "球离边缘还有大半个球"也算成贴边, 球就会莫名其妙被挪走。
+    off_right = (x + BALL - PAD) > sw - RB * 2   # 球体右缘已进右侧一球宽的带子
+    off_top = (y + PAD) < RB                     # 球体上缘离屏幕上沿不足一个球半径
+    if off_right:
+        x = _ball_win(sw)
+    if off_top:
+        y = _ball_top(sh)
+    _geo(BALL, BALL, x, y)   # 启动落点: 走 _geo 确保落地
+    # 画第一帧。**这一步原来漏了**: 画布底色是透明键色, 不画就等于什么都没有, 于是球起来
+    # 之后在桌面上完全看不见 —— 直到用户碰巧展开一次再收起(走 apply_palette → draw_ball)
+    # 或点「定位悬浮球」才第一次显形。用户报的「我找不到悬浮球啊, 是不是默认隐藏了」
+    # 根子就在这: 不是隐藏, 是根本没画。
+    draw_ball()
     try:   # 把自身 pid 写进位置文件: 主程序下次启动按它清理孤儿球(本次启动即写, 不等拖动)
         with open(_ball_pos_path(), "w", encoding="utf-8") as f:
             json.dump({"x": int(x), "y": int(y), "pid": os.getpid()}, f)
     except Exception:
         pass
 
-    # 心跳: 服务重启/退出后自动销毁(连续 2 次探活失败即退, 防孤儿悬浮球)
+    # 心跳: 服务重启/退出后自动销毁(连续 2 次探活失败即退, 防孤儿悬浮球);
+    # 顺带取「定位悬浮球」信号 —— 用户在主界面点按钮时, 球可能正躲在屏幕边缘或某个
+    # 想不起来的地方, 这一趟心跳就是把它叫回来的通道。
     misses = [0]
+    recall_seen = [None]   # None = 还没跟服务端对齐过基线(见下)
 
     def heartbeat():
         try:
-            with urllib.request.urlopen("http://127.0.0.1:%d/api/ui_version" % port,
+            with local_open("http://127.0.0.1:%d/api/ball_recall" % port,
                                         timeout=2) as r:
                 ok = r.status == 200
+                # 计数必须从**响应体**里读: 球是独立进程, 自己这边的 _BALL_RECALL 恒为 0,
+                # 拿它去比就永远得不出「有新信号」(前端点了按钮球却不动, 就是这里踩的坑)。
+                try:
+                    cur = int(json.loads(r.read().decode("utf-8")).get("n", 0))
+                except Exception:
+                    cur = recall_seen[0]
+                if recall_seen[0] is None:
+                    # 首轮只对齐基线不动作: 球刚起来时本来就在可见位置,
+                    # 而且服务端的 n 可能已经攒了好几次点击, 不校准的话会凭空闪一下。
+                    recall_seen[0] = cur
+                elif cur != recall_seen[0]:
+                    recall_seen[0] = cur
+                    try:
+                        recall_ball()
+                    except Exception:
+                        pass
+                    # 回执: 让主界面能确定「球真的响应了」, 而不是只显示一句
+                    # 「已发送请求」让用户去猜。失败也无所谓, 前端会等到超时并如实提示。
+                    try:
+                        local_open(
+                            "http://127.0.0.1:%d/api/ball_recall_ack?n=%d" % (port, cur),
+                            timeout=2).read()
+                    except Exception:
+                        pass
         except Exception:
             ok = False
         if ok:
             misses[0] = 0
         else:
             misses[0] += 1
-            if misses[0] >= 2:
+            if misses[0] >= 2:   # 连续两轮探活失败(最坏约5秒): 服务没了, 收球
                 root.destroy()
                 return
-        root.after(4000, heartbeat)
-    root.after(2000, heartbeat)
+        root.after(2500, heartbeat)
+    root.after(1500, heartbeat)
     poll()
+    ball_anim()
     if "--ball-autoclose" in sys.argv:   # 测试钩子: N 毫秒后自动关闭(验证能正常建窗)
         try:
             root.after(int(sys.argv[sys.argv.index("--ball-autoclose") + 1]), root.destroy)
@@ -9380,12 +12426,136 @@ def run_float_ball(port):
             root.after(int(sys.argv[sys.argv.index("--ball-autoexpand") + 1]), expand)
         except (ValueError, IndexError):
             pass
+    if "--ball-panel" in sys.argv:   # 测试钩子: 打开收藏夹/人设窗口(验证渲染不报错)
+        try:
+            _which = sys.argv[sys.argv.index("--ball-panel") + 1]
+        except IndexError:
+            _which = "saved"
+
+        def _open_panel():
+            expand()
+            (show_saved if _which == "saved" else show_personas)()
+        root.after(1200, _open_panel)
+    if "--ball-autohide" in sys.argv:   # 测试钩子: N 毫秒后隐藏再显示(验证收边动效与恢复条)
+        try:
+            _d = int(sys.argv[sys.argv.index("--ball-autohide") + 1])
+        except (ValueError, IndexError):
+            _d = 800
+
+        def _hide_show():
+            hide_ball()
+            root.after(max(300, _d), show_ball)
+        root.after(_d, _hide_show)
+    if "--ball-recall" in sys.argv:   # 测试钩子: N 毫秒后执行「定位悬浮球」
+        try:
+            _d = int(sys.argv[sys.argv.index("--ball-recall") + 1])
+        except (ValueError, IndexError):
+            _d = 800
+        root.after(_d, recall_ball)
+    if "--ball-solid" in sys.argv:   # 测试钩子: 切换实心体(ico=正20面体 / dode=正12面体, 与 shader 同形)
+        try:
+            _s = sys.argv[sys.argv.index("--ball-solid") + 1]
+        except IndexError:
+            _s = "ico"
+        if _s in ("ico", "dode", "trunc"):
+            globals()["_BALL_SOLID"] = _s
+    def _fake_center():
+        return root.winfo_x() + BALL // 2, root.winfo_y() + BALL // 2
+
+    if "--ball-fake-click" in sys.argv:
+        # 测试钩子: N 毫秒后注入"球心按下 → 0.18s 后抬起", 走虚拟输入层同一条状态机。
+        # 用户明确要求别动他的鼠标(他在打游戏), 所以这条自测路径全程只改软件状态。
+        try:
+            _fc = int(sys.argv[sys.argv.index("--ball-fake-click") + 1])
+        except (ValueError, IndexError):
+            _fc = 3000
+
+        def _arm_click():
+            cx, cy = _fake_center()
+            fake["seq"] = [(0.0, cx, cy, 1, 0), (0.18, cx, cy, 0, 0)]
+            fake["t0"] = time.time()
+        root.after(_fc, _arm_click)
+    if "--ball-fake-drag" in sys.argv:
+        # 测试钩子: N 毫秒后注入"球心按下 → 拖到屏幕右缘 → 松手", 验证**拖拽 + 贴边收起**
+        # 这条最容易出错的路径(同样不碰真实鼠标)。
+        try:
+            _fd = int(sys.argv[sys.argv.index("--ball-fake-drag") + 1])
+        except (ValueError, IndexError):
+            _fd = 3000
+
+        def _arm_drag():
+            cx, cy = _fake_center()
+            tx = root.winfo_screenwidth() - 2
+            fake["seq"] = [(0.0, cx, cy, 1, 0), (0.25, tx, cy, 1, 0), (0.5, tx, cy, 0, 0)]
+            fake["t0"] = time.time()
+        root.after(_fd, _arm_drag)
+    if "--ball-core" in sys.argv:   # 预览钩子: 换中心徽记(diamond/ripple/reticle/none)
+        try:
+            _c = sys.argv[sys.argv.index("--ball-core") + 1]
+        except IndexError:
+            _c = "diamond"
+        if _c in ("diamond", "ripple", "reticle", "none"):
+            globals()["_BALL_CORE"] = _c
+    if "--ball-skin-demo" in sys.argv:   # 测试钩子: 循环切换球体皮肤(验证四种状态渲染)
+        _SEQ = ["idle", "hover", "busy", "unread", "drag"]
+
+        def _skin_demo(i=0):
+            if i >= len(_SEQ) * 2:
+                return
+            _k = _SEQ[i % len(_SEQ)]
+            st["hover"] = (_k == "hover")
+            st["drag"] = (_k == "drag")
+            st["unread"] = (_k == "unread")
+            st["skin_force"] = _k   # 直接钉住状态, 绕开 sending["on"] 这类外部条件
+            sync_skin()
+            root.after(1500, lambda: _skin_demo(i + 1))
+        root.after(900, _skin_demo)
+    if "--ball-demo" in sys.argv:   # 测试钩子: N 毫秒后灌一版假的三段式结果(验证逐段渲染)
+        def _demo():
+            expand()
+            user_bubble("喝可乐能杀灭蛔虫，这是老偏方了", "回怼")
+            holder = ai_bubble()
+            holder["gen"] = gen["n"]
+            holder["src"] = "喝可乐能杀灭蛔虫，这是老偏方了"
+            for payload in (
+                {"kind": "targets", "stance_note": "证据一致否定该说法",
+                 "evidence": [{"id": "E1", "title": "驱虫药使用说明", "url": "https://www.who.int/",
+                               "cred": "权威"},
+                              {"id": "E2", "title": "可乐成分与胃内稀释",
+                               "url": "https://www.msdmanuals.com/", "cred": "可靠"}],
+                 "items": [
+                     {"point": "喝可乐能杀灭蛔虫", "kind": "知识误区", "note": "胃酸与稀释让可乐达不到杀虫浓度"},
+                     {"point": "老偏方都靠谱", "kind": "诉诸传统", "note": "流传久不等于有效"}]},
+                {"kind": "lines", "items": [
+                    {"text": "可乐要能杀蛔虫，医院早改行卖饮料了", "basis": "公开医学资料",
+                     "target": "知识误区", "evidence": ["E1"]},
+                    {"text": "拿老偏方当论据，这思路我服", "basis": "公开资料",
+                     "target": "诉诸传统", "evidence": []}]},
+                {"kind": "paras", "items": [
+                    {"text": "我拿公开资料跟你说话：可乐进胃就被胃酸和食物稀释，"
+                             "根本到不了能杀虫的浓度，把这当偏方就是拿感觉代替剂量。",
+                     "basis": "公开医学资料", "target": "知识误区", "evidence": ["E2"]}]},
+                {"kind": "long", "items": [
+                    {"text": "你这两条我都拆了：杀虫要靠剂量，可乐在胃里被稀释得剩不下什么，"
+                             "拿老偏方压人更是把流传当成证据。要真有这效果，驱虫药早该停产了。",
+                     "basis": "公开医学资料", "target": "整体反驳", "evidence": ["E1", "E2"]}]},
+            ):
+                seg_append(holder, payload)
+                root.update_idletasks()
+                time.sleep(0.25)
+            rebut_tail(holder, {"offline": False}, [
+                {"title": "驱虫药使用说明", "url": "https://www.who.int/", "cred_label": "权威",
+                 "site": "www.who.int"}])
+        try:
+            root.after(int(sys.argv[sys.argv.index("--ball-demo") + 1]), _demo)
+        except (ValueError, IndexError):
+            pass
     root.mainloop()
 
 
 def port_busy(port):
     try:
-        with urllib.request.urlopen("http://127.0.0.1:%d/api/feed" % port, timeout=1.5) as r:
+        with local_open("http://127.0.0.1:%d/api/feed" % port, timeout=1.5) as r:
             return r.status == 200
     except Exception:
         return False
@@ -9430,7 +12600,7 @@ if __name__ == "__main__":
         print("端口 8000/8010/8020 均被占用, 无法启动")
         sys.exit(1)
     _SERVER = server
-    print("洞鉴虚明 v0.2.8.0a 已启动: http://127.0.0.1:%d" % port)
+    print("洞鉴虚明 v0.2.8.5a 已启动: http://127.0.0.1:%d" % port)
     print("按 Ctrl+C 停止服务")
     if os.name == "nt":
         _kill_stale_ball()   # 上次异常退出遗留的孤儿悬浮球(正常退出已被租约收走)

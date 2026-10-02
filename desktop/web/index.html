@@ -55,6 +55,7 @@
           </div>
           <label>预览放大（悬停封面播放时的画面倍率）</label>
           <div class="row" id="pvRow">
+            <button data-v="1" class="seg">×1（不放大）</button>
             <button data-v="1.5" class="seg">×1.5</button>
             <button data-v="2" class="seg on">×2（默认）</button>
             <button data-v="3" class="seg">×3</button>
@@ -119,6 +120,24 @@
       </details>
 
       <details open>
+        <summary>AI 悬浮窗（仅电脑版）</summary>
+        <div class="sec" id="floatBallSec">
+          <div class="fb-box">
+            <div class="ai-mode-head"><b>屏幕悬浮球</b>
+              <span class="tip-inline">（悬浮在屏幕上的小球，单击展开 AI 助手：验证真实性 / 生成回怼。
+                面板右上「✕ 隐藏」可把小球收进屏幕边缘，靠边那条细线点一下就回来；
+                拖动小球贴到屏幕边缘松手也是隐藏。右键小球另有菜单）</span></div>
+            <div class="fb-acts">
+              <button id="floatBallToggle" class="ai-mode-btn off">开启悬浮窗</button>
+              <button id="floatBallFind" class="ai-mode-btn">找不到球？点这里定位</button>
+            </div>
+            <p class="tip" id="floatBallState">状态：未开启</p>
+          </div>
+          <p class="tip">对话窗口需先在「AI 配置」里填好 API Key。仅 Windows 电脑版可用。</p>
+        </div>
+      </details>
+
+      <details open>
         <summary>偏好备注（告诉AI你爱看什么）</summary>
         <div class="sec">
           <textarea id="prefsNote" rows="4" placeholder="例：喜欢独立游戏和数码评测，讨厌流量明星八卦，多推技术向内容…"></textarea>
@@ -166,7 +185,7 @@
         </div>
       </details>
 
-      <footer>洞鉴虚明 v0.2.7.0b<br>数据只存本机</footer>
+      <footer>洞鉴虚明 v0.2.8.5a<br>数据只存本机</footer>
     </div>
   </aside>
 
@@ -410,6 +429,7 @@
           <div class="m-row"><span>剔除时长超过</span><input type="number" id="mMaxDur" class="small" min="0" step="1"><span>分钟的内容（0=关闭；仅有真实时长的信息生效）</span></div>
           <div class="m-row"><span>剔除时长低于</span><input type="number" id="mMinDur" class="small" min="0" step="1"><span>分钟的内容（默认1）</span></div>
           <div class="m-row"><span>只显示最近</span><input type="number" id="mMaxAge" class="small" min="0" step="1"><span>个月内发布的信息（默认5，0=不限）</span></div>
+          <p class="tip">偏好备注里的主题同样受这个时间窗限制：标准/严格档位完全一致（绝不会刷出更早的内容），宽松档位给偏好多留 6 个月。偏好内容每次随机抽取主题与翻页，不会反复推同一批。</p>
           <div class="m-row"><span>严肃模式只显示最近</span><input type="number" id="mSerMaxAge" class="small" min="0" step="1"><span>个月内发布的信息（默认30，0=不限）</span></div>
           <div class="m-row"><span>已看信息</span><input type="number" id="mSeenHours" class="small" min="0" step="1"><span>小时内不重复出现（默认6，0=不限）</span></div>
           <div class="m-row"><span>启动预缓存</span>

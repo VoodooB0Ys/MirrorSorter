@@ -1,4 +1,4 @@
-/* 洞鉴虚明 v0.2.8.0a - 前端逻辑 */
+/* 洞鉴虚明 v0.2.8.0b - 前端逻辑 */
 "use strict";
 
 const $ = (s) => document.querySelector(s);
@@ -249,9 +249,10 @@ function applyView() {
   document.querySelectorAll("#reasonRow .seg").forEach((b) =>
     b.classList.toggle("on", b.dataset.reason === reason));
 }
+const PV_ZOOMS = [1, 1.5, 2, 3, 4];   // 1 = 原位不放大(只看不动), 其余为放大倍率
 function pvZoom() {
   const v = parseFloat(localStorage.getItem("pv_zoom")) || 2;
-  return (v === 1.5 || v === 2 || v === 3 || v === 4) ? v : 2;
+  return PV_ZOOMS.includes(v) ? v : 2;
 }
 function applyPvZoom() {
   document.documentElement.style.setProperty("--pv-zoom", String(pvZoom()));
@@ -567,18 +568,30 @@ async function startPreview(tw) {
   stopPreview();
   const rect = tw.getBoundingClientRect();
   const zoom = pvZoom();
+  // ×1 = 原位播放: 浮层就是封面本身那么大, 贴回卡片原位即可, 不做任何位移
   const ovW = Math.round(rect.width * zoom);
   const ovH = Math.round(rect.height * zoom);
-  // 统一中心锚点: 预览以封面中心对称放大(中列视觉=原位, 不朝任何方向飘),
-  // 越出信息流左右边界的方向被钳回(左列贴左缘/最后一列整体左移, 不压设置栏与右侧面板)。
   const feed = document.getElementById("feedList");
   const feedRect = feed.getBoundingClientRect();
-  let left = Math.round(rect.left + rect.width / 2 - ovW / 2);   // 中心锚点
-  left = Math.max(feedRect.left, Math.min(left, Math.round(feedRect.left + feedRect.width - ovW)));   // 左右都不出信息流边界
+  let left, top;
+  if (zoom === 1) {
+    left = Math.round(rect.left);
+    top = Math.round(rect.top);
+  } else {
+    // 统一中心锚点: 预览以封面中心对称放大(中列视觉=原位, 不朝任何方向飘),
+    // 越出信息流左右边界的方向被钳回(左列贴左缘/最后一列整体左移, 不压设置栏与右侧面板)。
+    left = Math.round(rect.left + rect.width / 2 - ovW / 2);   // 中心锚点
+    // 窗口窄时高倍率会算得比信息流还宽, 此时夹取会退化成"永远贴左缘"。
+    // 这种情况按信息流居中放, 至少视觉上是平衡的(两侧对称溢出), 比死贴一边好看。
+    left = (ovW >= feedRect.width)
+      ? Math.round(feedRect.left + (feedRect.width - ovW) / 2)
+      : Math.max(feedRect.left, Math.min(left, Math.round(feedRect.left + feedRect.width - ovW)));
+    top = Math.round(rect.top);
+  }
   const ov = document.createElement("div");
-  ov.className = "pv-overlay";
+  ov.className = "pv-overlay" + (zoom === 1 ? " pv-flat" : "");
   ov.style.left = left + "px";
-  ov.style.top = Math.round(rect.top) + "px";
+  ov.style.top = top + "px";
   ov.style.width = ovW + "px";
   ov.style.height = ovH + "px";
   const img = tw.querySelector("img");
@@ -1455,15 +1468,21 @@ function applyAiMainBtn(on) {
     : "状态：已关闭（不消耗 token）";
 }
 /* ---------- AI 悬浮窗(仅电脑版): 设置开关 + 状态 ---------- */
-function applyFloatBallBtn(enabled, running, supported) {
+function applyFloatBallBtn(enabled, running, supported, reason, hint) {
   const btn = $("#floatBallToggle"), st = $("#floatBallState");
   if (!btn) return;
   btn.textContent = enabled ? "已开启 · 点击关闭" : "开启悬浮窗";
   btn.classList.toggle("off", !enabled);
-  st.textContent = !supported ? "状态：当前环境不支持（仅 Windows 电脑版可用）"
-    : enabled ? (running ? "状态：悬浮球运行中 · 单击小球打开 AI 助手，右键小球退出"
-                          : "状态：已开启但悬浮球未运行（重启应用后自动出现）")
-    : "状态：未开启";
+  if (!supported) {
+    // 说清到底缺什么, 别只丢一句"环境不支持"
+    st.textContent = "状态：本机无法显示悬浮球 —— " + (reason || "当前环境不支持")
+      + (hint ? "\n处理办法：" + hint : "");
+  } else {
+    st.textContent = enabled
+      ? (running ? "状态：悬浮球运行中 · 单击小球打开 AI 助手，右键小球退出"
+                 : "状态：已开启但悬浮球未运行（重启应用后自动出现）")
+      : "状态：未开启";
+  }
 }
 async function refreshFloatBall() {
   if (window.AndroidBridge) {   // Android 共用同一前端, 悬浮窗是桌面专属
@@ -1472,7 +1491,7 @@ async function refreshFloatBall() {
   }
   try {
     const d = await api("/api/floatball");
-    applyFloatBallBtn(d.enabled, d.running, d.supported);
+    applyFloatBallBtn(d.enabled, d.running, d.supported, d.reason, d.hint);
   } catch (_) {}
 }
 $("#floatBallToggle").onclick = async () => {
@@ -1480,19 +1499,57 @@ $("#floatBallToggle").onclick = async () => {
   const on = !btn.classList.contains("off");
   try {
     const d = await api("/api/floatball", { method: "POST", body: { enabled: !on } });
-    applyFloatBallBtn(!on, d.running, d.supported);
+    applyFloatBallBtn(!on, d.running, d.supported, d.reason, d.hint);
     if (d.supported) toast(!on ? "悬浮球已出现在屏幕上" : "悬浮窗已关闭");
+    else toast("本机无法显示悬浮球：" + (d.reason || "环境不支持"), { warn: true });
     if (!on && d.supported) {   // 拉起后复查: 进程闪退(如缺 tkinter)给出提示
       setTimeout(async () => {
         try {
           const s = await api("/api/floatball");
-          applyFloatBallBtn(s.enabled, s.running, s.supported);
-          if (s.enabled && !s.running) toast("悬浮球启动失败，请重启应用后再试", { warn: true });
+          applyFloatBallBtn(s.enabled, s.running, s.supported, s.reason, s.hint);
+          if (s.enabled && !s.running) {
+            toast(s.spawn_error || "悬浮球启动失败，请重启应用后再试", { warn: true });
+          }
         } catch (_) {}
       }, 1500);
     }
   } catch (e) {
     toast("操作失败：" + (e.message || e), { warn: true });
+  }
+};
+
+// 「找不到球？」: 悬浮球可能被拖到屏幕边缘外、被别的置顶窗口盖住、或位置记在换屏前的坐标上。
+// 点这里让球自己回到右侧醒目位置并闪三下。
+//
+// 关键: 请求「发出去」不等于球「收到了」。球是独立进程, 靠 2.5s 一次的心跳来取信号,
+// 所以这里不能一发出就报成功 —— 必须等球的回执(ack)才算数; 等不到就如实说"没响应",
+// 让用户知道该去重新开启悬浮窗, 而不是对着一个永远没反馈的按钮反复点。
+$("#floatBallFind").onclick = async () => {
+  try {
+    const d = await api("/api/floatball");
+    if (!d.supported) {
+      toast("本机无法显示悬浮球：" + (d.reason || "环境不支持"), { warn: true });
+      return;
+    }
+    if (!d.running) {
+      toast("悬浮球当前没在运行，先点「开启悬浮窗」", { warn: true });
+      return;
+    }
+    const r = await api("/api/ball_recall_go");
+    const want = (r && r.n) || 0;
+    toast("已发出定位请求，正在等悬浮球响应…");
+    // 球最坏要等一个完整心跳周期(2.5s)才会取到信号, 所以给 9×600ms ≈ 5.4s 的余量
+    for (let i = 0; i < 9; i++) {
+      await new Promise((ok) => setTimeout(ok, 600));
+      const s = await api("/api/ball_recall");
+      if ((s.ack || 0) >= want) {
+        toast("悬浮球已回到屏幕右侧（闪三下的那个就是它）");
+        return;
+      }
+    }
+    toast("悬浮球没有响应，可能已经退出了，请点「开启悬浮窗」重新拉起", { warn: true });
+  } catch (e) {
+    toast("定位失败：" + (e.message || e), { warn: true });
   }
 };
 
@@ -2492,7 +2549,10 @@ window.__nativeTiebaSaved = (ok) => {
     if (mqMobile.matches && e.target.closest(".card")) e.preventDefault();   // 长按不弹系统复制菜单
   });
   document.addEventListener("click", (e) => {
-    if (lpSuppress) { lpSuppress = false; e.stopPropagation(); e.preventDefault(); return; }
+    // 必须走 window.__lpSuppress: 这里以前写成裸标识符 lpSuppress, 而设值时写的是
+    // window.__lpSuppress, 于是这一行每次都抛 ReferenceError —— 结果是"每次点击都报错",
+    // 且长按出菜单后那次点击照样会穿透跳转。两处名字必须一致。
+    if (window.__lpSuppress) { window.__lpSuppress = false; e.stopPropagation(); e.preventDefault(); return; }
     if (!e.target.closest("#cardMenu") && !e.target.closest(".card")) closeCardMenu();
   }, true);
 

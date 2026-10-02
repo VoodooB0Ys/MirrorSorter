@@ -58,7 +58,9 @@ body {
   background:var(--input); border:1px solid var(--line); color:var(--txt);
   border-radius:6px; padding:7px 9px; font-size:13px; width:100%; }
 #railBody textarea { resize:vertical; }
-#railBody .row { display:flex; gap:8px; align-items:center; }
+/* 档位行必须能换行: 手机宽度(360~400px)装不下 5 个"预览放大"按钮, 不换行 ×4 会被直接裁掉。
+   输入框那行不用另加规则 —— 本文件下面已有 #railBody .row input { flex:1 }。 */
+#railBody .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
 #railBody input[readonly], #railBody input[readonly]:focus { opacity:.85; cursor:default; }
 .tip-inline { font-size:11px; color:var(--sub); font-weight:normal; }
 #baseToggle.small-op { align-self:flex-start; font-size:11px; padding:3px 10px; }

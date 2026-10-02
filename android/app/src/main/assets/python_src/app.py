@@ -291,6 +291,7 @@ _FUNNEL_LABELS = {
     "blocklist": "拉黑名单", "help": "求助帖", "xhh": "小黑盒筛选", "dedup": "重复标题",
     "follow_window": "关注超强调窗", "cooldown": "展示冷却", "cooldown_relaxed": "冷却不足复用", "ai_gate": "AI门禁", "kept": "最终入池",
     "pref_fetch": "偏好·搜到", "pref_kept": "偏好·入池", "pref_drop": "偏好·被拦",
+    "pref_age": "偏好·超时间窗",
     "build_full": "全量构建", "build_quick": "快速构建",
 }
 
@@ -646,25 +647,17 @@ _recent_rand = []
 _kw_cursor = 0
 _kw_page = 0
 _fetch_count = 0
-_pref_cursor = 0   # 偏好词轮换游标
-_pref_page = 0     # 偏好词翻页游标(逐轮推进, 永远只搜第1页会反复同一批视频)
+_pref_cursor = 0   # 偏好词轮换游标(严肃模式变体池仍按此轮换)
+_pref_page = 0     # 偏好词翻页计数(保留兼容, 实际取页已改为随机)
+_pref_bag = []     # 偏好词洗牌袋: 一轮内全覆盖 + 顺序随机
+_pref_page_hist = []   # 最近用过的页码(防连续命中同一页)
 _PREF_PAGE_MAX = 4 # 偏好词翻页深度(4页×30条/词, 覆盖小众主题的近期供给)
+PREF_LOOSE_BONUS_MONTHS = 6   # 宽松档: 偏好备注内容额外宽限月数(其余档位不加)
 
 
 def pref_keywords(enabled):
-    """偏好备注 → 搜索词(逗号分词, 2-12字); 每轮取2个, 多轮刷新轮换覆盖全部偏好。"""
-    raw = sget("prefs_note") or ""
-    out = []
-    for part in re.split(r"[，,、;；\n。！？!?]+", raw):
-        p = part.strip()
-        if 2 <= len(p) <= 12:
-            out.append(p)
-    if not out:
-        return []
-    if len(out) == 1:
-        return out
-    idx = _pref_cursor % len(out)
-    return [out[idx], out[(idx + 1) % len(out)]]
+    """偏好备注 → 搜索词(逗号分词, 2-12字); 每轮取2个, 洗牌袋保证覆盖全部偏好但顺序随机。"""
+    return _pref_pick(pref_all_kws(), 2)
 
 
 def pref_all_kws():
@@ -678,14 +671,68 @@ def pref_all_kws():
     return out
 
 
-def _pref_search_terms(enabled, quick):
-    """本轮要搜的(偏好词, 页码): 完整构建取2词/快速开屏取1词(轮换游标覆盖全部偏好),
-    页码游标逐轮推进 —— 永远只搜第1页会把同一批视频翻来覆去, 被已看窗口压光后偏好就"消失"了。"""
-    prefs = pref_keywords(enabled)
-    if not prefs:
+def pref_age_months():
+    """偏好备注内容的发布时间窗(月, 0=不限) —— 偏好同样受时间窗约束, 不再整段豁免。
+    严格/标准: 与设定窗完全一致(设定3个月就绝不出现3个月前的内容);
+    宽松: 额外宽限 PREF_LOOSE_BONUS_MONTHS 个月(偏好主题常是小众长尾, 多给半年保供给);
+    严肃: 走严肃独立时间窗(知识类内容历史长), 同样不再豁免。
+    设定为 0(不限)时偏好也随之为不限。"""
+    try:
+        if sget("mode") == "严肃":
+            base = int(sget("ser_max_age_months") or 0)
+        else:
+            base = int(sget("m_max_age_months") or 0)
+    except Exception:
+        base = 0
+    if not base:
+        return 0
+    if sget("mode") == "宽松":
+        return base + PREF_LOOSE_BONUS_MONTHS
+    return base   # 严格/标准/其它档位: 一分不多给
+
+
+def pref_age_cut():
+    """偏好时间窗的绝对时间戳(0=不限), 供抓取侧预过滤使用。"""
+    m = pref_age_months()
+    return int(time.time() - m * 30.44 * 86400) if m else 0
+
+
+def _pref_pick(pool, n):
+    """洗牌袋取词: 一轮内每个偏好词都被轮到, 但顺序随机。
+    旧版按固定游标取相邻两词, 顺序完全可预期 → 用户感知"每次刷出来都一样"。"""
+    global _pref_bag
+    pool = list(dict.fromkeys([w for w in pool if w]))
+    if not pool or n <= 0:
+        _pref_bag = []
         return []
-    pg = (_pref_page % _PREF_PAGE_MAX) + 1
-    return [(kw, pg) for kw in prefs[:1 if quick else 2]]
+    bag = [w for w in _pref_bag if w in pool]
+    if len(bag) < n:                     # 袋见底 → 补入新一轮洗好的全量词(只补袋里没有的)
+        rest = [w for w in pool if w not in bag]
+        random.shuffle(rest)
+        bag += rest
+    picked = bag[:n]
+    _pref_bag = bag[n:]
+    return picked
+
+
+def _pref_pick_page():
+    """随机页码(避开最近用过的页): 旧版 1→2→3→4 顺序循环, 4轮后完全复现同一批视频。"""
+    global _pref_page_hist
+    cands = [p for p in range(1, _PREF_PAGE_MAX + 1) if p not in _pref_page_hist]
+    if not cands:
+        _pref_page_hist = []
+        cands = list(range(1, _PREF_PAGE_MAX + 1))
+    pg = random.choice(cands)
+    _pref_page_hist = (_pref_page_hist + [pg])[-2:]
+    return pg
+
+
+def _pref_search_terms(enabled, quick):
+    """本轮要搜的(偏好词, 页码): 完整构建取2词/快速开屏取1词。
+    词走洗牌袋、页码随机 —— 两者都随机才不会固定周期复现同一批视频
+    (旧版是双顺序游标, 每 N×4 轮就完整重放一轮)。"""
+    prefs = _pref_pick(pref_all_kws(), 1 if quick else 2)
+    return [(kw, _pref_pick_page()) for kw in prefs]
 
 
 def serious_kw_pool(enabled):
@@ -839,16 +886,22 @@ def search_pushdown():
     return push
 
 
-def search_items(keyword, page=1, limit=30, order=None, duration=None):
+def search_items(keyword, page=1, limit=30, order=None, duration=None, pub_begin=None):
     """WBI签名搜索(实测免登录可用, 可翻页)。失败返回[]。
-    order/duration: 筛选条件下推(见 search_pushdown), 不传则行为与旧版一致。"""
-    try:
+    order/duration: 筛选条件下推(见 search_pushdown), 不传则行为与旧版一致。
+    pub_begin: 只收该时间戳之后发布的内容(秒级), 服务端下推偏好时间窗 —— 后端时间窗是硬约束,
+    能下推就下推, 抓回来的才多是窗内新内容; 若下推后整页为空(小众词无近期供给)则回退免窗重取,
+    最终仍由 pref_age_cut 在本地兜底过滤。"""
+
+    def _once(extra):
         params = {"search_type": "video", "keyword": keyword,
                   "page": str(page), "page_size": str(limit)}
         if order:
             params["order"] = order
         if duration:
             params["duration"] = duration
+        if extra:
+            params.update(extra)
         qs = wbi_enc(params)
         req = urllib.request.Request(
             "https://api.bilibili.com/x/web-interface/wbi/search/type?" + qs,
@@ -858,6 +911,15 @@ def search_items(keyword, page=1, limit=30, order=None, duration=None):
             return []
         res = (d.get("data") or {}).get("result") or []
         return [normalize_search(it) for it in res[:limit] if it.get("bvid")]
+
+    try:
+        if pub_begin:
+            got = _once({"pubtime_begin_s": str(int(pub_begin))})
+            if got:
+                return got
+            got = _once(None)      # 窗内无供给 → 回退免窗重取(本地仍会按窗过滤)
+            return got
+        return _once(None)
     except Exception:
         return []
 HEADERS = {
@@ -2523,11 +2585,15 @@ def fetch_pool(quick=False):
     # 与榜单/贴吧/小黑盒同批发出请求; 结果在榜单消费后立即收编(见下方消费块),
     # 保证预算不被相关链/搜索词引擎挤占 —— 旧版排最末且带 len(items)<420 闸门,
     # 相关链+词引擎把池子灌满后偏好词整段被跳过(用户"偏好几乎刷不到"的根因);
-    # 快速开屏也搜1词(旧版quick完全不搜偏好); 页码游标逐轮翻页防同一批视频反复。
+    # 快速开屏也搜1词(旧版quick完全不搜偏好); 取词走洗牌袋、取页随机, 防同一批视频反复。
+    # 偏好内容同样受时间窗硬约束(见 pref_age_months): 服务端能下推就下推, 不再整段豁免。
     pref_terms = _pref_search_terms(enabled, quick)
     _push0 = search_pushdown()
+    _pref_cut0 = pref_age_cut()
     pref_futures = [(kw, pg, _FX.submit(search_items, kw, pg,
-                                        order=_push0.get("order"), duration=_push0.get("duration")))
+                                        order=_push0.get("order"),
+                                        duration=_push0.get("duration"),
+                                        pub_begin=_pref_cut0 or None))
                     for kw, pg in pref_terms]
     cur_gids = []
     jobs = []
@@ -2555,28 +2621,34 @@ def fetch_pool(quick=False):
             errors.append("%s: %s" % (shown, (data or {}).get("code") or err))
 
     # --- 偏好词引擎(消费): 紧跟榜单之后、贴吧/相关链/词引擎之前收编, 预算必有富余 ---
-    # 偏好备注是用户明写的主动意图, 优先级高于分区白名单与严肃模式硬拒:
-    # 结果统一打 pref_kw 标记, 在 machine_filter(时间窗)/bake_universe/planned_feed 各层豁免。
+    # 偏好备注是用户明写的主动意图, 优先级高于分区白名单与严肃模式硬拒(仍在 planned_feed 豁免);
+    # 但时间窗是用户对"新鲜度"的硬设定, 不再豁免 —— 抓回即按偏好窗预过滤, 老视频不占池子名额。
+    _pref_cut = pref_age_cut()   # 0=不限
     for kw, pg, fut in pref_futures:
         try:
             res = fut.result() or []
         except Exception:
             res = []
+        if len(res) > 1:
+            random.shuffle(res)   # 同词同页返回结果顺序固定 → 打散, 不再每轮池顶同一批
         made = 0
         for x in res:
             bvid = (x.get("url") or "").rsplit("/", 1)[-1]
-            if bvid and bvid not in seen and len(items) < 450:
-                seen[bvid] = 1
-                x["src"] = "偏·" + kw[:6]   # 混排桶标记(偏好词)
-                x["pref_kw"] = kw           # 偏好意图标记: 下游各层据此豁免/加成
-                items.append(x)
-                made += 1
+            if not bvid or bvid in seen or len(items) >= 450:
+                continue
+            if _pref_cut and (x.get("pubdate") or 0) and x["pubdate"] < _pref_cut:
+                _funnel_bump("pref_age")   # 超偏好时间窗 → 丢弃(标准/严格档绝不放行)
+                continue
+            seen[bvid] = 1
+            x["src"] = "偏·" + kw[:6]   # 混排桶标记(偏好词)
+            x["pref_kw"] = kw           # 偏好意图标记: 下游据此加成/豁免分区与严肃硬拒
+            items.append(x)
+            made += 1
         if made:
             names.append("偏好·%s×%d" % (kw, made))
             _funnel_bump("pref_fetch", made)
     if pref_terms:
-        _pref_cursor += 1 if quick else 2   # 下轮换下一批偏好词(quick搜1词只进1格)
-        _pref_page += 1                     # 下轮翻新的一页
+        _pref_cursor += 1 if quick else 2   # 严肃模式变体池仍按此游标轮换
 
     # --- 快速开屏: 消费与榜单同时发出的搜索词请求(见 quick 分支的提前提交) ---
     if quick:
@@ -4599,6 +4671,7 @@ def machine_filter(items):
         max_age = int(sget("ser_max_age_months") or 0)   # 严肃模式独立时间窗(默认30月, 知识内容历史长)
     else:
         max_age = int(sget("m_max_age_months") or 0)
+    pref_age = pref_age_months()   # 偏好内容的独立窗: 宽松档 +6 月, 严格/标准档与设定窗一致
     dedup = sget("m_dedup") == "1"
     emotion = sget("m_emotion") != "0"
     news_fresh = sget("m_news_fresh") != "0"
@@ -4629,10 +4702,13 @@ def machine_filter(items):
             if fm and now - it["pubdate"] > fm * 30.44 * 86400:
                 _funnel_bump("follow_window")
                 continue   # 超出强调月数 → 直接丢弃(单独机制, 不符合规则不进池)
-        if max_age and not it.get("following") and not it.get("pref_kw") \
-                and it["pubdate"] and now - it["pubdate"] > max_age * 30.44 * 86400:
-            _funnel_bump("age")
-            continue   # 只保留最近 N 个月发布的内容(关注的人/偏好词直搜结果豁免一般窗)
+        if not it.get("following"):
+            # 偏好词直搜结果不再豁免时间窗, 只按偏好专属窗判定(宽松档多给6个月, 其余与设定一致);
+            # 关注的人走 bili_follow_months 单独机制(上面已判)。
+            win = pref_age if it.get("pref_kw") else max_age
+            if win and it["pubdate"] and now - it["pubdate"] > win * 30.44 * 86400:
+                _funnel_bump("pref_age" if it.get("pref_kw") else "age")
+                continue   # 只保留最近 N 个月内发布的内容
         if news_fresh and it.get("pubdate") and _is_newsy(it) and now - it["pubdate"] > 86400:
             _funnel_bump("news")
             continue   # 时效分层: 资讯/热点只推24小时内(干货/教程不受此限)

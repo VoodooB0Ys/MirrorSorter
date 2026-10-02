@@ -11,6 +11,12 @@ feed with built-in AI chat.
 - **Tunable feed & AI chat**: single / dual / large-image display modes, search with sort modes
   (relevance / views / newest / trending-hot, `*` prefix keeps personal blocks) and an AI chat that
   can act on your behalf (search, tune preferences, ask-about-a-card, daily digest with preference suggestions)
+- **AI floating ball (desktop)**: an always-on-top **wireframe dodecahedron hologram**
+  (real 3D rotation, edge bloom, scanlines) that expands in place into a chat panel on
+  **click** (hovering only highlights it) — web-evidence fact checking
+  (true/false/uncertain + evidence links) and evidence-backed clapback generation;
+  drag it to a screen edge to tuck it away behind a thin restore strip; colors follow
+  the main UI accent
 
 ## Repository Layout
 

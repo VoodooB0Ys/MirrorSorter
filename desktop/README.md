@@ -55,6 +55,39 @@ Once configured: flame/low-quality score filtering (level = threshold) + persona
 2. Enter an API key (DeepSeek gives free credit on signup; Zhipu / Qwen also work — just change URL + model)
 3. Save → refresh the feed; today's AI cost shows in the right panel
 
+## AI Floating Ball (Windows desktop only)
+
+Left settings → "AI 悬浮窗" → enable: a small always-on-top ball stays on the screen
+over any app (position is remembered; right-click the ball to exit; it disappears
+automatically if the service stops). The ball is a rotating **wireframe dodecahedron
+hologram** (20 vertices / 30 edges / 12 pentagon faces) drawn in real 3D with
+depth-cued edges, edge bloom and scanlines; its color follows the main UI accent.
+
+**Clicking the ball expands it in place into a compact chat panel** (no separate
+window; "─ 收起" collapses it back into the ball). Hovering only highlights the ball
+— it never opens the panel on its own; opening is click-only. Drag the ball onto a
+screen edge and release to tuck it away: the ball slides off-screen and a thin
+restore strip stays on that edge (click the strip to pull the ball back). The panel
+is a chat stream with two modes above the input box:
+
+- **验证真实性 (Fact check)**: paste a comment/claim → the service searches the web
+  (360 → Bing → DDG fallback chain, credibility-ranked domains), reads the top pages and
+  the AI returns a verdict (true / false / uncertain) with confidence, reasons,
+  the knowledge errors / logical fallacies it spotted, and clickable evidence links
+- **生成回怼 (Clapback)**: paste a comment to rebut → the AI first names the other side's
+  knowledge errors and logical fallacies, then writes first-person clapback lines
+  (addressing "you", never advising the user): N one-liners + N paragraphs + 1 long
+  piece, where N is the gear setting (1/2/3). **Each part is shown the moment it is
+  generated** — no waiting for the whole run — and every line is one-click copyable
+
+Gear drawer (⚙): thinking depth (快/标准/深挖), savagery (温和/毒舌/阴阳, the top gear
+uses spicier forum-style wording) and count (1/2/3, which only changes how many
+one-liners and paragraphs you get; the long piece is always 1).
+
+Both modes need the AI config above; results carry an "offline" warning when no web
+evidence could be retrieved. Nothing about your browser is read — the service fetches
+public pages itself.
+
 ## Run from Source
 
 ```

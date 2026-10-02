@@ -112,14 +112,35 @@ check("搜索: 无* → 关屏蔽", captured.get("blocks") is False and captured
 check("搜索: *与无*不串缓存", len(app._search_wave) == 2)
 app._search_first_wave, app._search_expand_wave = orig_first, orig_expand
 
-# ---------- 3. 偏好词豁免 ----------
-app.sset("m_max_age_months", "5")
-old_item_pref = mkitem(title="后朋克歌单精选", pubdate=int(NOW - 400 * 86400), pref_kw="后朋克音乐")
+# ---------- 3. 偏好词时间窗(偏好不再豁免; 宽松档多给6个月) ----------
+app.sset("mode", "标准")
+app.sset("m_max_age_months", "3")          # 设定: 只看最近3个月
+app.sset("ser_max_age_months", "30")
+old_item_pref = mkitem(title="四年前的绘画教程", url="https://www.bilibili.com/video/BVprefaged",
+                       pubdate=int(NOW - 400 * 86400), pref_kw="绘画")
+fresh_pref = mkitem(title="本月绘画过程", url="https://www.bilibili.com/video/BVpreffresh",
+                    pubdate=int(NOW - 10 * 86400), pref_kw="绘画")
 old_item_plain = mkitem(title="十年前的老歌合集", url="https://www.bilibili.com/video/BVold00001",
                         pubdate=int(NOW - 400 * 86400))
-kept = app.machine_filter([old_item_pref, old_item_plain])
-check("时间窗: 偏好直搜结果豁免", any(it.get("pref_kw") for it in kept))
-check("时间窗: 非偏好老内容仍剔除", all(it.get("title") != "十年前的老歌合集" for it in kept))
+kept = app.machine_filter([old_item_pref, fresh_pref, old_item_plain])
+kept_t = {it["title"] for it in kept}
+check("时间窗: 偏好超窗内容剔除(标准档)", "四年前的绘画教程" not in kept_t, str(kept_t))
+check("时间窗: 偏好窗内内容保留", "本月绘画过程" in kept_t, str(kept_t))
+check("时间窗: 非偏好老内容仍剔除", "十年前的老歌合集" not in kept_t, str(kept_t))
+
+app.sset("mode", "宽松")
+check("偏好窗: 宽松档 = 设定+6", app.pref_age_months() == 9)
+p8 = mkitem(title="八个月前绘画", url="https://www.bilibili.com/video/BVpref8m",
+            pubdate=int(NOW - 8 * 30.44 * 86400), pref_kw="绘画")
+p10 = mkitem(title="十个月前绘画", url="https://www.bilibili.com/video/BVpref10m",
+             pubdate=int(NOW - 10 * 30.44 * 86400), pref_kw="绘画")
+kept2 = {it["title"] for it in app.machine_filter([p8, p10])}
+check("时间窗: 宽松档8月偏好保留/10月剔除", kept2 == {"八个月前绘画"}, str(kept2))
+app.sset("mode", "严格")
+check("偏好窗: 严格档 = 设定值", app.pref_age_months() == 3)
+kept3 = {it["title"] for it in app.machine_filter([p8])}
+check("时间窗: 严格档偏好不放宽(8月剔除)", kept3 == set(), str(kept3))
+app.sset("mode", "标准")
 
 music_pref = mkitem(title="后朋克音乐推荐", area="音乐", tname="音乐综合", pref_kw="后朋克音乐")
 music_plain = mkitem(title="流行音乐盘点", area="音乐", tname="音乐综合",
@@ -157,7 +178,8 @@ app.sset("mode", "标准")
 app.sset("dislike_note", "")
 
 # ---------- 4. 偏好漏斗标签 ----------
-check("偏好漏斗标签齐全", all(k in app._FUNNEL_LABELS for k in ("pref_fetch", "pref_kept", "pref_drop")))
+check("偏好漏斗标签齐全", all(k in app._FUNNEL_LABELS
+                              for k in ("pref_fetch", "pref_kept", "pref_drop", "pref_age")))
 
 # ---------- 5. 搜索排序(综合/播放/最新/最新热门) ----------
 SORT_POOL = [
@@ -216,40 +238,47 @@ r = app.search_all("排序测试2", 0, 10, sort="views")
 check("排序: 扩波后快照自动重排", r["items"][0]["title"][0] == "F" and r["total"] == 6)
 app._search_first_wave, app._search_expand_wave = orig_first_s, orig_expand_s
 
-# ---------- 6. 偏好词引擎供给(上移修复: 提前并行+立即收编+翻页) ----------
+# ---------- 6. 偏好词引擎供给(上移修复: 提前并行+立即收编; 随机取词/取页) ----------
 app.sset("prefs_note", "后朋克音乐")
-app._pref_cursor = 0
-app._pref_page = 0
+app._pref_bag = []
+app._pref_page_hist = []
 
 terms_quick = app._pref_search_terms("", True)
 check("偏好供给: 快速开屏搜1词", len(terms_quick) == 1 and terms_quick[0][0] == "后朋克音乐")
 check("偏好供给: 单词备注不重复搜同词", len(app._pref_search_terms("", False)) == 1)
 
 app.sset("prefs_note", "后朋克音乐, 器乐摇滚, 氛围电子")
-app._pref_cursor = 0
-app._pref_page = 0
+app._pref_bag = []
+app._pref_page_hist = []
 terms_full = app._pref_search_terms("", False)
-check("偏好供给: 完整构建搜2词", len(terms_full) == 2 and terms_full[0][0] == "后朋克音乐")
-check("偏好供给: 首轮第1页", terms_full[0][1] == 1)
+check("偏好供给: 完整构建搜2词",
+      len(terms_full) == 2 and all(k in ("后朋克音乐", "器乐摇滚", "氛围电子") for k, _ in terms_full),
+      str(terms_full))
+check("偏好供给: 页码在翻页深度内",
+      all(1 <= p <= app._PREF_PAGE_MAX for _, p in terms_full), str(terms_full))
 
-app.sset("prefs_note", "后朋克音乐, 器乐摇滚, 氛围电子")
-app._pref_cursor = 0
-app._pref_page = 0
+# 随机性: 洗牌袋两轮必覆盖全部偏好词(旧的固定游标可预期); 多轮页码不再 1→2→3→4 循环
+app._pref_bag = []
+app._pref_page_hist = []
 first = app._pref_search_terms("", False)
-app._pref_cursor += 2
-app._pref_page += 1
 second = app._pref_search_terms("", False)
-check("偏好供给: 词轮换推进", {k for k, _ in first} == {"后朋克音乐", "器乐摇滚"}
-      and {k for k, _ in second} == {"氛围电子", "后朋克音乐"},
-      "first=%s second=%s" % (first, second))
-check("偏好供给: 页码逐轮翻新", first[0][1] == 1 and second[0][1] == 2)
+covered = {k for k, _ in first} | {k for k, _ in second}
+check("偏好供给: 两轮覆盖全部偏好词",
+      covered == {"后朋克音乐", "器乐摇滚", "氛围电子"}, "first=%s second=%s" % (first, second))
+pages, words = set(), set()
+for _ in range(12):
+    for k, p in app._pref_search_terms("", False):
+        words.add(k)
+        pages.add(p)
+check("偏好供给: 多轮词不固定(全部出现过)", words == {"后朋克音乐", "器乐摇滚", "氛围电子"}, str(words))
+check("偏好供给: 页码随机(非固定单页)", len(pages) >= 3, str(sorted(pages)))
 
-# fetch_pool 集成(全量 mock 网络函数): 偏好词在 quick/full 构建都必须出内容, 且页码推进
+# fetch_pool 集成(全量 mock 网络函数): 偏好词在 quick/full 构建都必须出内容, 且时间窗下推
 calls_log = []
 
 
-def fake_pref_search(keyword, page=1, limit=30, order=None, duration=None):
-    calls_log.append((keyword, page))
+def fake_pref_search(keyword, page=1, limit=30, order=None, duration=None, pub_begin=None):
+    calls_log.append((keyword, page, pub_begin))
     if keyword == "后朋克音乐":
         return [mkitem(title="后朋克测试视频%d-%d" % (page, i),
                        url="https://www.bilibili.com/video/BVpref%d%03d" % (page, i),
@@ -268,31 +297,40 @@ app.fetch_tieba_pool = lambda quick=False: ([], [])
 app.fetch_xhh_pool = lambda quick=False: ([], [])
 app.fetch_following_videos = lambda: ([], None)
 app.fetch_related = lambda seed: []
+app.sset("prefs_note", "后朋克音乐")   # 单词备注: 集成断言不受随机取词影响
+app._pref_bag = []
+app._pref_page_hist = []
 try:
     calls_log.clear()
-    app._pref_cursor = 0
-    app._pref_page = 0
     rq = app.fetch_pool(quick=True)
     pref_q = [it for it in rq["items"] if it.get("pref_kw")]
     check("偏好供给: quick开屏也搜偏好(旧版整段跳过)", len(pref_q) == 3
           and all(it["src"].startswith("偏·") for it in pref_q))
-    check("偏好供给: quick首轮第1页", ("后朋克音乐", 1) in calls_log)
+    pref_calls = [c for c in calls_log if c[0] == "后朋克音乐"]
+    check("偏好供给: quick页码在翻页深度内",
+          bool(pref_calls) and all(1 <= c[1] <= app._PREF_PAGE_MAX for c in pref_calls),
+          str(pref_calls))
+    check("偏好供给: 偏好时间窗下推到搜索请求",
+          bool(pref_calls) and all(c[2] for c in pref_calls), str(pref_calls))
 
     calls_log.clear()
-    app._pref_cursor = 0          # 回到第一个偏好词
-    app._pref_page = 1            # 模拟quick已消费第1页, 第二轮应翻到第2页
     rf = app.fetch_pool(quick=False)
     pref_f = [it for it in rf["items"] if it.get("pref_kw")]
     check("偏好供给: full构建偏好出内容且在预算内", len(pref_f) == 3)
-    check("偏好供给: 第二轮翻到第2页", ("后朋克音乐", 2) in calls_log,
-          "calls=%s" % [c for c in calls_log if c[0] == "后朋克音乐"])
+
+    app.sset("m_max_age_months", "0")     # 时间窗设为不限 → 不再下推
+    calls_log.clear()
+    app.fetch_pool(quick=True)
+    check("偏好供给: 时间窗不限时不下推",
+          all(c[2] is None for c in calls_log if c[0] == "后朋克音乐"), str(calls_log))
+    app.sset("m_max_age_months", "3")
 finally:
     app.search_items, app._safe_json = orig_si, orig_sj
     app.fetch_tieba_pool, app.fetch_xhh_pool = orig_tb, orig_xhh
     app.fetch_following_videos, app.fetch_related = orig_fol, orig_rel
     app.sset("prefs_note", "")
-    app._pref_cursor = 0
-    app._pref_page = 0
+    app._pref_bag = []
+    app._pref_page_hist = []
 
 # ---------- 7. AI聊天: payload确认执行器 ----------
 orig_fr = app.force_rebuild

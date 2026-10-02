@@ -58,7 +58,17 @@ body {
   background:var(--input); border:1px solid var(--line); color:var(--txt);
   border-radius:6px; padding:7px 9px; font-size:13px; width:100%; }
 #railBody textarea { resize:vertical; }
-#railBody .row { display:flex; gap:8px; align-items:center; }
+/* 档位行必须能换行: 侧栏宽度可变(窗口窄/字体放大时更窄), 不换行的话最后几个按钮会被
+   直接裁掉(预览放大的 ×4 就这么没的)。弹窗那边(.modal-body .row)一直是换行的, 这里对齐它。 */
+#railBody .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+/* 换行是给"一排档位按钮"用的; 带输入框的行不能被换行把按钮顶到下一行 ——
+   输入框/下拉改成"占满剩余宽度"(flex:1)而不是"固定 100%", 窄的时候它自己缩, 不触发换行。
+   复选框/取色器不参与(它们本来就是小控件)。 */
+/* flex-basis 必须给小值(60px)而不是 auto: 换行是按"基准尺寸"判的, auto 会取输入框的
+   固有宽度(约 190px), 于是它照样把后面的按钮挤到下一行 —— 只有基准够小, 它才会"自己缩"。 */
+#railBody .row > input:not([type="checkbox"]):not([type="color"]),
+#railBody .row > select,
+#railBody .row > textarea { flex:1 1 60px; width:auto; min-width:0; }
 #railBody input[readonly], #railBody input[readonly]:focus { opacity:.85; cursor:default; }
 .tip-inline { font-size:11px; color:var(--sub); font-weight:normal; }
 #baseToggle.small-op { align-self:flex-start; font-size:11px; padding:3px 10px; }
@@ -340,6 +350,8 @@ select option { background:var(--card); color:var(--txt); }
 /* 悬停预览播放浮层: fixed 在封面位置放大, body级最高层, 不归滚动容器管 */
 .pv-overlay { position:fixed; z-index:99999; pointer-events:none; border-radius:6px;
               overflow:hidden; box-shadow:0 12px 40px #000a; }
+/* ×1 原位档: 浮层与封面同尺寸, 不该像个"飘起来的窗", 收掉投影与圆角差异 */
+.pv-overlay.pv-flat { box-shadow:0 6px 18px #0006; border-radius:4px; }
 .pv-overlay img, .pv-overlay video { position:absolute; top:0; left:0; width:100%; height:100%;
                                      object-fit:cover; }
 .pv-overlay video { opacity:0; transition:opacity .2s; }
@@ -509,6 +521,13 @@ body.hide-reason .card .reason { display:none !important; }
 .fb-box { background:var(--card); border:1px solid var(--line); border-radius:10px;
           padding:12px; display:flex; flex-direction:column; gap:8px; margin:6px 0; }
 .fb-box .tip { margin:0; }
+/* 两个动作并排: 「开关悬浮窗」是主操作, 「找不到球」是救援入口, 窄屏自动换行 */
+.fb-acts { display:flex; gap:8px; flex-wrap:wrap; }
+.fb-acts .ai-mode-btn { width:auto; flex:1 1 150px; padding:10px 12px; }
+/* 救援入口: 用虚线框与主操作(实线)区分, 明确"这不是常规操作、是找不回球时才点"。
+   用 .fb-acts 前缀提高优先级, 避免被通用的 button/ai-mode-btn 规则盖掉 border 样式。 */
+.fb-acts #floatBallFind { border-style:dashed; border-width:1px; color:var(--sub); }
+.fb-acts #floatBallFind:hover { border-color:var(--accent); color:var(--accent); border-style:solid; }
 #railBody .sub { color:var(--sub); font-size:12px; min-width:110px; }
 
 /* 弹窗 */
