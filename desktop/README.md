@@ -31,16 +31,18 @@ Double-clicking again is safe: it detects the running service and just opens the
 Clicking a feed card, message entry, account link, history/saved item — anything
 that used to open your system browser — now opens as a **tab in the app window**:
 
-- A native browser-style **tab bar sits at the top of the window**: `信息流` is the
-  pinned home tab (cannot be closed); every video/post opens as a new tab showing
-  the page title with a hover `✕` to close; click a tab to switch.
+- A native browser-style **tab bar sits at the top of the frameless window**: `信息流`
+  is the pinned home tab (cannot be closed); every video/post opens as a new tab
+  showing the page title with a hover `✕` to close; click a tab to switch. Site
+  pop-ups (target=_blank) become tabs too.
+- **Switching tabs never reloads**: each tab is its own WebView2 instance sharing
+  the same browser profile — the feed keeps its state, videos keep playing when
+  you switch away and back.
+- The window is borderless: drag the tab bar's empty area to move, double-click it
+  to maximize, `─ □ ✕` window buttons at the right end, edges still resize.
 - The tab bar is part of the window chrome (WinForms-drawn) — it never overlaps or
   blocks any website's own UI.
-- In-site links navigate within the current tab and the tab remembers its latest
-  address; opening the same link twice just switches to the existing tab.
 - Site logins (e.g. Bilibili) persist across restarts (WebView2 non-private mode).
-- Known trade-off: switching tabs reloads the page (one WebView per window), so
-  playback doesn't continue across tab switches.
 - No WebView2 runtime on the machine? The app falls back to the old
   external-browser mode automatically (with a one-time notice) — never a blank window.
 
@@ -127,8 +129,9 @@ python app.py            # equivalent headless service (CLI)
 ```
 desktop/
 ├── app.py            # backend: fetching + AI scoring + SQLite + all APIs + local server
-├── app_window.py     # window shell (exe entry): pywebview window + built-in browser tabs
-├── shell_tabstrip.py # native browser-style tab bar at the top of the window
+├── app_window.py     # window shell (exe entry): frameless pywebview window + tabs
+├── shell_tabstrip.py # native browser-style tab bar (also the borderless title bar)
+├── shell_pages.py    # per-tab WebView2 control pool (switching never reloads)
 ├── web/index.html    # UI skeleton
 ├── web/style.css     # styles
 ├── web/app.js        # frontend logic (openExternal routes links into shell tabs)

@@ -93,19 +93,20 @@ class ShellApi:
     def __init__(self):
         self._win = None          # 主窗口, attach() 绑定
         self._app_url = None
+        self._pages = None        # WebView2 控件池, bind_pages() 注入
+        self._visible_id = self.HOME_ID
         self._strip_update = None  # 原生标签栏重绘回调, bind_strip() 注入
         self._lock = threading.Lock()
-        self._tabs = [{"id": self.HOME_ID, "url": None, "title": "信息流", "pinned": True}]
+        self._tabs = [{"id": self.HOME_ID, "url": None, "title": "信息流",
+                       "pinned": True, "opened": True}]
         self._active = self.HOME_ID
         self._next_id = 1
 
     def attach(self, win, app_url):
-        """主窗口创建后绑定; loaded 后同步标签状态并渲染标签条。"""
+        """主窗口创建后绑定窗口引用(供控件池 marshal 与窗口按钮使用)。"""
         self._win = win
         self._app_url = app_url
         self._tabs[0]["url"] = app_url
-        win.events.loaded += lambda *_a: self._on_loaded()
-        self._render()
 
     # ---- 桥: 前端探测(存在即说明跑在桌面壳里) ----
     def shell_info(self):
@@ -119,17 +120,19 @@ class ShellApi:
             return "bad-url"
         with self._lock:
             for t in self._tabs:
-                if t["url"] == url:   # 同一链接只占一个标签, 重复点=切过去
+                if t["url"] == url:   # 同一链接只占一个标签, 重复点=切过去(不重载)
                     self._active = t["id"]
+                    tab = t
                     break
             else:
-                self._tabs.append({"id": self._next_id, "url": url,
-                                   "title": (title or url)[:24], "pinned": False})
+                tab = {"id": self._next_id, "url": url,
+                       "title": (title or url)[:24], "pinned": False, "opened": False}
+                self._tabs.append(tab)
                 self._active = self._next_id
                 self._next_id += 1
-        ret = self._navigate(url)
+        self._activate(tab)
         self._render()   # 即时反馈: 标签栏立刻高亮新标签(不等页面加载完)
-        return ret
+        return "ok"
 
     def tab_switch(self, tid=None):
         try:
@@ -141,8 +144,9 @@ class ShellApi:
             if t is None:
                 return "gone"
             self._active = tid
-            url = t["url"] or self._app_url
-        return self._navigate(url)
+        self._activate(t)
+        self._render()
+        return "ok"
 
     def tab_close(self, tid=None):
         try:
@@ -155,13 +159,15 @@ class ShellApi:
                 return "gone"
             if self._tabs[idx]["pinned"]:
                 return "pinned"
-            self._tabs.pop(idx)
+            dead = self._tabs.pop(idx)
             if self._active == tid:   # 关的是当前页 → 激活前一个, 没有则回信息流
                 self._active = self._tabs[max(0, idx - 1)]["id"]
             nxt = next(x for x in self._tabs if x["id"] == self._active)
-            url = nxt["url"] or self._app_url
+        self._activate(nxt)          # 先显示邻居, 再销毁旧控件(避免黑屏)
+        if self._pages is not None:
+            self._pages.dispose(tid)
         self._render()
-        return self._navigate(url)
+        return "ok"
 
     def open_external(self, url):
         """用户显式要求用系统浏览器时(标签条 ⧉ 按钮)。"""
@@ -172,39 +178,37 @@ class ShellApi:
         return "ok"
 
     # ---- 内部 ----
-    def _navigate(self, url):
-        if self._win is None:
-            return "no-window"
-        try:
-            self._win.load_url(url)
-            return "ok"
-        except Exception:
-            return "fail"
-
-    def _on_loaded(self):
-        # 放独立线程: 避免在事件回调线程里同步调 evaluate_js 与 UI 线程互等
-        threading.Thread(target=self._sync_after_load, daemon=True,
-                         name="msx-tabs-sync").start()
-
-    def _sync_after_load(self):
-        w = self._win
-        if w is None:
+    def _activate(self, tab):
+        """显示 tab(无控件则异步创建), 隐藏当前控件 —— 纯可见性切换, 页面零重载。"""
+        pages = self._pages
+        if pages is None:
             return
-        try:
-            time.sleep(0.2)   # 等文档可用, 取页面标题
-            url = w.get_current_url() or self._app_url
-            with self._lock:
-                tab = next((x for x in self._tabs if x["id"] == self._active), None)
-                keep_home = tab is None or tab["id"] == self.HOME_ID
-            title = w.evaluate_js("document.title")
-            if not keep_home and tab is not None:
-                if url:
-                    tab["url"] = url   # 站内跳转后记住最新地址, 切回标签时恢复
-                if title:
-                    tab["title"] = str(title).strip()[:24]
-            self._render()
-        except Exception:
-            pass
+        with self._lock:
+            prev_id = self._visible_id
+            self._visible_id = tab["id"]
+        if not tab["pinned"] and not tab["opened"]:
+            tab["opened"] = True
+            pages.create(tab["url"], tab["id"])
+        if prev_id != tab["id"]:
+            pages.hide(prev_id)
+        pages.show(tab["id"])
+
+    def update_title(self, tab_key, title):
+        """站点控件的 DocumentTitleChanged 回调 → 刷新标签标题。"""
+        title = str(title or "").strip()[:24]
+        if not title:
+            return
+        with self._lock:
+            t = next((x for x in self._tabs if x["id"] == tab_key), None)
+            if t is not None and not t["pinned"]:
+                t["title"] = title
+        self._render()
+
+    def bind_pages(self, pages):
+        """注入 WebView2 控件池(shell_pages.create_pool)并显示首页标签。"""
+        self._pages = pages
+        self._activate(self._tabs[0])
+        self._render()
 
     def bind_strip(self, update_fn):
         """注入原生标签栏重绘回调(shell_tabstrip.install_strip 的返回值)。"""
@@ -311,17 +315,21 @@ def shell_main(e2e_url=None):
     api = ShellApi()
     win = webview.create_window("%s %s" % (APP_NAME, APP_VER), url,
                                 width=MAIN_W, height=MAIN_H, min_size=MAIN_MIN,
-                                background_color=BG_DARK, js_api=api)
+                                background_color=BG_DARK, js_api=api, frameless=True)
     api.attach(win, url)
 
     def gui_ready():
-        # GUI 就绪(在 pywebview 的后台线程): 等原生窗体创建完成后安装标签栏, 再跑测试钩子
+        # GUI 就绪(在 pywebview 的后台线程): 装控件池与标签栏, 再跑测试钩子
         try:
-            end = time.time() + 30
-            while (win.native is None or not win.native.IsHandleCreated) and time.time() < end:
-                time.sleep(0.2)
-            if win.native is None:
-                raise RuntimeError("native window form not ready")
+            from shell_pages import create_pool
+            pages = create_pool(win, api.update_title,
+                                lambda _k, u: api.open_in_app(u))
+            pages.init()          # 等窗体就绪 + WS_THICKFRAME 无边框缩放补丁
+            api.bind_pages(pages)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        try:
             from shell_tabstrip import install_strip
             api.bind_strip(install_strip(win, api))
         except Exception:

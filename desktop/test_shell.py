@@ -58,44 +58,57 @@ check("桥拒绝非 http(s) URL", api.open_in_app("javascript:alert(1)") == "bad
 check("open_external 拒绝非 http(s)", api.open_external("file:///C:/") == "bad-url")
 info = api.shell_info()
 check("shell_info 供前端探测", info.get("embedded_browser") is True and info.get("tabs") is True)
-check("未绑窗口时安全拒绝导航", api.open_in_app("https://www.bilibili.com") == "no-window")
+check("未绑控件池时不崩(仅登记)", api.open_in_app("https://www.bilibili.com") == "ok"
+      and len(api._tabs) == 2)
 
-# 假窗口: 只记录 load_url 调用, 验证标签表逻辑(不起 GUI)
-nav = []
-
-
-class _Ev:
-    def __iadd__(self, f):
-        return self
+# 假控件池: 记录 create/show/hide/dispose 调用, 验证标签逻辑与"切换零重载"(不起 GUI)
+calls = []
 
 
-class FakeWin:
-    def __init__(self):
-        self.events = type("E", (), {"loaded": _Ev()})()
+class FakePages:
+    def init(self):
+        pass
 
-    def load_url(self, url):
-        nav.append(url)
+    def create(self, url, key):
+        calls.append(("create", url, key))
+
+    def show(self, key):
+        calls.append(("show", key))
+
+    def hide(self, key):
+        calls.append(("hide", key))
+
+    def dispose(self, key):
+        calls.append(("dispose", key))
 
 
 api2 = aw.ShellApi()
-api2.attach(FakeWin(), "http://127.0.0.1:8000")
+api2.attach(None, "http://127.0.0.1:8000")
+api2.bind_pages(FakePages())
 check("信息流是 0 号固定标签", api2._tabs[0]["pinned"] is True and api2._active == 0)
-check("开新链接=新标签+导航", api2.open_in_app("https://www.bilibili.com/video/BV1xx") == "ok"
-      and len(api2._tabs) == 2 and api2._active == 1 and nav[-1] == "https://www.bilibili.com/video/BV1xx")
-n0 = len(api2._tabs)
+check("开新链接=新标签+创建控件", api2.open_in_app("https://www.bilibili.com/video/BV1xx") == "ok"
+      and len(api2._tabs) == 2 and api2._active == 1
+      and ("create", "https://www.bilibili.com/video/BV1xx", 1) in calls
+      and ("show", 1) in calls)
+n_create = calls.count(("create", "https://www.bilibili.com/video/BV1xx", 1))
 api2.open_in_app("https://www.bilibili.com/video/BV1xx")   # 同链接重复点
-check("同链接去重(只切过去)", len(api2._tabs) == n0 and api2._active == 1)
+check("同链接去重且不重建控件(零重载)", len(api2._tabs) == 2
+      and calls.count(("create", "https://www.bilibili.com/video/BV1xx", 1)) == n_create)
 api2.open_in_app("https://tieba.baidu.com/p/1")
 check("第二个标签入表并激活", len(api2._tabs) == 3 and api2._active == 2)
-check("切回信息流", api2.tab_switch(0) == "ok" and api2._active == 0
-      and nav[-1] == "http://127.0.0.1:8000")
-check("切到指定标签", api2.tab_switch(1) == "ok" and api2._active == 1)
+c_before = len([c for c in calls if c[0] == "create"])
+api2.tab_switch(0)   # 切回信息流: 纯可见性 → 不应有任何 create
+check("切回信息流零重载(无 create)", api2._active == 0
+      and len([c for c in calls if c[0] == "create"]) == c_before
+      and ("show", 0) in calls and ("hide", 2) in calls)
+check("切到指定标签零重载", api2.tab_switch(1) == "ok" and api2._active == 1
+      and len([c for c in calls if c[0] == "create"]) == c_before)
 check("固定标签不可关", api2.tab_close(0) == "pinned" and len(api2._tabs) == 3)
 check("关不存在标签安全", api2.tab_close(999) == "gone" and api2.tab_close("x") == "bad-id")
 check("关当前标签→激活前一个", api2.tab_close(2) == "ok" and len(api2._tabs) == 2
-      and api2._active == 1)
+      and api2._active == 1 and ("dispose", 2) in calls)
 check("关最后一个标签→回信息流", api2.tab_close(1) == "ok" and api2._active == 0
-      and nav[-1] == "http://127.0.0.1:8000" and len(api2._tabs) == 1)
+      and ("show", 0) in calls and len(api2._tabs) == 1)
 
 # ---------- 3. 前端统一出口 ----------
 js = io.open(os.path.join(PROJECT, "web", "app.js"), encoding="utf-8").read()

@@ -5,6 +5,8 @@
 - 标签栏 = Dock=Top 的 Panel, Paint 事件自绘标签(圆角/标题/✕), MouseClick 命中测试;
 - WebView2 控件从 Dock=Fill 改为手动定位在标签栏下方(Anchor 四边), 窗口缩放自动跟随。
 标签栏属于窗口 chrome, 不向页面注入任何元素 —— 任何网站都不被遮挡、行为不变。
+窗口为无边框(frameless): 本栏兼任标题栏 —— 空白处可拖动窗口/双击最大化,
+右端有 ─ □ ✕ 窗口按钮; 无边框缩放由 shell_pages.init 的 WS_THICKFRAME 补丁恢复。
 
 注意: pythonnet 对 .NET 虚方法重写(OnPaint 等)不可靠, 必须用 Paint/MouseClick 事件订阅。
 """
@@ -33,8 +35,9 @@ def install_strip(win, api, bg_rgb=(15, 17, 21)):
     BG = Color.FromArgb(*bg_rgb)
     FG_ON = Color.White
     FG_OFF = Color.FromArgb(168, 176, 190)
-    st = {"tabs": [], "active": 0}
+    st = {"tabs": [], "active": 0, "hover_close": False}
     lock = threading.Lock()
+    form = win.native
 
     strip = WinForms.Panel()
     strip.DoubleBuffered = True
@@ -93,20 +96,99 @@ def install_strip(win, api, bg_rgb=(15, 17, 21)):
                 g.DrawString("\u2715", font, SolidBrush(fg),
                              RectangleF(float(cx), float(y), float(close_w), float(h)), sf)
 
-    def on_mouse_click(_sender, args):
+    BTN_W = lambda: int(40 * scale)   # ─ □ ✕ 每个按钮宽
+
+    def _btn_zone(x):
+        return x >= strip.Width - BTN_W() * 3
+
+    def _btn_at(x):
+        """返回 0=─ 1=□ 2=✕ 或 None。"""
+        if not _btn_zone(x):
+            return None
+        i = (x - (strip.Width - BTN_W() * 3)) // BTN_W()
+        return ("min", "max", "close")[int(i)]
+
+    def _toggle_max():
+        import System.Windows.Forms as WinForms
+        try:
+            form.MaximizedBounds = WinForms.Screen.FromControl(form).WorkingArea
+            form.WindowState = (WinForms.FormWindowState.Normal
+                                if form.WindowState == WinForms.FormWindowState.Maximized
+                                else WinForms.FormWindowState.Maximized)
+        except Exception:
+            pass
+
+    def _hit_tab(x, yv):
         boxes = _layout(strip.Width)
         for i, t in enumerate(st["tabs"]):
             if i >= len(boxes):
                 break
-            x, tw = boxes[i]
-            y, h = int(4 * scale), tab_h
-            if x <= args.X <= x + tw and y <= args.Y <= y + h:
-                if t.get("closable") and args.X > x + tw - int(24 * scale):
-                    api.tab_close(t["id"])
-                else:
-                    api.tab_switch(t["id"])
-                return
+            bx, tw = boxes[i]
+            by, bh = int(4 * scale), tab_h
+            if bx <= x <= bx + tw and by <= yv <= by + bh:
+                return st["tabs"][i]
+        return None
 
+    def on_mouse_down(_sender, args):
+        import ctypes
+        if args.Button != WinForms.MouseButtons.Left:
+            return
+        if _btn_at(args.X) is not None or _hit_tab(args.X, args.Y) is not None:
+            return
+        if args.Clicks == 2:   # 双击空白区: 最大化/还原
+            _toggle_max()
+            return
+        try:   # 空白区按下 → 拖动窗口(标准 NC 拖拽技巧)
+            u32 = ctypes.windll.user32
+            hwnd = form.Handle.ToInt32()
+            u32.ReleaseCapture()
+            u32.SendMessageW(hwnd, 0xA1, 0x2, 0)   # WM_NCLBUTTONDOWN, HTCAPTION
+        except Exception:
+            pass
+
+    def on_mouse_move(_sender, args):
+        hov = (_btn_at(args.X) == "close") and _btn_zone(args.X)
+        if hov != st["hover_close"]:
+            st["hover_close"] = hov
+            strip.Invalidate()
+
+    def on_mouse_leave(_sender, _args):
+        if st["hover_close"]:
+            st["hover_close"] = False
+            strip.Invalidate()
+
+    def on_window_btn(name):
+        import System.Windows.Forms as WinForms
+        try:
+            if name == "min":
+                form.WindowState = WinForms.FormWindowState.Minimized
+            elif name == "max":
+                _toggle_max()
+            elif name == "close":
+                form.Close()
+        except Exception:
+            pass
+
+    def on_mouse_click(_sender, args):
+        name = _btn_at(args.X)
+        if name is not None:
+            on_window_btn(name)
+            return
+        t = _hit_tab(args.X, args.Y)
+        if t is not None:
+            boxes = _layout(strip.Width)
+            for i, tt in enumerate(st["tabs"]):
+                if tt is t and i < len(boxes):
+                    x, tw = boxes[i]
+                    if t.get("closable") and args.X > x + tw - int(24 * scale):
+                        api.tab_close(t["id"])
+                    else:
+                        api.tab_switch(t["id"])
+                    return
+
+    strip.MouseDown += on_mouse_down
+    strip.MouseMove += on_mouse_move
+    strip.MouseLeave += on_mouse_leave
     strip.Paint += on_paint
     strip.MouseClick += on_mouse_click
     strip.Resize += lambda _s, _e: strip.Invalidate()
