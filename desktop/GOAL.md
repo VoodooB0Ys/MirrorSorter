@@ -167,7 +167,8 @@ FormBorderStyle=None 后补回 WS_THICKFRAME 样式位恢复原生边缘缩放�
 | 多控件内存占用 | 各控件共享同一浏览器进程（仅渲染器独立）；站点页数量用户可控（可关） |
 | 无边框无法缩放/盖任务栏 | WS_THICKFRAME + 自建贴边缩放热区(THICKFRAME 缩放带在 WebView2 覆盖下收不到鼠标)；MaximizedBounds=工作区 |
 | 拖边缘缩放变成拖走窗口 | 原因同上(鼠标落入标签栏空白触发了移动)；已由热区+上缘缩放带修复 |
-| 站点页面深浅与主界面不一致(白屏刺眼) | PreferredColorScheme + 页面内自愈定时器(每1.2s重测背景亮度, 反色兜底, 主题晚应用也能追上) |
+| 站点页面深浅与主界面不一致(白屏刺眼) | **B站走原生深色**：CookieManager 直接写官方深色开关 cookie(theme_style=dark, 顶栏切换写的就是它)+重载生效；其他站 PreferredColorScheme + 页面内自愈反色兜底(每1.5s重测) |
+| 脚本改名后引用不同步(踩坑: _DARK_JS→_SMART_JS 改名漏改引用, NameError 被吞, 注入静默失效多轮) | 改名必须全局 grep 旧名；产品异常不要裸 except:pass 吞掉(至少落日志) |
 | 壳内页面读不到用户主题/强调色 | 壳内 WebView2 的 localStorage 与外部浏览器独立 → 主题/强调色落服务端设置(ui_theme/ui_accent_id), 页面首启无本地值时从 /api/ui_theme 恢复 |
 | 无边框窗体缝隙露白线 | 窗体 BackColor 改深色 + 关闭 DWM 非客户区渲染 |
 | 批量替换静默失败(踩坑三次: 绘制块/常量残留/st 顺序) | 替换后必须 grep 验证目标代码真实存在, 再跑 py_compile+运行验证 |

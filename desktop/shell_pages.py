@@ -17,7 +17,11 @@ import time
 # 页面已深色(原生夜间/PreferredColorScheme生效) → 保持不动;
 # 浅色页面(贴吧等不跟随系统的站) → 反色+色相旋转兜底(媒体类反转回原色);
 # 主题晚于首次测量才应用(SPA懒应用)也会被自动追上; 白天模式由 mode 变量直接关断
-_SMART_JS = r"""
+# 统一主题脚本(自愈: 页面内定时器重测/重设):
+# - B站: 用它自己的原生深色主题(cookie theme_style=dark, 官方顶栏开关写的就是这个),
+#   效果是真正的原生深色; 白天模式清除该 cookie
+# - 其他站点: 测量背景亮度, 浅色页面反色兜底(媒体类元素反转回原色), 已深色不动
+_THEME_DARK_JS = r"""
 window.__msx_theme_mode = 'dark';
 (function(){
   function lum(rgb){
@@ -26,11 +30,25 @@ window.__msx_theme_mode = 'dark';
     if (m.length > 3 && parseFloat(m[3]) === 0) return -1;
     return 0.299*m[0] + 0.587*m[1] + 0.114*m[2];
   }
+  function report(s){
+    try { fetch("/api/shell_debug?s=" + encodeURIComponent(s), {cache:"no-store"}); } catch(e) {}
+  }
+  function cleanup(){
+    var o = document.getElementById('__msx_dark');
+    if (o) o.remove();
+    document.documentElement.style.removeProperty('filter');
+  }
   function tick(){
-    if (window.__msx_theme_mode !== 'dark') {
-      var o = document.getElementById('__msx_dark');
-      if (o) o.remove();
-      document.documentElement.style.removeProperty('filter');
+    if (window.__msx_theme_mode !== 'dark') { cleanup(); return; }
+    var isBili = /(^|\.)bilibili\.com$/.test(location.hostname);
+    if (isBili) {
+      if (document.cookie.indexOf('theme_style=dark') === -1) {
+        document.cookie = 'theme_style=dark; path=/; domain=.bilibili.com; max-age=31536000';
+        report('bili-cookie-set');
+        var n = +(sessionStorage.getItem('__msx_rl') || 0);
+        if (n < 2) { sessionStorage.setItem('__msx_rl', String(n + 1)); location.reload(); return; }
+      }
+      cleanup();   // B站原生深色, 不做反色
       return;
     }
     var b = lum(getComputedStyle(document.body).backgroundColor);
@@ -47,9 +65,10 @@ window.__msx_theme_mode = 'dark';
         + 'img,video,picture,canvas,svg,iframe,embed,object'
         + '{filter:invert(1) hue-rotate(180deg)}';
       (document.head || document.documentElement).appendChild(st);
+      report('invert-injected ' + location.hostname);
     }
   }
-  if (!window.__msx_theme_timer) window.__msx_theme_timer = setInterval(tick, 1200);
+  if (!window.__msx_theme_timer) window.__msx_theme_timer = setInterval(tick, 1500);
   tick();
 })()
 """
@@ -59,6 +78,12 @@ window.__msx_theme_mode = 'light';
   var old = document.getElementById('__msx_dark');
   if (old) old.remove();
   document.documentElement.style.removeProperty('filter');
+  if (/(^|\.)bilibili\.com$/.test(location.hostname) &&
+      document.cookie.indexOf('theme_style=dark') !== -1) {
+    document.cookie = 'theme_style=; path=/; domain=.bilibili.com; max-age=0';
+    var n = +(sessionStorage.getItem('__msx_rl') || 0);
+    if (n < 2) { sessionStorage.setItem('__msx_rl', String(n + 1)); location.reload(); }
+  }
 })()
 """
 
@@ -98,6 +123,7 @@ def create_pool(win, on_title, on_newtab, theme_getter=None):
 
     class _Pool:
         ctrls = {0: None}   # tab_key -> WebView2 控件(0 = 信息流主控件)
+        _bili_reloaded = {}  # id(ctrl) -> 上次重载时的主题(B站深色cookie生效防循环)
 
         def _is_dark(self):
             try:
@@ -118,7 +144,31 @@ def create_pool(win, on_title, on_newtab, theme_getter=None):
                             2 if dark else 1)   # Dark/Light
                     except Exception:
                         pass
-                    core.ExecuteScriptAsync(_DARK_JS if dark else _LIGHT_JS)
+                    # ---- B站原生深色: 官方深色开关就是 theme_style cookie
+                    #      (顶栏头像区的深浅切换写它), 用 CookieManager 直接设置 ----
+                    try:
+                        cm = core.CookieManager
+                        want = "dark" if dark else ""
+                        if want:
+                            cm.AddOrUpdateCookie(cm.CreateCookie(
+                                "theme_style", "dark", ".bilibili.com", "/"))
+                            cm.AddOrUpdateCookie(cm.CreateCookie(
+                                "b_night_number", "1", ".bilibili.com", "/"))
+                        else:
+                            cm.DeleteCookies("theme_style", "https://www.bilibili.com")
+                            cm.DeleteCookies("b_night_number", "https://www.bilibili.com")
+                        src = str(c.Source or "")
+                        # 当前页在B站且该标签还没为此主题重载过 → 重载一次让原生深色生效
+                        # (防循环: 同一标签同一主题只重载一次)
+                        if ("bilibili.com" in src
+                                and self._bili_reloaded.get(id(c)) != dark):
+                            self._bili_reloaded[id(c)] = dark
+                            core.Reload()
+                    except Exception:
+                        import traceback
+                        traceback.print_exc()
+                    # ---- 其他站点: 智能反色兜底(自愈定时器在脚本内) ----
+                    core.ExecuteScriptAsync(_THEME_DARK_JS if dark else _LIGHT_JS)
                 except Exception:
                     import traceback
                     print("[theme] ERROR:", flush=True)

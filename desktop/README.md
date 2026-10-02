@@ -37,9 +37,11 @@ that used to open your system browser — now opens as a **tab in the app window
   pop-ups (target=_blank) become tabs too. Tabs render browser-style (rounded top,
   accent bar on the active tab).
 - **Pages follow the app's dark/light theme and accent color**: with 黑夜 mode on,
-  embedded sites render dark automatically — no more blinding white pages; the tab
-  accent bar uses your accent color from the app settings. Theme/accent are stored
-  in the app settings store and restored inside the shell on first launch.
+  Bilibili switches to **its own native dark theme** (the shell sets the same
+  `theme_style` cookie the site's own toggle writes) — no blinding white pages and
+  no cheap color inversion; other sites get an auto-dark fallback. The tab accent
+  bar follows your accent color from the app settings, and theme/accent are
+  restored inside the shell on first launch from the settings store.
 - **Switching tabs never reloads**: each tab is its own WebView2 instance sharing
   the same browser profile — the feed keeps its state, videos keep playing when
   you switch away and back.

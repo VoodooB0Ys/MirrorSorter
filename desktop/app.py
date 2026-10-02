@@ -8669,6 +8669,10 @@ class Handler(BaseHTTPRequestHandler):
                                    "xhh": {"logged_in": xhh_logged_in,
                                            "unread": xhh_unread,
                                            "url": "https://www.xiaoheihe.cn/message/home/comment"}})
+        if path.startswith("/api/shell_debug"):
+            print("[shell-debug] %s" % path[len("/api/shell_debug?s="):], flush=True)
+            return self.send_json({"ok": True})
+
         if path == "/api/ui_theme":
             # 桌面窗口壳: 页面首次启动(壳内localStorage为空)时从这里恢复主界面主题/强调色
             acc_id = sget("ui_accent_id")
