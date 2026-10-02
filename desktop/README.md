@@ -31,12 +31,13 @@ Double-clicking again is safe: it detects the running service and just opens the
 Clicking a feed card, message entry, account link, history/saved item — anything
 that used to open your system browser — now opens as a **tab in the app window**:
 
-- A floating tab bar sits at the **bottom center**: `[信息流] [页面标题 ✕] [⟳] [⧉]`
-  — click a pill to switch tabs, `✕` closes, `⟳` reloads, `⧉` hands the current
-  page to your system browser. It auto-hides while a video goes fullscreen.
-- The feed itself is the pinned `信息流` tab; in-site links navigate within the
-  current tab and the tab remembers its latest address; opening the same link
-  twice just switches to the existing tab.
+- A native browser-style **tab bar sits at the top of the window**: `信息流` is the
+  pinned home tab (cannot be closed); every video/post opens as a new tab showing
+  the page title with a hover `✕` to close; click a tab to switch.
+- The tab bar is part of the window chrome (WinForms-drawn) — it never overlaps or
+  blocks any website's own UI.
+- In-site links navigate within the current tab and the tab remembers its latest
+  address; opening the same link twice just switches to the existing tab.
 - Site logins (e.g. Bilibili) persist across restarts (WebView2 non-private mode).
 - Known trade-off: switching tabs reloads the page (one WebView per window), so
   playback doesn't continue across tab switches.
@@ -127,6 +128,7 @@ python app.py            # equivalent headless service (CLI)
 desktop/
 ├── app.py            # backend: fetching + AI scoring + SQLite + all APIs + local server
 ├── app_window.py     # window shell (exe entry): pywebview window + built-in browser tabs
+├── shell_tabstrip.py # native browser-style tab bar at the top of the window
 ├── web/index.html    # UI skeleton
 ├── web/style.css     # styles
 ├── web/app.js        # frontend logic (openExternal routes links into shell tabs)

@@ -4,17 +4,17 @@
 把服务装进自带的应用窗口: pywebview 驱动系统自带的 WebView2(Edge Chromium 内核),
 - 双击启动 → 弹出应用主窗口, 不再依赖外部浏览器;
 - 点 feed 卡片/消息/账号等任何视频·帖子链接 → 主窗口内**新增一个内置浏览器标签页**
-  (右上角悬浮标签条可切换/关闭, 不产生任何新窗口);
+  (窗口顶部原生"浏览器式"标签栏, 信息流为固定首页标签, 不产生任何新窗口);
 - 未装 WebView2 运行时或缺 pywebview 库 → 自动回退外部浏览器模式(旧行为, 弹提示);
 - `python app_window.py --server` → 纯服务模式(等同 python app.py --auto-open)。
 
 实现说明: pywebview 一个窗口只有一个 WebView, 标签页 = Python 端维护的标签表 +
-切换时导航同一 WebView, 注入标签条随每次页面加载重新渲染。已知取舍: 切换标签
-会重新加载页面(视频播放不跨标签续播); 站内链接在当前标签内正常跳转。
+切换时导航同一 WebView; 标签栏是窗口顶部的原生部件(见 shell_tabstrip.py), 不向
+页面注入任何元素。已知取舍: 切换标签会重新加载页面(视频播放不跨标签续播);
+站内链接在当前标签内正常跳转。
 
 开源依赖: pywebview (MIT, github.com/r0x0r/pywebview), Windows 走 WebView2 运行时。
 """
-import json
 import os
 import re
 import sys
@@ -33,71 +33,6 @@ APP_VER = app.APP_VER
 MAIN_W, MAIN_H = 1440, 920
 MAIN_MIN = (1080, 700)
 BG_DARK = "#0f1115"   # 与 web/style.css 暗色 --bg 一致, 避免窗口加载瞬间白闪
-ACCENT = "251,114,153"   # 应用主题强调色(B站粉), 标签条选中态用
-
-# 内置浏览器标签条: 由 Python 在每次页面加载后注入并传入标签状态渲染。
-# - 底部居中悬浮胶囊(站点顶栏/底栏大多有内容, 底部中央冲突最小), 常态 85% 不透明;
-# - 进入全屏(看视频)自动隐藏, 退出恢复;
-# - 切换/关闭走桥(tab_switch/tab_close), 捕获阶段点击防站点脚本吞事件;
-# - ⟳ 刷新当前页, ⧉ 用系统浏览器打开当前页。
-TABBAR_JS = r"""
-window.__MSX_render = function(state){
-  var old = document.getElementById('__msx_tabbar');
-  if (old) { old.remove(); }
-  function api(){ return (window.pywebview && window.pywebview.api) || null; }
-  var bar = document.createElement('div');
-  bar.id = '__msx_tabbar';
-  bar.style.cssText = 'position:fixed;bottom:14px;left:50%;transform:translateX(-50%);'
-    + 'z-index:2147483647;display:flex;align-items:center;gap:5px;max-width:86vw;'
-    + 'font:12px/1 system-ui,"Microsoft YaHei",sans-serif;opacity:.85;'
-    + 'transition:opacity .25s;user-select:none;-webkit-user-select:none;'
-    + 'padding:4px;border-radius:12px;background:rgba(10,12,18,.55);'
-    + 'box-shadow:0 6px 24px rgba(0,0,0,.35)';
-  bar.addEventListener('mouseenter', function(){ bar.style.opacity = '1'; });
-  bar.addEventListener('mouseleave', function(){ bar.style.opacity = '.85'; });
-  function fs(){ return !!document.fullscreenElement; }
-  document.addEventListener('fullscreenchange', function(){
-    bar.style.display = fs() ? 'none' : 'flex';
-  });
-  if (fs()) { bar.style.display = 'none'; }
-  function pill(label, tip, fn, active, closable, tid){
-    var p = document.createElement('div');
-    p.title = tip;
-    p.style.cssText = 'display:flex;align-items:center;gap:5px;padding:7px 10px;'
-      + 'border-radius:9px;cursor:pointer;white-space:nowrap;max-width:200px;'
-      + 'overflow:hidden;background:' + (active ? 'rgba(%ACCENT%,.95)' : 'rgba(40,46,60,.92)')
-      + ';color:#fff';
-    var t = document.createElement('span');
-    t.textContent = label;
-    t.style.cssText = 'overflow:hidden;text-overflow:ellipsis';
-    p.appendChild(t);
-    if (closable) {
-      var x = document.createElement('span');
-      x.textContent = '\u2715';
-      x.title = '\u5173\u95ed\u6807\u7b7e\u9875';
-      x.style.cssText = 'opacity:.55;padding:0 1px';
-      x.addEventListener('click', function(ev){
-        ev.stopPropagation(); var a = api(); if (a) a.tab_close(tid);
-      }, true);
-      p.appendChild(x);
-    }
-    p.addEventListener('click', function(ev){
-      ev.preventDefault(); ev.stopPropagation(); fn();
-    }, true);
-    bar.appendChild(p);
-  }
-  (state.tabs || []).forEach(function(tb){
-    pill(tb.title || '\u9875\u9762', tb.title || '', function(){
-      var a = api(); if (a) a.tab_switch(tb.id);
-    }, tb.id === state.active, !tb.pinned, tb.id);
-  });
-  pill('\u27f3', '\u5237\u65b0\u5f53\u524d\u9875', function(){ location.reload(); });
-  pill('\u29c9', '\u7528\u7cfb\u7edf\u6d4f\u89c8\u5668\u6253\u5f00\u5f53\u524d\u9875', function(){
-    var a = api(); if (a) a.open_external(location.href);
-  });
-  (document.body || document.documentElement).appendChild(bar);
-};
-"""
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 _WV2_CLIENT_ID = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"   # WebView2 Evergreen 运行时
@@ -158,6 +93,7 @@ class ShellApi:
     def __init__(self):
         self._win = None          # 主窗口, attach() 绑定
         self._app_url = None
+        self._strip_update = None  # 原生标签栏重绘回调, bind_strip() 注入
         self._lock = threading.Lock()
         self._tabs = [{"id": self.HOME_ID, "url": None, "title": "信息流", "pinned": True}]
         self._active = self.HOME_ID
@@ -191,7 +127,9 @@ class ShellApi:
                                    "title": (title or url)[:24], "pinned": False})
                 self._active = self._next_id
                 self._next_id += 1
-        return self._navigate(url)
+        ret = self._navigate(url)
+        self._render()   # 即时反馈: 标签栏立刻高亮新标签(不等页面加载完)
+        return ret
 
     def tab_switch(self, tid=None):
         try:
@@ -268,19 +206,22 @@ class ShellApi:
         except Exception:
             pass
 
+    def bind_strip(self, update_fn):
+        """注入原生标签栏重绘回调(shell_tabstrip.install_strip 的返回值)。"""
+        self._strip_update = update_fn
+        self._render()
+
     def _render(self):
-        w = self._win
-        if w is None:
+        """把标签表同步到原生标签栏(跨线程安全, 由 strip 侧 marshal 到 UI 线程)。"""
+        fn = self._strip_update
+        if fn is None:
             return
         try:
             with self._lock:
-                payload = json.dumps(
-                    {"active": self._active,
-                     "tabs": [{"id": t["id"], "title": t["title"] or "页面", "pinned": t["pinned"]}
-                              for t in self._tabs]},
-                    ensure_ascii=False)
-            w.evaluate_js(TABBAR_JS.replace("%ACCENT%", ACCENT)
-                          + "\n__MSX_render(%s);" % payload)
+                tabs = [{"id": t["id"], "title": t["title"] or "页面",
+                         "closable": not t["pinned"]} for t in self._tabs]
+                active = self._active
+            fn(tabs, active)
         except Exception:
             pass
 
@@ -373,14 +314,25 @@ def shell_main(e2e_url=None):
                                 background_color=BG_DARK, js_api=api)
     api.attach(win, url)
 
-    def e2e_hook():
-        if not e2e_url:
-            return
-        time.sleep(8)   # 等主窗口与服务就绪
-        api.open_in_app(e2e_url, "E2E 视频标签页")
+    def gui_ready():
+        # GUI 就绪(在 pywebview 的后台线程): 等原生窗体创建完成后安装标签栏, 再跑测试钩子
+        try:
+            end = time.time() + 30
+            while (win.native is None or not win.native.IsHandleCreated) and time.time() < end:
+                time.sleep(0.2)
+            if win.native is None:
+                raise RuntimeError("native window form not ready")
+            from shell_tabstrip import install_strip
+            api.bind_strip(install_strip(win, api))
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        if e2e_url:
+            time.sleep(8)   # 等主窗口与服务就绪
+            api.open_in_app(e2e_url, "E2E 视频标签页")
 
     # 非无痕: 内置浏览器标签页里的登录态(B站等)跨重启保留, 数据落用户目录
-    webview.start(func=e2e_hook, private_mode=False,
+    webview.start(func=gui_ready, private_mode=False,
                   debug=os.environ.get("MSX_DEBUG") == "1")
     # start() 返回 = 窗口已关闭 → 收尾退出(收球/停线程池/关服务)
     app.shutdown(server)
