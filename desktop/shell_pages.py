@@ -214,10 +214,13 @@ def _build_inject_script(port):
         'try { fetch("http://127.0.0.1:" + window.__MSX_PORT__ +'
         ' "/api/shell_debug?s=userscript-env-injected", {mode: "no-cors"}); } catch (e) {}',
     ]
-    if vue:
-        parts.append(vue)   # var Vue = ...(全局, 供净化大师使用)
-    if shim:
-        parts.append(shim)
+    # Vue/GM垫片只为净化大师服务 —— 它们会污染页面全局(曾致 B 站页面 Vue.use
+    # 崩溃 → 评论/懒加载图片全挂), 净化大师禁用时绝不注入
+    if builtin:
+        if vue:
+            parts.append(vue)   # var Vue = ...(全局, 供净化大师使用)
+        if shim:
+            parts.append(shim)
     if builtin:
         parts.append(
             'if ((function(){var h=location.hostname; return h==="bilibili.com"||'
