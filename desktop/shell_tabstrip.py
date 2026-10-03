@@ -28,9 +28,9 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None):
 
     form = win.native
     scale = float(getattr(form, "_scale", 1.0) or 1.0)
-    bar_h = max(34, int(44 * scale))
+    bar_h = max(28, int(32 * scale))
     tab_h = bar_h - 8
-    font = Font("Microsoft YaHei", 9.0 * scale)
+    font = Font("Microsoft YaHei", 8.0 * scale)
     TAB_ACTIVE = Color.FromArgb(22, 25, 32)     # 激活标签(=应用 --panel)
     TAB_HOVER = Color.FromArgb(30, 34, 44)      # 非激活悬停
     BG = Color.FromArgb(10, 12, 16)             # 标签栏底色(比窗口更深一档)
@@ -60,7 +60,7 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None):
             return []
         gap, margin = int(4 * scale), int(6 * scale)
         btn_zone = BTN_W() * 3 + int(2 * scale)
-        tw = min(int(200 * scale),
+        tw = min(int(180 * scale),
                  max(int(110 * scale), (width - margin - btn_zone - gap * (n - 1)) // n))
         out, x = [], margin
         for _ in range(n):
@@ -73,7 +73,8 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None):
         d = rad * 2
         p.AddArc(x, y, d, d, 180, 90)             # 左上
         p.AddArc(x + w - d, y, d, d, 270, 90)     # 右上
-        p.AddLine(x + w, y + h, x, y + h)         # 底边直角(贴住栏底)
+        p.AddArc(x + w - d, y + h - d, d, d, 0, 90)    # 右下
+        p.AddArc(x, y + h - d, d, d, 90, 90)      # 左下
         p.CloseFigure()
         return p
 
@@ -82,38 +83,41 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None):
         g.SmoothingMode = SmoothingMode.AntiAlias
         g.Clear(BG)
         boxes = _layout(strip.Width)
-        rad = int(8 * scale)
+        rad = int(5 * scale)
+        ty, th = int(3 * scale), bar_h - int(6 * scale)
+        last_right = None
         for i, t in enumerate(st["tabs"]):
             if i >= len(boxes):
                 break
             x, tw = boxes[i]
             act = (t["id"] == st["active"])
             hov = (st["hover_tab"] == t["id"] and not act)
-            # 顶圆角矩形, 底边贴住栏底 —— 与内容区相连的浏览器标签观感
+            if not act and last_right is not None:   # 非激活标签之间的细分隔线
+                g.DrawLine(Pen(Color.FromArgb(52, 57, 68), 1.0),
+                           float(x - int(2 * scale)), float(ty + th * 0.25),
+                           float(x - int(2 * scale)), float(ty + th * 0.75))
             g.FillPath(SolidBrush(TAB_ACTIVE if act else (TAB_HOVER if hov else BG)),
-                       _rounded_path(x, 0, tw, bar_h, rad))
-            if act:   # 顶部强调条(颜色跟随设置文件的强调色)
-                g.FillRectangle(SolidBrush(st["accent"]), float(x + rad * 0.4), 0.0,
-                                float(tw - rad * 0.8), float(int(3 * scale)))
+                       _rounded_path(x, ty, tw, th, rad))
             fg = FG_ON if act else FG_OFF
-            close_w = int(22 * scale) if t.get("closable") else int(8 * scale)
-            rect = RectangleF(float(x + int(10 * scale)), 0.0,
-                              float(tw - close_w - int(10 * scale)), float(bar_h))
+            close_w = int(18 * scale) if t.get("closable") else int(6 * scale)
+            rect = RectangleF(float(x + int(8 * scale)), float(ty),
+                              float(tw - close_w - int(8 * scale)), float(th))
             g.DrawString(t.get("title") or "页面", font, SolidBrush(fg), rect, sf)
             if t.get("closable"):
                 cx = x + tw - close_w
-                g.DrawString("\u2715", font, SolidBrush(fg),
-                             RectangleF(float(cx), 0.0, float(close_w), float(bar_h)), sf)
-        # 右端窗口按钮: ─ □ ✕ —— 无边框窗口的标题栏按钮, 白色符号 + 分隔线, 始终清晰可见
+                g.DrawString("✕", font, SolidBrush(fg),
+                             RectangleF(float(cx), float(ty), float(close_w), float(th)), sf)
+            last_right = x + tw
+        # 右端窗口按钮: ─ □ ✕ —— 白色符号 + 分隔线
         from System.Drawing import Pen
         bw = BTN_W()
         zx = strip.Width - bw * 3
-        g.DrawLine(Pen(Color.FromArgb(70, 76, 92), 1.0),
-                   float(zx), float(int(5 * scale)), float(zx), float(bar_h - int(5 * scale)))
+        g.DrawLine(Pen(Color.FromArgb(52, 57, 68), 1.0),
+                   float(zx), float(int(4 * scale)), float(zx), float(bar_h - int(4 * scale)))
         sf_c = StringFormat()
         sf_c.Alignment = StringAlignment.Center
         sf_c.LineAlignment = StringAlignment.Center
-        for i, (name, sym) in enumerate((("min", "\u2500"), ("max", "\u25a1"), ("close", "\u2715"))):
+        for i, (name, sym) in enumerate((("min", "─"), ("max", "□"), ("close", "✕"))):
             bx = zx + bw * i
             hov = (st["hover_btn"] == name)
             if name == "close" and hov:
@@ -122,10 +126,10 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None):
             elif hov:
                 g.FillRectangle(SolidBrush(Color.FromArgb(62, 68, 84)),
                                 float(bx), 0.0, float(bw), float(bar_h))
-            g.DrawString(sym, font, SolidBrush(Color.FromArgb(236, 240, 248)),
+            g.DrawString(sym, font, SolidBrush(Color.FromArgb(226, 230, 238)),
                          RectangleF(float(bx), 0.0, float(bw), float(bar_h)), sf_c)
 
-    BTN_W = lambda: int(46 * scale)   # ─ □ ✕ 每个按钮宽(与系统标题栏按钮同规格)
+    BTN_W = lambda: int(36 * scale)   # ─ □ ✕ 窗口按钮宽
 
     def _btn_zone(x):
         return x >= strip.Width - BTN_W() * 3

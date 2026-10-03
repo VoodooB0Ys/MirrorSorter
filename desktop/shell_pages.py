@@ -9,6 +9,7 @@
 任意线程调用。pythonnet 注意: 控件必须在 UI 线程创建(跨线程建父子会抛
 ArgumentException); Anchor 必须显式四边(主控件 Dock=Fill 时其 Anchor 值不可拷贝)。
 """
+import os
 import threading
 import time
 
