@@ -13,6 +13,8 @@ import os
 import threading
 import time
 
+import app   # DATA_DIR(日志/用户脚本目录); 由 app_window 一并加载, 无循环依赖
+
 
 # 自愈式智能深色: 脚本在页面内常驻定时器, 每1.2s重测背景亮度 ——
 # 页面已深色(原生夜间/PreferredColorScheme生效) → 保持不动;
@@ -22,6 +24,50 @@ import time
 # - B站: 用它自己的原生深色主题(cookie theme_style=dark, 官方顶栏开关写的就是这个),
 #   效果是真正的原生深色; 白天模式清除该 cookie
 # - 其他站点: 测量背景亮度, 浅色页面反色兜底(媒体类元素反转回原色), 已深色不动
+# 页面诊断钩子: JS异常/资源加载失败经 window.open(msx-debug:...) 回传(不产生真实新窗)
+_DEBUG_HOOK_JS = r"""
+(function(){
+  if (window.__msx_dbg) return;
+  window.__msx_dbg = 1;
+  function rep(s){
+    try { window.open('msx-debug:' + String(s).slice(0, 220), '_blank'); } catch (e) {}
+  }
+  window.addEventListener('error', function(e){
+    if (e.target && e.target !== window && (e.target.src || e.target.href)) {
+      rep('RESFAIL ' + (e.target.tagName || '') + ' ' + String(e.target.src || e.target.href).slice(0, 150));
+    } else {
+      rep('JSERR ' + (e.message || '') + ' @' + String(e.filename || '').slice(-40) + ':' + (e.lineno || 0));
+    }
+  }, true);
+  window.addEventListener('unhandledrejection', function(e){
+    rep('REJ ' + String(e.reason).slice(0, 150));
+  }, true);
+  var of = fetch;
+  window.fetch = function(){
+    var args = arguments, url = String((args[0] && args[0].url) || args[0] || '');
+    return of.apply(this, arguments).then(function(r){
+      if (!r.ok) rep('FETCH ' + r.status + ' ' + url.slice(0, 140));
+      return r;
+    }, function(e){
+      rep('FETCHFAIL ' + url.slice(0, 140) + ' ' + (e && e.message ? e.message : ''));
+      throw e;
+    });
+  };
+  var ox = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(m, u){
+    this.__msx_u = String(u);
+    return ox.apply(this, arguments);
+  };
+  var osend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function(){
+    var xhr = this, u = this.__msx_u || '';
+    this.addEventListener('error', function(){ rep('XHRFAIL ' + u.slice(0, 140)); });
+    this.addEventListener('load', function(){ if (xhr.status >= 400) rep('XHR' + xhr.status + ' ' + u.slice(0, 140)); });
+    return osend.apply(this, arguments);
+  };
+})();
+"""
+
 _THEME_DARK_JS = r"""
 window.__msx_theme_mode = 'dark';
 (function(){
@@ -93,6 +139,17 @@ window.__msx_theme_mode = 'light';
 # 通道: AddScriptToExecuteOnDocumentCreatedAsync(每次文档创建自动执行, MAIN 上下文,
 # 等价于 document-start 的油猴脚本)。扩展 API(AddBrowserExtensionAsync)在部分
 # 环境返回"不支持"(0x80070032), 因此不依赖它。
+def _dbg_log(msg):
+    """壳诊断日志(数据目录/shell_debug.log): 无控制台环境下排查注入链路。"""
+    try:
+        import time as _t
+        with open(os.path.join(app.DATA_DIR, "shell_debug.log"), "a",
+                  encoding="utf-8") as f:
+            print("[shell] " + msg, flush=True); f.write("[" + NL + "] %s" % (_t.strftime("%H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
 def _read_ext_file(name):
     import sys
     here = os.path.dirname(os.path.abspath(__file__))
@@ -101,9 +158,14 @@ def _read_ext_file(name):
         p = os.path.join(d, name)
         if os.path.isfile(p):
             try:
-                return open(p, encoding="utf-8").read()
-            except Exception:
+                data = open(p, encoding="utf-8").read()
+                _dbg_log("read %s from %s (%d bytes)" % (name, d, len(data)))
+                return data
+            except Exception as e:
+                _dbg_log("read %s FAILED: %r" % (name, e))
                 return ""
+    _dbg_log("read %s NOT FOUND (here=%s meipass=%s)"
+             % (name, here, getattr(sys, "_MEIPASS", None)))
     return ""
 
 
@@ -142,8 +204,10 @@ def _build_inject_script(port):
     shim = _read_ext_file("gm-shim.js")
     builtin = _read_ext_file("bilibili-cleaner.user.js")
     if not shim:
+        _dbg_log("build_inject: NO SHIM -> inject disabled")
         return ""
     parts = [
+        _DEBUG_HOOK_JS,
         "window.__MSX_PORT__ = %d;" % port,
         'try { fetch("http://127.0.0.1:" + window.__MSX_PORT__ +'
         ' "/api/shell_debug?s=userscript-env-injected", {mode: "no-cors"}); } catch (e) {}',
@@ -229,17 +293,15 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000):
                         if want:
                             cm.AddOrUpdateCookie(cm.CreateCookie(
                                 "theme_style", "dark", ".bilibili.com", "/"))
-                            cm.AddOrUpdateCookie(cm.CreateCookie(
-                                "b_night_number", "1", ".bilibili.com", "/"))
                         else:
                             cm.DeleteCookies("theme_style", "https://www.bilibili.com")
-                            cm.DeleteCookies("b_night_number", "https://www.bilibili.com")
                         src = str(c.Source or "")
                         # 当前页在B站且该标签还没为此主题重载过 → 重载一次让原生深色生效
                         # (防循环: 同一标签同一主题只重载一次)
                         if ("bilibili.com" in src
                                 and self._bili_reloaded.get(id(c)) != dark):
                             self._bili_reloaded[id(c)] = dark
+                            _dbg_log("bili cookie set dark=%s -> reload" % dark)
                             core.Reload()
                     except Exception:
                         pass   # 关窗时序中控件可能刚好销毁, 静默即可
@@ -343,16 +405,23 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000):
                         core.DocumentTitleChanged += lambda _s2, _a2: on_title(
                             tab_key, core.DocumentTitle)
                         try:   # 内置油猴环境: 净化大师 + 用户自定义脚本(每次文档创建自动执行)
+                            _dbg_log("on_ready: registering document-created script")
                             inj = _build_inject_script(box.get("port") or 8000)
                             if inj:
                                 core.AddScriptToExecuteOnDocumentCreatedAsync(inj)
-                        except Exception:
-                            import traceback
-                            traceback.print_exc()
+                                _dbg_log("on_ready: AddScript called (%d chars)" % len(inj))
+                            else:
+                                _dbg_log("on_ready: empty inject script!")
+                        except Exception as e:
+                            _dbg_log("on_ready FAILED: %r" % e)
 
                         def on_newwin(_s2, a2):
                             a2.Handled = True
-                            on_newtab(tab_key, str(a2.get_Uri()))
+                            u = str(a2.get_Uri())
+                            if u.startswith("msx-debug:"):
+                                _dbg_log(u[len("msx-debug:"):])
+                                return
+                            on_newtab(tab_key, u)
                         core.NewWindowRequested += on_newwin
 
                         def on_nav_done(_s2, _a2):   # 每次整页加载完按当前主题补注入
