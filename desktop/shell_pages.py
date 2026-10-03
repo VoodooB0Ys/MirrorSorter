@@ -155,6 +155,9 @@ def _build_inject_script(port):
         parts.append(
             'if ((function(){var h=location.hostname; return h==="bilibili.com"||'
             'h.endsWith(".bilibili.com")})()) {\n' + builtin + '\n}')
+    bsb = _read_ext_file("bilibili-sponsorblock.js")
+    if bsb:
+        parts.append('try {\n' + bsb + '\n} catch (e) { console.warn("[msx] sponsorblock", e); }')
     for us in _user_scripts():
         parts.append('try { (function(){\n' + us + '\n})(); }'
                      ' catch (e) { console.warn("[msx] userscript", e); }')

@@ -71,6 +71,9 @@ Python 3.14 兼容。调研结论：
    user.js，MAIN 上下文 document-start）——扩展 API(AddBrowserExtensionAsync)
    在部分环境返回"不支持"(0x80070032)，故不依赖它；用户自定义油猴脚本：丢进
    数据目录 userscripts/*.user.js 即全站生效。
+   另内置 **SponsorBlock 客户端**（数据源 BilibiliSponsorBlock 社区 bsbsb.top,
+   API CORS 全开）：B 站视频页自动跳过恰饭/三连提醒/片头片尾等社区标注片段
+   （进度条片段着色 + 播放器右上 🧭 开关 + 跳过提示）。
 8. 切回信息流标签时设置栏不再出现白色焦点框（页面焦点环已去掉）。
 9. **任何时刻只有一个应用窗口**；关闭主窗口 → 应用进程退出、悬浮球收走、服务关闭。
 10. **零降级死角**：未装 WebView2 运行时/库缺失的机器 → 自动回退到"外部浏览器模式"

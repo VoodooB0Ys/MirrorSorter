@@ -36,6 +36,10 @@ that used to open your system browser — now opens as a **tab in the app window
   showing the page title with a hover `✕` to close; click a tab to switch. Site
   pop-ups (target=_blank) become tabs too. Tabs render browser-style (rounded top,
   accent bar on the active tab).
+- **In-video sponsor skip** (SponsorBlock client, community data from
+  [BilibiliSponsorBlock](https://github.com/hanydd/BilibiliSponsorBlock) / bsbsb.top):
+  embedded video pages auto-skip community-marked segments (赞助/恰饭, 三连提醒,
+  片头片尾...) with progress-bar coloring and a 🧭 toggle on the player.
 - **Bilibili page cleaner built in** ([bilibili-cleaner](https://github.com/festoney8/bilibili-cleaner), MIT):
   embedded Bilibili pages get full page purification + ad filtering (300+ options,
   "净化" button at the bottom-right to configure). Custom userscripts: drop any
