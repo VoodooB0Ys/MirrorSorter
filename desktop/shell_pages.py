@@ -202,7 +202,9 @@ def _build_inject_script(port):
     """组装文档创建脚本: Vue + GM垫片 + 内置净化大师 + 用户脚本。"""
     vue = _read_ext_file("vue.global.prod.js")
     shim = _read_ext_file("gm-shim.js")
-    builtin = _read_ext_file("bilibili-cleaner.user.js")
+    # 净化大师默认禁用(其脚本环境曾干扰B站页面图片/评论加载, 用户反馈后移除);
+    # 需要时设环境变量 MSX_CLEANER=1 重新启用
+    builtin = _read_ext_file("bilibili-cleaner.user.js") if os.environ.get("MSX_CLEANER") == "1" else ""
     if not shim:
         _dbg_log("build_inject: NO SHIM -> inject disabled")
         return ""
@@ -220,7 +222,7 @@ def _build_inject_script(port):
         parts.append(
             'if ((function(){var h=location.hostname; return h==="bilibili.com"||'
             'h.endsWith(".bilibili.com")})()) {\n' + builtin + '\n}')
-    bsb = _read_ext_file("bilibili-sponsorblock.js")
+    bsb = "" if os.environ.get("MSX_NO_INJECT") else _read_ext_file("bilibili-sponsorblock.js")
     if bsb:
         parts.append('try {\n' + bsb + '\n} catch (e) { console.warn("[msx] sponsorblock", e); }')
     for us in _user_scripts():
