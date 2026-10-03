@@ -36,6 +36,10 @@ that used to open your system browser — now opens as a **tab in the app window
   showing the page title with a hover `✕` to close; click a tab to switch. Site
   pop-ups (target=_blank) become tabs too. Tabs render browser-style (rounded top,
   accent bar on the active tab).
+- **Bilibili page cleaner built in** ([bilibili-cleaner](https://github.com/festoney8/bilibili-cleaner), MIT):
+  embedded Bilibili pages get full page purification + ad filtering (300+ options,
+  "净化" button at the bottom-right to configure). Custom userscripts: drop any
+  `.user.js` into `%LOCALAPPDATA%\LocalLow\MirrorSorter\userscripts` and it loads on every page automatically.
 - **Pages follow the app's dark/light theme and accent color**: with 黑夜 mode on,
   Bilibili switches to **its own native dark theme** (the shell sets the same
   `theme_style` cookie the site's own toggle writes) — no blinding white pages and
