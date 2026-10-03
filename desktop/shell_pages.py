@@ -88,7 +88,80 @@ window.__msx_theme_mode = 'light';
 """
 
 
-def create_pool(win, on_title, on_newtab, theme_getter=None):
+# ---- 内置油猴脚本环境: Vue + GM 垫片 + 净化大师 + 用户自定义脚本 ----
+# 通道: AddScriptToExecuteOnDocumentCreatedAsync(每次文档创建自动执行, MAIN 上下文,
+# 等价于 document-start 的油猴脚本)。扩展 API(AddBrowserExtensionAsync)在部分
+# 环境返回"不支持"(0x80070032), 因此不依赖它。
+def _read_ext_file(name):
+    import sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (here, os.path.join(getattr(sys, "_MEIPASS", "") or "", "extensions"),
+              os.path.join(here, "extensions")):
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            try:
+                return open(p, encoding="utf-8").read()
+            except Exception:
+                return ""
+    return ""
+
+
+def _user_scripts():
+    """用户自定义油猴脚本: 数据目录 userscripts/*.user.js, 丢进去即生效。"""
+    try:
+        d = os.path.join(app.DATA_DIR, "userscripts")
+        out = []
+        if os.path.isdir(d):
+            for fn in sorted(os.listdir(d)):
+                if fn.endswith((".user.js", ".js")):
+                    try:
+                        out.append(open(os.path.join(d, fn), encoding="utf-8").read())
+                    except Exception:
+                        pass
+        return out
+    except Exception:
+        return []
+
+
+def _glob_match(pattern, host):
+    """简化 @match 通配: *://*.bilibili.com/* 的 host 段 *.bilibili.com 含主域"""
+    try:
+        hostpat = pattern.split("://", 1)[-1].split("/", 1)[0]
+        if hostpat.startswith("*."):
+            dome = hostpat[2:]
+            return host == dome or host.endswith("." + dome)
+        return host == hostpat
+    except Exception:
+        return True
+
+
+def _build_inject_script(port):
+    """组装文档创建脚本: Vue + GM垫片 + 内置净化大师 + 用户脚本。"""
+    vue = _read_ext_file("vue.global.prod.js")
+    shim = _read_ext_file("gm-shim.js")
+    builtin = _read_ext_file("bilibili-cleaner.user.js")
+    if not shim:
+        return ""
+    parts = [
+        "window.__MSX_PORT__ = %d;" % port,
+        'try { fetch("http://127.0.0.1:" + window.__MSX_PORT__ +'
+        ' "/api/shell_debug?s=userscript-env-injected", {mode: "no-cors"}); } catch (e) {}',
+    ]
+    if vue:
+        parts.append(vue)   # var Vue = ...(全局, 供净化大师使用)
+    if shim:
+        parts.append(shim)
+    if builtin:
+        parts.append(
+            'if ((function(){var h=location.hostname; return h==="bilibili.com"||'
+            'h.endsWith(".bilibili.com")})()) {\n' + builtin + '\n}')
+    for us in _user_scripts():
+        parts.append('try { (function(){\n' + us + '\n})(); }'
+                     ' catch (e) { console.warn("[msx] userscript", e); }')
+    return "\n;\n".join(parts)
+
+
+def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000):
     """创建控件池。须在窗口壳启动后调用(任意线程, 内部自行 marshal)。
 
     on_title(tab_key, title) / on_newtab(tab_key, url): 站点控件的
@@ -97,7 +170,7 @@ def create_pool(win, on_title, on_newtab, theme_getter=None):
     (key 0 = 信息流主控件); 控件对象由池内部持有。
     """
     import System.Windows.Forms as WinForms  # noqa: F401  提前加载 CLR(pythonnet)
-    box = {"form": None, "theme": None, "stopping": False}
+    box = {"form": None, "theme": None, "stopping": False, "port": port}
 
     def _ui(fn):
         """marshal 到 UI 线程(窗体未绑定时直接执行, 供测试注入)。"""
@@ -265,6 +338,13 @@ def create_pool(win, on_title, on_newtab, theme_getter=None):
                         core = c.CoreWebView2
                         core.DocumentTitleChanged += lambda _s2, _a2: on_title(
                             tab_key, core.DocumentTitle)
+                        try:   # 内置油猴环境: 净化大师 + 用户自定义脚本(每次文档创建自动执行)
+                            inj = _build_inject_script(box.get("port") or 8000)
+                            if inj:
+                                core.AddScriptToExecuteOnDocumentCreatedAsync(inj)
+                        except Exception:
+                            import traceback
+                            traceback.print_exc()
 
                         def on_newwin(_s2, a2):
                             a2.Handled = True

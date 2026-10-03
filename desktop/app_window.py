@@ -332,7 +332,7 @@ def shell_main(e2e_url=None):
                 return v
             pages = create_pool(
                 win, api.update_title, lambda _k, u: api.open_in_app(u),
-                theme_getter=_current_theme)
+                theme_getter=_current_theme, port=port)
             pages.init()          # 等窗体就绪 + WS_THICKFRAME 无边框缩放补丁
             api.bind_pages(pages)
         except Exception:
