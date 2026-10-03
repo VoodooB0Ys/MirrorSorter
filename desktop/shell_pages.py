@@ -165,8 +165,7 @@ def create_pool(win, on_title, on_newtab, theme_getter=None):
                             self._bili_reloaded[id(c)] = dark
                             core.Reload()
                     except Exception:
-                        import traceback
-                        traceback.print_exc()
+                        pass   # 关窗时序中控件可能刚好销毁, 静默即可
                     # ---- 其他站点: 智能反色兜底(自愈定时器在脚本内) ----
                     core.ExecuteScriptAsync(_THEME_DARK_JS if dark else _LIGHT_JS)
                 except Exception:

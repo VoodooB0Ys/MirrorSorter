@@ -296,13 +296,15 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None):
                 p.BringToFront()
             ew = int(4 * scale)
             cw, ch = form.ClientSize.Width, form.ClientSize.Height
+            # 右/下热区外扩 2px: 150% DPI 下逻辑坐标→物理像素有舍入差,
+            # 精确贴边会露出窗体背景 1px 白线; 多覆盖的部分被窗口裁剪, 无副作用
             edge("left", Point(0, 0), Size(ew, ch),
                  WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Bottom |
                  WinForms.AnchorStyles.Left, WinForms.Cursors.SizeWE)
-            edge("right", Point(cw - ew, 0), Size(ew, ch),
+            edge("right", Point(cw - ew - 2, 0), Size(ew + 2, ch),
                  WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Bottom |
                  WinForms.AnchorStyles.Right, WinForms.Cursors.SizeWE)
-            edge("bottom", Point(0, ch - ew), Size(cw, ew),
+            edge("bottom", Point(0, ch - ew - 2), Size(cw + 2, ew + 2),
                  WinForms.AnchorStyles.Bottom | WinForms.AnchorStyles.Left |
                  WinForms.AnchorStyles.Right, WinForms.Cursors.SizeNS)
         except Exception:
