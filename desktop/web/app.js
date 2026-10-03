@@ -267,7 +267,7 @@ function applyView() {
   const list = document.getElementById("feedList");
   list.classList.toggle("dual", layout === "dual");
   list.classList.toggle("big", layout === "big");
-  list.classList.remove("cov-s", "cov-m", "cov-l");
+  list.classList.remove("cov-s", "cov-m", "cov-l", "cov-xl");   // xl 漏移除会让特大档残留(CSS 同权重下后者覆盖), 其他档位切不动
   list.classList.add("cov-" + cov);
   document.body.classList.toggle("hide-reason", reason === "hide");
   document.querySelectorAll("#layoutRow .seg").forEach((b) =>
