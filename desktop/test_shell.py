@@ -43,7 +43,7 @@ def load(name, fname):
 app = load("app_shell_test", "app.py")
 check("app.run_server 可复用", callable(getattr(app, "run_server", None)))
 check("app.shutdown 统一收尾", callable(getattr(app, "shutdown", None)))
-check("app.APP_VER 版本常量", app.APP_VER == "v0.3.1.2dsk", app.APP_VER)
+check("app.APP_VER 版本常量", app.APP_VER == "v0.3.1.3dsk", app.APP_VER)
 
 # ---------- 2. app_window 标签页管理与降级探测 ----------
 aw = load("app_window_shell_test", "app_window.py")
@@ -222,8 +222,9 @@ check("规则对象注入(__MSX_MF__: 词表/正则/拉黑/厌恶词)",
 check("播放页筛选逻辑(过滤+去重+7:3混排+探索池)",
       "mfFilter" in _ownui and "mixRel" in _ownui and "x/web-interface/popular" in _ownui
       and "mfPass" in _ownui and "normTitle" in _ownui and "emoBad" in _ownui)
-check("顶栏左导航隐藏(left-entry) 且 不误伤搜索/用户区",
-      "left-entry{display:none" in _ownui and "right-entry" not in _ownui)
+check("顶栏只隐导航条目(slimNav逐条目+LOGO豁免+tick补隐), 无整块/猜测选择器",
+      "slimNav" in _ownui and "mini-header__logo" in _ownui and "NAV_LABELS" in _ownui
+      and "bili-header__channel" not in _ownui and ".left-entry{" not in _ownui)
 check("播放页筛选设置行(mPlayRel 回显+保存)",
       'id="mPlayRel"' in _idx and "m_play_related" in _appj)
 
@@ -235,7 +236,7 @@ check("app.js 跳转出口调用点 ≥ 10", js.count("openExternal(") >= 11, st
 check("index.html 无 target=_blank", 'target="_blank"' not in io.open(
     os.path.join(PROJECT, "web", "index.html"), encoding="utf-8").read())
 html = io.open(os.path.join(PROJECT, "web", "index.html"), encoding="utf-8").read()
-check("页脚版本 v0.3.1.2dsk", "洞鉴虚明 v0.3.1.2dsk" in html)
+check("页脚版本 v0.3.1.3dsk", "洞鉴虚明 v0.3.1.3dsk" in html)
 check("设置页: 字体大小三档(默认小)", 'id="fontRow"' in html and html.count("data-font=") == 3
       and 'data-font="small"' in html)
 check("设置页: 背景预设/自定义/深度滑条在强调色设置下方",

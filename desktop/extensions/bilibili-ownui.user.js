@@ -14,14 +14,25 @@
   if (location.hostname !== "www.bilibili.com") return;
   if (!/^\/video\//.test(location.pathname)) return;
 
-  /* ---------------- 顶栏精简: 只去左侧频道导航(搜索框/用户区保留) ---------------- */
-  try {
-    var navSt = document.createElement("style");
-    navSt.id = "msx-ownui-nav";
-    navSt.textContent = ".bili-header .left-entry{display:none!important}"
-      + ".bili-header .bili-header__channel{display:none!important}";
-    (document.head || document.documentElement).appendChild(navSt);
-  } catch (e) { /* 静默 */ }
+  /* ---------------- 顶栏精简: 只去左侧频道导航(保留LOGO/搜索框/用户区) ----------------
+   * 不整块隐藏 left-entry(部分登录态变体下会连带整条栏消失), 改为逐条目处理:
+   * 只隐藏文本命中导航标签的子条目; 含 LOGO/搜索/用户区的元素一律跳过。 */
+  var NAV_LABELS = ["首页", "番剧", "直播", "游戏中心", "会员购", "漫画", "赛事", "下载客户端"];
+  function slimNav() {
+    try {
+      qsa(".bili-header .left-entry").forEach(function (ul) {
+        qsa(":scope > *", ul).forEach(function (el) {
+          // LOGO / 搜索 / 用户区(及任何包含它们的包装)绝不动
+          if (qs(".mini-header__logo, .center-search-container, .right-entry", el)) return;
+          var t = String(el.textContent || "").replace(/\s+/g, "");
+          if (t && t.length <= 14 && NAV_LABELS.some(function (k) { return t.indexOf(k) >= 0; })) {
+            el.style.setProperty("display", "none", "important");
+          }
+        });
+      });
+    } catch (e) { /* 静默 */ }
+  }
+  slimNav();
 
   /* ---------------- 播放页推荐筛选(与信息流 machine_filter 同源的页面端子集) ----------------
    * 规则由壳注入 window.__MSX_MF__; 缺失/null 时回退原始列表。 */
@@ -631,6 +642,7 @@
     // SPA 路由 watcher: BV 变化 → teardown + 重建; enforce 兜底防 Vue 复活
     S.tick = setInterval(function () {
       enforce();
+      slimNav();   // 顶栏导航条目可能被 Vue 重挂, 周期性补隐
       if (location.pathname === S.lastPath) return;
       S.lastPath = location.pathname;
       teardown();
