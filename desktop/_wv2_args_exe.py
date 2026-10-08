@@ -1,12 +1,26 @@
 # -*- coding: utf-8 -*-
-"""实证: 启动 exe(洞鉴虚明v0.3.1.7dsk) 后抓 WebView2 浏览器进程命令行, 与源码跑对照。"""
+"""实证: 启动 exe 后抓 WebView2 浏览器进程命令行, 与源码跑对照。
+   默认取 dist/ 下最新的 洞鉴虚明*.exe, 也可 argv[1] 指定。"""
+import glob
 import os
 import subprocess
 import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-EXE = os.path.join(HERE, "dist", "洞鉴虚明v0.3.1.7dsk.exe")
+
+
+def pick_exe():
+    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
+        return sys.argv[1]
+    cands = [p for p in glob.glob(os.path.join(HERE, "dist", "洞鉴虚明*.exe"))
+             if "安装包" not in p]
+    if not cands:
+        return None
+    return max(cands, key=os.path.getmtime)
+
+
+EXE = pick_exe()
 
 
 def dump(tag):
@@ -43,9 +57,10 @@ def dump(tag):
 
 
 def main():
-    if not os.path.isfile(EXE):
+    if not EXE or not os.path.isfile(EXE):
         print("EXE MISSING:", EXE)
         return 1
+    print("target exe:", os.path.basename(EXE))
     proc = subprocess.Popen([EXE], cwd=os.path.dirname(EXE))
     try:
         time.sleep(16)
