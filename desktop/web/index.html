@@ -35,6 +35,26 @@
             </label>
             <span class="custom-accent-hint">自定义</span>
           </div>
+          <label>背景颜色（预设/自定义，深度滑条调深浅；标签栏与设置栏同步适配）</label>
+          <div id="bgRow" class="swatches"></div>
+          <div id="bgCustomRow" class="swatches custom-accent-row">
+            <label class="custom-accent-picker" title="自定义背景颜色">
+              <input id="bgColorInput" type="color" value="#f2f4f9" aria-label="选择背景颜色">
+              <span class="custom-accent-plus" aria-hidden="true">+</span>
+            </label>
+            <span class="custom-accent-hint">自定义</span>
+            <button type="button" class="seg" id="bgResetBtn" title="清除背景颜色与深度，回到默认">恢复默认</button>
+          </div>
+          <label>颜色深度（1=白天深度，10=黑夜深度）</label>
+          <div class="row" id="bgDepthRow">
+            <input type="range" id="bgDepth" min="1" max="10" step="1" value="1" style="flex:1">
+          </div>
+          <label>字体大小（选择即生效，自动记住）</label>
+          <div class="row" id="fontRow">
+            <button data-font="small" class="seg on">小（默认）</button>
+            <button data-font="medium" class="seg">中</button>
+            <button data-font="large" class="seg">大</button>
+          </div>
           <label>信息流显示</label>
           <div class="row" id="layoutRow">
             <button data-layout="single" class="seg on">单栏（默认）</button>
@@ -62,6 +82,35 @@
             <button data-v="4" class="seg">×4</button>
           </div>
           <p class="tip">选择即生效，自动记住</p>
+        </div>
+      </details>
+      <details open>
+        <summary>画质增强设置</summary>
+        <div class="sec">
+          <label>AI超分（Anime4K/ACNet 实时超分，用显卡跑 12 层卷积网络。关闭|轻|标准|高|旗舰 五档 = <b>细节注入强度</b>：档位越高，网络细节注入与自适应锐化越强、也越吃显卡；轻最保守、旗舰最进取。任何档位都保证"开超分不会比关超分更糊/更暗"）</label>
+          <div class="row" id="srLevelRow">
+            <button data-level="关" class="seg on">关（默认）</button>
+            <button data-level="轻" class="seg">轻</button>
+            <button data-level="标准" class="seg">标准</button>
+            <button data-level="高" class="seg">高</button>
+            <button data-level="旗舰" class="seg">旗舰</button>
+          </div>
+          <label>超分倍率（1|1.25|1.5|2 = <b>网络输入的档位</b>：1× 只按屏幕需要处理（最省），2× 让网络看到完整源分辨率（最清晰、最吃显卡）。倍数越高，重建出的纹理与边缘越多）</label>
+          <div class="row" id="srScaleRow">
+            <button data-scale="1" class="seg">1×</button>
+            <button data-scale="1.25" class="seg">1.25×</button>
+            <button data-scale="1.5" class="seg">1.5×</button>
+            <button data-scale="2" class="seg on">2×（默认）</button>
+          </div>
+          <label>当画面本来就 1:1（屏幕不需要放大）时不会启动超分：那一档浏览器原画已是最优，跑网络只会先缩再重建、必然更糊。需要放大的场合（例如 1080p 源放到 2K/4K 屏）才工作。播放画面里静止的部分（人物特写等）始终保持网络重建的细节，运动部分自动回到原画以保证流畅。</label>
+          <label>增强强度（关闭|轻|中|强 四档一体；锐化+色彩饱和/对比微增）</label>
+          <div class="row" id="bqLevelRow">
+            <button data-level="关闭" class="seg">关闭</button>
+            <button data-level="轻" class="seg">轻</button>
+            <button data-level="中" class="seg on">中（默认）</button>
+            <button data-level="强" class="seg">强</button>
+          </div>
+          <label>切换后对「新打开的B站标签页」生效；已打开的页面刷新后生效。</label>
         </div>
       </details>
       <details open>
@@ -185,7 +234,7 @@
         </div>
       </details>
 
-      <footer>洞鉴虚明 v0.2.9.0a<br>数据只存本机</footer>
+      <footer>洞鉴虚明 v0.3.0.0dsk<br>数据只存本机</footer>
     </div>
   </aside>
 

@@ -2355,6 +2355,7 @@ try:
     # 那时应当按信息流居中(两侧对称溢出), 这条断言钉住这个分支不被删掉。
     check("预览:过宽时改为居中而非贴边",
           "ovW >= feedRect.width" in _js and "(feedRect.width - ovW) / 2" in _js)
+    check("预览:浮层挂html下绕开zoom坐标系", "document.documentElement.appendChild(ov)" in _js)
 
     # ---------- 孤儿球清理: tasklist 输出必须按 GBK 解 ----------
     # 中文 Windows 的 tasklist 输出是 GBK; 以前用 text=True 让 subprocess 按 UTF-8 解,

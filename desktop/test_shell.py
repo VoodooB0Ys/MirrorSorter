@@ -43,13 +43,35 @@ def load(name, fname):
 app = load("app_shell_test", "app.py")
 check("app.run_server 可复用", callable(getattr(app, "run_server", None)))
 check("app.shutdown 统一收尾", callable(getattr(app, "shutdown", None)))
-check("app.APP_VER 版本常量", app.APP_VER == "v0.2.9.0a", app.APP_VER)
+check("app.APP_VER 版本常量", app.APP_VER == "v0.3.0.0dsk", app.APP_VER)
 
 # ---------- 2. app_window 标签页管理与降级探测 ----------
 aw = load("app_window_shell_test", "app_window.py")
 check("壳版本与 app 一致", aw.APP_VER == app.APP_VER)
 check("WebView2 运行时探测可用", isinstance(aw.webview2_available(), bool))
 check("pywebview 探测可用", isinstance(aw.have_pywebview(), bool))
+_bs = aw._bundled_resource(*aw._WV2_BOOTSTRAP)
+check("WebView2 引导安装包随包分发", _bs is not None and os.path.getsize(_bs) > 1000000, _bs)
+check("缺运行时→自动安装→失败才回退(壳流程接线)",
+      "install_webview2_runtime()" in io.open(
+          os.path.join(PROJECT, "app_window.py"), encoding="utf-8").read())
+check("运行时安装: 装前修复EdgeUpdate环境(文件锁/服务/状态重置)",
+      "taskkill /IM msedgewebview2.exe" in io.open(os.path.join(PROJECT, "installer", "app_installer.nsi"), encoding="utf-8-sig").read()
+      and "sc config edgeupdate start= demand" in io.open(os.path.join(PROJECT, "installer", "app_installer.nsi"), encoding="utf-8-sig").read()
+      and "DeleteRegKey HKLM \"SOFTWARE\Microsoft\EdgeUpdate\"" in io.open(os.path.join(PROJECT, "installer", "app_installer.nsi"), encoding="utf-8-sig").read())
+_enh = os.path.join(PROJECT, "extensions", "bilibili-enhance.user.js")
+check("画质增强插件: 内置+注入接线",
+      os.path.isfile(_enh) and "bilibili-enhance.user.js" in io.open(
+          os.path.join(PROJECT, "shell_pages.py"), encoding="utf-8").read()
+      and "feConvolveMatrix" in io.open(_enh, encoding="utf-8").read())
+check("Edge浏览器内核兜底(运行时装不上时的免安装方案)",
+      "find_edge_browser_dir" in io.open(os.path.join(PROJECT, "app_window.py"), encoding="utf-8").read()
+      and "msedge.exe" in io.open(os.path.join(PROJECT, "app_window.py"), encoding="utf-8").read()
+      and "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER" in io.open(os.path.join(PROJECT, "app_window.py"), encoding="utf-8").read())
+check("运行时安装: %TEMP%故障重定向重试(安装器+exe两路)",
+      "SetEnvironmentVariable" in io.open(os.path.join(PROJECT, "installer", "app_installer.nsi"), encoding="utf-8-sig").read()
+      and 'os.environ["TMP"] = fallback' in io.open(
+          os.path.join(PROJECT, "app_window.py"), encoding="utf-8").read())
 
 api = aw.ShellApi()
 check("桥拒绝非 http(s) URL", api.open_in_app("javascript:alert(1)") == "bad-url"
@@ -118,7 +140,48 @@ check("app.js 跳转出口调用点 ≥ 10", js.count("openExternal(") >= 11, st
 check("index.html 无 target=_blank", 'target="_blank"' not in io.open(
     os.path.join(PROJECT, "web", "index.html"), encoding="utf-8").read())
 html = io.open(os.path.join(PROJECT, "web", "index.html"), encoding="utf-8").read()
-check("页脚版本 v0.2.9.0a", "洞鉴虚明 v0.2.9.0a" in html)
+check("页脚版本 v0.3.0.0dsk", "洞鉴虚明 v0.3.0.0dsk" in html)
+check("设置页: 字体大小三档(默认小)", 'id="fontRow"' in html and html.count("data-font=") == 3
+      and 'data-font="small"' in html)
+check("设置页: 背景预设/自定义/深度滑条在强调色设置下方",
+      0 < html.find("customAccentRow") < html.find("bgRow")
+      < html.find("bgCustomRow") < html.find("bgDepthRow") < html.find("fontRow"))
+_appjs = io.open(os.path.join(PROJECT, "web", "app.js"), encoding="utf-8").read()
+check("背景系统: 自定义色+1..10深度派生全套表面色",
+      "hexToHsl" in _appjs and 'set("--panel"' in _appjs
+      and 'set("--input"' in _appjs and "bgDepth" in _appjs and "bgHex" in _appjs)
+check("背景系统: 预设色卡+自定义历史+推送标签栏方案",
+      "bgCustomList" in _appjs and "bgStripScheme" in _appjs
+      and "bg: bgStripScheme()" in _appjs)
+check("标签栏吃背景方案: 服务端存储+轮询消费",
+      "ui_bg_scheme" in io.open(os.path.join(PROJECT, "app.py"), encoding="utf-8").read()
+      and "ui_bg_scheme" in io.open(os.path.join(PROJECT, "app_window.py"), encoding="utf-8").read()
+      and "set_bg_scheme" in io.open(os.path.join(PROJECT, "shell_tabstrip.py"), encoding="utf-8").read())
+check("深度滑条跟随强调色", "accent-color: var(--accent)" in io.open(
+    os.path.join(PROJECT, "web", "style.css"), encoding="utf-8").read())
+check("内置画质增强脚本: SVG非锐化掩模(模糊-合成)锐化+色彩滤镜+服务端开关",
+      "feGaussianBlur" in io.open(os.path.join(PROJECT, "extensions", "bilibili-enhance.user.js"), encoding="utf-8").read()
+      and "feComposite" in io.open(os.path.join(PROJECT, "extensions", "bilibili-enhance.user.js"), encoding="utf-8").read()
+      and "msx-sharpen" in io.open(os.path.join(PROJECT, "extensions", "bilibili-enhance.user.js"), encoding="utf-8").read()
+      and "__MSX_BQ__" in io.open(os.path.join(PROJECT, "extensions", "bilibili-enhance.user.js"), encoding="utf-8").read())
+_srlib = io.open(os.path.join(PROJECT, "extensions", "anime4k-webgpu.js"), encoding="utf-8").read()
+_srglue = io.open(os.path.join(PROJECT, "extensions", "bilibili-sr.user.js"), encoding="utf-8").read()
+check("AI超分: Anime4K-WebGPU库(MIT)+胶水+开关接线",
+      len(_srlib) > 3000000 and "CNNx2UL" in _srglue
+      and "requestVideoFrameCallback" in _srglue
+      and "ui_sr" in io.open(os.path.join(PROJECT, "shell_pages.py"), encoding="utf-8").read()
+      and '"ui_sr"' in io.open(os.path.join(PROJECT, "app.py"), encoding="utf-8").read()
+      and 'id="srLevelRow"' in html and 'data-level="关"' in html)
+check("画质增强接线: 注入管线+设置白名单+独立设置栏(档位即开关)",
+      "__MSX_BQ__" in io.open(os.path.join(PROJECT, "shell_pages.py"), encoding="utf-8").read()
+      and '"ui_bq", "ui_bq_level"' in io.open(os.path.join(PROJECT, "app.py"), encoding="utf-8").read()
+      and 'id="bqLevelRow"' in html and 'data-level="关闭"' in html
+      and "<summary>画质增强设置</summary>" in html
+      and 'id="bqRow"' not in html
+      # 位置: 紧跟在「主题设置」栏后面(主题设置 < 画质增强设置 < AI 配置)
+      and html.index("<summary>主题设置</summary>")
+      < html.index("<summary>画质增强设置</summary>")
+      < html.index("<summary>AI 配置</summary>"))
 check("壳关闭站点弹新页→系统浏览器的默认行为",
       "OPEN_EXTERNAL_LINKS_IN_BROWSER" in io.open(
           os.path.join(PROJECT, "app_window.py"), encoding="utf-8").read())
@@ -150,6 +213,20 @@ for _ in range(40):
 check("app_window --server 起真实服务", ok or (already and proc.poll() == 0),
       "already_running=%s exit=%s" % (already, proc.poll()))
 proc.terminate()
+
+# ---------- N. 安装包(NSIS) ----------
+_nsi = io.open(os.path.join(PROJECT, "installer", "app_installer.nsi"),
+               encoding="utf-8-sig").read()
+check("NSIS脚本: WebView2三注册表位探测+缺则静默装",
+      _nsi.count("EdgeUpdate\\Clients\\${WV2}") == 3 and "/silent /install" in _nsi)
+check("NSIS脚本: 卸载器与添加/删除程序登记",
+      "WriteUninstaller" in _nsi and "CurrentVersion\\Uninstall\\${UNKEY}" in _nsi)
+check("NSIS脚本: 数据目录策略(卸载不删用户数据)",
+      not re.search(r'RMDir[^\n]*LocalLow', _nsi) and 'RMDir /r "$INSTDIR"' in _nsi)
+import glob
+_pkgs = glob.glob(os.path.join(PROJECT, "dist", "*安装包*.exe"))
+check("安装包产物已构建", bool(_pkgs) and os.path.getsize(_pkgs[-1]) > 100 * 1024 * 1024,
+      _pkgs[-1] if _pkgs else "missing")
 
 print("RESULT: %s" % ("FAIL(%d)" % FAIL if FAIL else "ALL_PASS (%d checks)" % PASS))
 sys.exit(1 if FAIL else 0)

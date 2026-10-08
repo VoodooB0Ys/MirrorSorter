@@ -5,7 +5,8 @@
 - 双击启动 → 弹出应用主窗口, 不再依赖外部浏览器;
 - 点 feed 卡片/消息/账号等任何视频·帖子链接 → 主窗口内**新增一个内置浏览器标签页**
   (窗口顶部原生"浏览器式"标签栏, 信息流为固定首页标签, 不产生任何新窗口);
-- 未装 WebView2 运行时或缺 pywebview 库 → 自动回退外部浏览器模式(旧行为, 弹提示);
+- 未装 WebView2 运行时 → 先跑随包的微软官方引导安装包自动装上(一次UAC授权, 需联网);
+  缺 pywebview 库或安装失败/被拒 → 自动回退外部浏览器模式(旧行为, 弹提示);
 - `python app_window.py --server` → 纯服务模式(等同 python app.py --auto-open)。
 
 实现说明: pywebview 一个窗口只有一个 WebView, 标签页 = Python 端维护的标签表 +
@@ -36,12 +37,18 @@ BG_DARK = "#0f1115"   # 与 web/style.css 暗色 --bg 一致, 避免窗口加载
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 _WV2_CLIENT_ID = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"   # WebView2 Evergreen 运行时
+_WV2_BOOTSTRAP = ("WebView2Runtime", "MicrosoftEdgeWebview2Setup.exe")   # 微软官方引导包(随包分发)
 
 
 def webview2_available():
-    """检测系统 WebView2 运行时(注册表 pv 值)。检测不了/没装都按缺失 → 回退外部浏览器。"""
+    """检测系统 WebView2 运行时: 注册表 pv 值, 或环境变量指向的可用内核
+    (Edge 浏览器兜底, 见 find_edge_browser_dir)。检测不了/没装都按缺失。"""
     if os.name != "nt":
         return False
+    env_dir = os.environ.get("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER") or ""
+    if env_dir and (os.path.isfile(os.path.join(env_dir, "msedgewebview2.exe"))
+                    or os.path.isfile(os.path.join(env_dir, "msedge.exe"))):
+        return True
     try:
         import winreg
     except ImportError:
@@ -58,6 +65,122 @@ def webview2_available():
                     return True
         except OSError:
             continue
+    return False
+
+
+def find_edge_browser_dir():
+    """找已安装的 Edge 浏览器内核目录(取最高版本, 含 msedge.exe)。
+    WebView2 加载器官方支持直接用 Edge 浏览器二进制充当运行时 —— 运行时装不上
+    (EdgeUpdate 机制损坏)的机器借此免安装获得完整 WebView2 能力。找不到返回 None。"""
+    if os.name != "nt":
+        return None
+    roots = []
+    for var in ("ProgramFiles(x86)", "ProgramFiles", "LocalAppData"):
+        base = os.environ.get(var)
+        if base:
+            roots.append(os.path.join(base, "Microsoft", "Edge", "Application"))
+    best, best_ver = None, ()
+    for root in roots:
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        for name in names:
+            if not re.match(r"^\d+\.\d+\.\d+\.\d+$", name):
+                continue
+            p = os.path.join(root, name)
+            if os.path.isfile(os.path.join(p, "msedge.exe")):
+                ver = tuple(int(x) for x in name.split("."))
+                if ver > best_ver:
+                    best, best_ver = p, ver
+    return best
+
+
+def _bundled_resource(*parts):
+    """随包资源定位: PyInstaller onefile 在 _MEIPASS 解包目录; 源码运行在脚本目录。"""
+    rel = os.path.join(*parts)
+    for base in (getattr(sys, "_MEIPASS", ""), HERE):
+        if base:
+            p = os.path.join(base, rel)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def _run_elevated_wait(args, timeout_s=600, verb="runas"):
+    """ShellExecute 拉起外部程序并等待结束, 返回退出码(负数=启动失败/超时)。
+    verb="runas" 强制走 UAC 提权 —— 引导安装包清单是 asInvoker, 用 subprocess 直接
+    拉起会以普通权限静默失败(全机安装需要管理员), 连 UAC 都不弹(线上实测)。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class _SEEI(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("fMask", wintypes.ULONG),
+                    ("hwnd", wintypes.HWND), ("lpVerb", wintypes.LPCWSTR),
+                    ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
+                    ("lpDirectory", wintypes.LPCWSTR), ("nShow", ctypes.c_int),
+                    ("hInstApp", wintypes.HINSTANCE), ("lpIDList", wintypes.LPVOID),
+                    ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
+                    ("dwHotKey", wintypes.DWORD), ("hIconOrMonitor", wintypes.HANDLE),
+                    ("hProcess", wintypes.HANDLE)]
+
+    SEE_MASK_NOCLOSEPROCESS, SEE_MASK_NOASYNC = 0x40, 0x100
+    sei = _SEEI()
+    sei.cbSize = ctypes.sizeof(_SEEI)
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+    sei.lpVerb = verb
+    sei.lpFile = args[0]
+    sei.lpParameters = " ".join(args[1:]) if len(args) > 1 else None
+    sei.nShow = 1   # SW_SHOWNORMAL(/silent 无界面, 不弹窗)
+    if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)):
+        return -1   # 拒绝提权/被策略拦截
+    try:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            code = wintypes.DWORD(0)
+            if ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, 500) == 0:
+                ctypes.windll.kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(code))
+                return code.value
+        return -2   # 超时
+    finally:
+        ctypes.windll.kernel32.CloseHandle(sei.hProcess)
+
+
+def install_webview2_runtime():
+    """系统缺 WebView2 运行时 → 跑随包分发的微软官方 Evergreen 引导安装包。
+    verb=runas 强制提权(UAC 弹窗), 全机安装必须管理员; 成功后复检返回 True。
+    取消授权/断网/被精简系统拦服务 → False, 调用方走外部浏览器兜底(旧行为)。"""
+    src = _bundled_resource(*_WV2_BOOTSTRAP)
+    if not src:
+        return False
+    _msg_box("首次使用需要安装 WebView2 运行时（微软官方组件，约需 1-2 分钟）。\n\n"
+             "点「确定」开始；若弹出「用户账户控制」窗口请点「是」。\n"
+             "需要联网；跳过将以外部浏览器模式打开。")
+    code = _run_elevated_wait([src, "/silent", "/install"], timeout_s=600)
+    if not (code == 0 and webview2_available()):
+        # 实测故障: 精简系统 %TEMP% 缺失/不可写 → 微软安装器报"无法创建临时目录"(0x80040902)。
+        # 把 TEMP/TMP 指到 Windows\Temp(提权子进程可写)重试一次; 提权子进程继承本进程环境。
+        fallback = os.path.join(os.environ.get("SystemDrive", "C:") + os.sep, "Windows", "Temp")
+        old_env = (os.environ.get("TEMP"), os.environ.get("TMP"))
+        try:
+            if os.path.isdir(fallback):
+                os.environ["TEMP"] = fallback
+                os.environ["TMP"] = fallback
+                code = _run_elevated_wait([src, "/silent", "/install"], timeout_s=600)
+        finally:
+            if old_env[0] is not None:
+                os.environ["TEMP"] = old_env[0]
+            if old_env[1] is not None:
+                os.environ["TMP"] = old_env[1]
+    if not (code == 0 and webview2_available()):
+        # 仍失败 → 交互式安装(弹微软官方界面, 用户能看到真实原因)
+        code = _run_elevated_wait([src], timeout_s=900)
+    if code == 0 and webview2_available():
+        return True
+    _msg_box("WebView2 运行时安装未完成（错误码 %s）。\n\n"
+             "常见原因: 系统临时目录(%%TEMP%%)不可用、精简系统禁用 Edge 更新服务、安全软件拦截。\n"
+             "替代方案: 安装 Microsoft Edge 浏览器后重开本应用（应用会自动借用其内核，\n"
+             "无需安装 WebView2 运行时）；本次将以外部浏览器模式打开，下次启动会再次尝试。" % code)
     return False
 
 
@@ -166,6 +289,9 @@ class ShellApi:
         self._activate(nxt)          # 先显示邻居, 再销毁旧控件(避免黑屏)
         if self._pages is not None:
             self._pages.dispose(tid)
+            # 销毁兜底: WebView2(DirectComposition)销毁偶发打断窗口合成层, 内容区整块
+            # 变黑而标签栏正常(用户截图) —— 强制再补一次邻居可见+焦点, 让其重新present。
+            self._pages.show(self._active)
         self._render()
         return "ok"
 
@@ -176,6 +302,25 @@ class ShellApi:
             return "bad-url"
         webbrowser.open(url)
         return "ok"
+
+    def on_side_button(self, back=True):
+        """鼠标侧键(后退/前进): 当前标签页内回退/前进; 后退到本标签最早的页(无历史)
+        时整个标签视为一次"返回" —— 关掉它回到来源标签/信息流。信息流是应用本体,
+        没有"返回"概念, 忽略。仅在 UI 线程调用(由 _install_mouse_side_buttons 触发)。"""
+        pages = self._pages
+        if pages is None:
+            return
+        with self._lock:
+            t = next((x for x in self._tabs if x["id"] == self._active), None)
+            tid = t["id"] if t else None
+            pinned = bool(t and t["pinned"])
+        if tid is None or pinned:
+            return
+        if pages.navigate_history(tid, back):
+            return
+        if not back:
+            return   # 前进无历史: 无事可做
+        self.tab_close(tid)
 
     # ---- 内部 ----
     def _activate(self, tab):
@@ -283,6 +428,87 @@ def main(argv=None):
     return shell_main(e2e_url=e2e_url)
 
 
+def _install_mouse_side_buttons(api, win):
+    """低级鼠标钩子(WH_MOUSE_LL)拦截本窗口内的侧键(后退/前进), 不交给 WebView2
+    原生处理。
+
+    原生路径: WebView2 收到 XButton 后在浏览器进程内同步执行 GoBack, 与本壳的
+    无边框窗口 + 控件可见性切换叠加时有概率整窗卡死(用户实测)。侧键语义改由
+    ShellApi.on_side_button 在 UI 线程实现: 标签页内回退, 到头关标签回信息流。
+    钩子按光标落点查根窗口, 只吞本窗口的侧键, 不影响其他应用; 独立线程装钩并
+    跑消息泵 —— 低级钩子所在线程不泵消息会被系统按超时静默摘除。pythonnet 3
+    无法子类化 IMessageFilter(WinForms 消息过滤器方案不可行), 故走 ctypes。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    WH_MOUSE_LL = 14
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WM_XBUTTONDBLCLK = 0x020B, 0x020C, 0x020D
+    GA_ROOT = 2
+
+    class MSLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD),
+                    ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t)]
+
+    LOWPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                 ctypes.c_size_t, ctypes.c_ssize_t)
+    user32.WindowFromPoint.restype = wintypes.HWND
+    user32.WindowFromPoint.argtypes = [wintypes.POINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+    user32.CallNextHookEx.restype = ctypes.c_ssize_t
+    user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int,
+                                      ctypes.c_size_t, ctypes.c_ssize_t]
+    root = int(win.native.Handle.ToInt64())   # pythonnet IntPtr 无 int() 转换
+
+    def _in_our_window(pt):
+        try:
+            h = user32.WindowFromPoint(wintypes.POINT(pt.x, pt.y))
+            if not h:
+                return False
+            top = user32.GetAncestor(h, GA_ROOT)
+            return int(top or 0) == root or int(h or 0) == root
+        except Exception:
+            return False
+
+    def _proc(n_code, w_param, l_param):
+        try:
+            if n_code >= 0 and w_param in (WM_XBUTTONDOWN, WM_XBUTTONUP,
+                                           WM_XBUTTONDBLCLK):
+                info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                if _in_our_window(info.pt):
+                    if w_param == WM_XBUTTONDOWN:
+                        # mouseData 高16位: 1=XBUTTON1(后退) 2=XBUTTON2(前进)
+                        back = ((info.mouseData >> 16) & 0xFFFF) == 1
+                        try:
+                            import System.Windows.Forms as WinForms
+                            form = api._win.native
+                            form.BeginInvoke(WinForms.MethodInvoker(
+                                lambda: api.on_side_button(back=back)))
+                        except Exception:
+                            pass
+                    return 1   # 吞掉: WebView2/页面收不到这套按键
+        except Exception:
+            pass
+        return user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+    proc_ref = LOWPROC(_proc)   # 持引用防 GC(钩子回调悬空会崩进程)
+
+    def _run():
+        hook = user32.SetWindowsHookExW(WH_MOUSE_LL, proc_ref, None, 0)
+        if not hook:
+            return
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            pass
+        user32.UnhookWindowsHookEx(hook)
+
+    threading.Thread(target=_run, daemon=True,
+                     name="msx-side-btn-hook").start()
+
+
 def shell_main(e2e_url=None):
     """窗口壳主流程: 起/复用服务 → WebView2 检测 → 主窗口(含标签页) → 全关后收尾。
 
@@ -294,12 +520,23 @@ def shell_main(e2e_url=None):
         _msg_box("端口 8000/8010/8020 均被占用，无法启动。")
         return 1
     url = "http://127.0.0.1:%d" % port
-    if not have_pywebview() or not webview2_available():
+    py_ok = have_pywebview()
+    if py_ok and not webview2_available():
+        # 缺运行时: 优先借用已装的 Edge 浏览器内核(免安装, 零系统改动);
+        # 真没有 Edge 才跑随包的官方引导安装包(一次授权, 约1-2分钟)
+        edge_dir = find_edge_browser_dir()
+        if edge_dir:
+            os.environ["WEBVIEW2_BROWSER_EXECUTABLE_FOLDER"] = edge_dir
+            print("WebView2 运行时缺失 → 借用 Edge 浏览器内核: %s" % edge_dir)
+        else:
+            install_webview2_runtime()
+    if not py_ok or not webview2_available():
         # 降级: 保留服务的旧行为(外部浏览器), 绝不白屏
         print("未检测到内置浏览器组件(WebView2 运行时), 回退外部浏览器模式: %s" % url)
         _msg_box("未检测到 WebView2 运行时，本次将以外部浏览器模式打开。\n\n"
-                 "如需应用窗口与内置浏览器，请安装 Microsoft Edge WebView2 Runtime\n"
-                 "(Win10/11 一般已自带；或到微软官网下载 Evergreen 安装包)。")
+                 "如需应用窗口与内置浏览器：安装 Microsoft Edge 浏览器后重开本应用\n"
+                 "（应用会自动借用其内核，无需安装 WebView2 运行时）；\n"
+                 "或到微软官网下载 WebView2 Runtime Evergreen 安装包。")
         webbrowser.open(url)
         try:
             while True:
@@ -341,7 +578,13 @@ def shell_main(e2e_url=None):
         try:
             from shell_tabstrip import install_strip
             api.bind_strip(install_strip(
-                win, api, accent_getter=lambda: app.sget("float_ball_accent")))
+                win, api, accent_getter=lambda: app.sget("float_ball_accent"),
+                bg_getter=lambda: app.sget("ui_bg_scheme")))
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        try:
+            _install_mouse_side_buttons(api, win)
         except Exception:
             import traceback
             traceback.print_exc()

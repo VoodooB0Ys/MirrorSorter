@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.2.9.0a)
+洞鉴虚明 · 基础版 (v0.3.0.0dsk)
 =========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -47,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORTS = (8000, 8010, 8020)
-APP_VER = "v0.2.9.0a"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.3.0.0dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -8116,11 +8116,16 @@ def serve_chunk(offset=0, limit=30, q="", request_id=""):
         chunk = acts[offset:offset + limit]
         consumed_end = min(offset + limit, len(acts))
     # 提前补池: 剩余未看内容不多时后台就开始抓, 用户滚到底时新内容已经就位(不必干等)。
-    # 阈值=60(约两页): 全量构建需10-30s, 半页缓冲常被快刷追上而卡顿, 两页缓冲足够构建完成。
-    # 快/全动态决策: 缺得多(距上次全量>90s)直接跑全量, 否则轻量 quick(防止小水慢添)。
-    if not q and not building and chunk and len(acts) - consumed_end < 60 \
+    # 剩余量必须按"本会话未返回"计(池子总数-已返回key), 不能按游标尾部条数: 评分落库/
+    # 负反馈都会触发计划全量重排, 已返回条目被混到游标之后, 尾部计数虚高 → 服务端一直
+    # 以为池子还厚, 补池迟迟不触发, 用户刷到底才干等读条(此前阈值=60仍复现的根因)。
+    # 阈值=150(约5页): 全量构建需10-30s, 快刷十几秒烧一页, 两页缓冲会被追上, 5页才稳跑赢。
+    # 快/全动态决策: 余量<60(两页)时quick补的量追不上快刷消耗, 直接跑全量; 距上次全量
+    # >90s也跑全量, 其余用轻量 quick(防止小水慢添)。
+    unserved = max(0, len(acts) - (len(sess["keys"]) if sess else 0))
+    if not q and not building and chunk and unserved < 150 \
             and time.time() - uni["built_at"] > 10:
-        need_full = time.time() - _last_full_build_ts > 90
+        need_full = unserved < 60 or time.time() - _last_full_build_ts > 90
         threading.Thread(target=build_universe,
                          kwargs={"quick": not need_full}, daemon=True).start()
     if not chunk:
@@ -8594,6 +8599,18 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        # 内置浏览器标签页里的超分脚本(bilibili-sr.user.js)轮询 /api/ui_settings 做热更新;
+        # 该页面跑在 https://*.bilibili.com 源上, 读 127.0.0.1 需要显式放行 ——
+        # 仅此一个只含 UI 开关的端点对 B 站源回显 ACAO, 其余端点(含 ai_key 的)一律不给
+        if getattr(self, "path", "").split("?")[0] == "/api/ui_settings":
+            try:
+                origin = self.headers.get("Origin") or ""
+                host = origin.split("://", 1)[-1].split("/", 1)[0] if "://" in origin else ""
+                if host == "bilibili.com" or host.endswith(".bilibili.com"):
+                    self.send_header("Access-Control-Allow-Origin", origin)
+                    self.send_header("Vary", "Origin")
+            except Exception:
+                pass
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -9009,12 +9026,19 @@ class Handler(BaseHTTPRequestHandler):
             if not tid.isdigit():
                 return self.send_json({"ok": False, "error": "tid无效"}, 400)
             return self.send_json(tieba_thread_content(tid))
+        if path == "/api/ui_settings":
+            # 内置浏览器标签页里的超分/画质脚本(bilibili-sr.user.js 等)轮询此端点做热更新。
+            # 只回 UI 开关键(绝不含 ai_key 等敏感项); CORS 仅对 B 站源回显, 其余网站一律不给。
+            return self.send_json({k: sget(k) for k in ("ui_bq", "ui_bq_level", "ui_sr",
+                                                        "ui_fg", "ui_sr_level", "ui_sr_scale")})
         if path == "/api/settings":
             return self.send_json({k: sget(k) for k in ("ai_base", "ai_key", "ai_model", "mode",
                                                         "prefs_note", "dislike_note",
                                                         "price_in", "price_out", "ai_full_scan",
                                                         "ai_interest_min", "ai_batch", "ai_cache_hours",
-                                                        "ai_enabled", "disclaimer_version")}
+                                                        "ai_enabled", "disclaimer_version",
+                                                        "ui_bq", "ui_bq_level", "ui_sr",
+                                                        "ui_fg", "ui_sr_level", "ui_sr_scale")}
                                   | {"ai_ok": ai_ok(), "ai_on": ai_on()})
         if path == "/api/floatball":
             env = float_ball_env()
@@ -9269,7 +9293,8 @@ class Handler(BaseHTTPRequestHandler):
             old_dislike = sget("dislike_note") or ""
             for k in ("ai_base", "ai_key", "ai_model", "mode", "prefs_note", "dislike_note",
                       "price_in", "price_out", "ai_full_scan", "ai_interest_min",
-                      "ai_batch", "ai_cache_hours", "ai_enabled"):
+                      "ai_batch", "ai_cache_hours", "ai_enabled", "ui_bq", "ui_bq_level",
+                      "ui_sr", "ui_fg", "ui_sr_level"):
                 if k in body and body[k] is not None:
                     if k in ("ai_base", "ai_model") and not str(body[k]).strip():
                         continue   # 地址/模型不允许空值覆盖(保留默认/原值)
@@ -9381,6 +9406,15 @@ class Handler(BaseHTTPRequestHandler):
                 acc_id = str(theme.get("accent_id") or "").strip()
                 if acc_id and len(acc_id) <= 40 and "<" not in acc_id:
                     sset("ui_accent_id", acc_id)   # 强调色原始标识(green/pink/custom:#xxx, 供壳内页面恢复)
+                bg = theme.get("bg")
+                if isinstance(bg, dict):
+                    # 页面算好的原生标签栏配色方案(hex串), shell_tabstrip 轮询消费
+                    _need = ("bar", "active", "hover", "fgon", "fgoff", "sep")
+                    if all(re.match(r"^#[0-9a-fA-F]{6}$", str(bg.get(k) or "")) for k in _need):
+                        try:
+                            sset("ui_bg_scheme", json.dumps(bg, ensure_ascii=False))
+                        except Exception:
+                            pass
             prefs_in = body.get("prefs")
             if isinstance(prefs_in, dict):
                 # 悬浮窗调节档位: 白名单校验, 非法值不落库

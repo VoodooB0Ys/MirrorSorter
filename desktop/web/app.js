@@ -1,4 +1,4 @@
-/* 洞鉴虚明 v0.2.9.0a - 前端逻辑 */
+/* 洞鉴虚明 v0.3.0.0dsk - 前端逻辑 */
 "use strict";
 
 const $ = (s) => document.querySelector(s);
@@ -168,7 +168,7 @@ function customAccents() {
 function saveCustomAccents(colors) {
   localStorage.setItem(CUSTOM_ACCENTS_KEY, JSON.stringify([...new Set(colors)].slice(0, 24)));
 }
-/* 强调色/主题变化时推送给悬浮球(桌面小组件, 颜色跟随主界面) */
+/* 强调色/主题/背景变化时推送给悬浮球与原生标签栏(桌面小组件, 颜色跟随主界面) */
 function pushBallTheme() {
   const theme = localStorage.getItem("theme") || "dark";
   const accent = localStorage.getItem("accent") || "pink";
@@ -178,7 +178,8 @@ function pushBallTheme() {
   fetch("/api/floatball", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ theme: { accent: hex, light: theme === "light", accent_id: accent } }),
+    body: JSON.stringify({ theme: { accent: hex, light: theme === "light", accent_id: accent,
+                                    bg: bgStripScheme() } }),
   }).catch(() => {});
 }
 /* 桌面壳内 WebView2 的 localStorage 与用户平时用的浏览器相互独立;
@@ -243,7 +244,167 @@ function applyTheme() {
       customRow.appendChild(swatch);
     });
   }
+  /* 字体大小: 小=1(默认) / 中 / 大 —— 整体缩放(排版随动)。
+     --ui-zoom 同步给 CSS: 100vh 在 zoom 下会被乘大(实测), 布局高度需除回来,
+     否则全屏时应用比视口高出一截, 侧栏底部(黑名单设置)永远滚不到 */
+  const fontLv = localStorage.getItem("fontLv") || "small";
+  const zval = fontLv === "medium" ? "1.15" : fontLv === "large" ? "1.3" : "1";
+  document.body.style.zoom = zval === "1" ? "" : zval;
+  document.documentElement.style.setProperty("--ui-zoom", zval);
+  document.querySelectorAll("#fontRow .seg").forEach((b) =>
+    b.classList.toggle("on", b.dataset.font === fontLv));
+  /* 背景颜色系统: 预设/自定义色卡 + 深度滑条(见 applyBg); 滑条位置随当前深度回显 */
+  applyBg(theme);
+  const sl = document.getElementById("bgDepth");
+  if (sl) {
+    let d = parseInt(localStorage.getItem("bgDepth") || "0", 10);
+    if (!(d >= 1 && d <= 10)) d = theme === "light" ? 1 : 10;
+    sl.value = d;
+  }
+  const curBgHex = localStorage.getItem("bgHex") || "";
+  const curDepth = bgDepthNow(theme);
+  const bgRow = document.getElementById("bgRow");
+  if (bgRow) {
+    bgRow.innerHTML = BGS.map((x) => {
+      const on = (curBgHex === x.hex);
+      return `<span class="sw ${on ? "on" : ""}" data-hex="${x.hex}" title="${x.name}" style="background:${bgPreviewColor(x.hex, curDepth)}"></span>`;
+    }).join("");
+    bgRow.querySelectorAll(".sw").forEach((s) => s.addEventListener("click", () => {
+      if (s.dataset.hex === "") localStorage.removeItem("bgHex");
+      else localStorage.setItem("bgHex", s.dataset.hex);
+      applyTheme();
+    }));
+  }
+  const bgCustomRow = document.getElementById("bgCustomRow");
+  if (bgCustomRow) {
+    bgCustomRow.querySelectorAll(".custom-accent-swatch").forEach((s) => s.remove());
+    bgCustoms().forEach((color) => {
+      const swatch = document.createElement("span");
+      swatch.className = "custom-accent-swatch" + (curBgHex === color ? " on" : "");
+      swatch.style.backgroundColor = color;
+      swatch.title = "使用背景颜色 " + color;
+      swatch.addEventListener("click", () => {
+        localStorage.setItem("bgHex", color);
+        applyTheme();
+      });
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "custom-accent-remove";
+      remove.textContent = "×";
+      remove.title = "删除该背景颜色";
+      remove.addEventListener("click", (e) => {
+        e.stopPropagation();
+        saveBgCustoms(bgCustoms().filter((c) => c !== color));
+        if (curBgHex === color) localStorage.removeItem("bgHex");
+        applyTheme();
+      });
+      swatch.appendChild(remove);
+      bgCustomRow.appendChild(swatch);
+    });
+  }
 }
+/* 背景颜色系统: 自定义颜色(色相/饱和度) + 深度滑条(1=白天深度 → 10=黑夜深度)。
+   背景/面板/卡片/软底/输入框/描边全部从同一 HSL 派生(设置栏等同步吃色);
+   未自定义时用标准蓝灰家族(220°), 深度1/10 即现在的白天/黑夜底色。 */
+function hexToHsl(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = ((n >> 16) & 255) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  let h = 0, s = 0;
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h = Math.round(h * 60);
+  }
+  return { h: h, s: Math.round(s * 100) };
+}
+function applyBg(theme) {
+  let depth = parseInt(localStorage.getItem("bgDepth") || "0", 10);
+  if (!(depth >= 1 && depth <= 10)) depth = theme === "light" ? 1 : 10;   // 默认跟随模式
+  const hex = (localStorage.getItem("bgHex") || "").toLowerCase();
+  const t = (depth - 1) / 9;
+  let h, s1, s2;
+  if (HEX_COLOR_RE.test(hex)) {
+    const c = hexToHsl(hex);
+    h = c.h; s1 = c.s; s2 = c.s;   // 自定义色: 色相/饱和全程保持, 深度只推明度
+  } else {
+    h = 220; s1 = 44; s2 = 18;     // 标准底色家族
+  }
+  const s = Math.round(s1 + (s2 - s1) * t);
+  const mix = (a, b) => Math.round((a + (b - a) * t) * 10) / 10;
+  const set = (k, l) => document.body.style.setProperty(k, `hsl(${h}, ${s}%, ${mix(l[0], l[1])}%)`);
+  set("--bg", [96, 7]);      set("--panel", [100, 11]);
+  set("--card", [100, 13]);  set("--soft", [93, 14]);
+  set("--input", [95, 5.5]); set("--line", [91, 19]);
+}
+/* ---- 背景颜色: 预设/自定义/深度 ---- */
+const BGS = [
+  { hex: "", name: "标准（默认）" },
+  { hex: "#f7f1e6", name: "米白" },
+  { hex: "#eaf5f6", name: "淡青" },
+  { hex: "#ecf6ee", name: "淡绿" },
+  { hex: "#f3f0fa", name: "淡紫" },
+  { hex: "#f9eff3", name: "淡粉" },
+];
+const BG_CUSTOMS_KEY = "bgCustomList";
+function bgCustoms() {
+  try {
+    const colors = JSON.parse(localStorage.getItem(BG_CUSTOMS_KEY) || "[]");
+    return Array.isArray(colors) ? colors.filter((c) => HEX_COLOR_RE.test(c)) : [];
+  } catch (_) {
+    return [];
+  }
+}
+function saveBgCustoms(colors) {
+  localStorage.setItem(BG_CUSTOMS_KEY, JSON.stringify([...new Set(colors)].slice(0, 24)));
+}
+function bgDepthNow(theme) {
+  let d = parseInt(localStorage.getItem("bgDepth") || "0", 10);
+  if (!(d >= 1 && d <= 10)) d = theme === "light" ? 1 : 10;
+  return d;
+}
+function hslToHex(h, s, l) {
+  s /= 100; l /= 100;
+  const k = (n) => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) => Math.round(255 * (l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1))));
+  return "#" + [f(0), f(8), f(4)].map((v) => Math.max(0, Math.min(255, v)).toString(16).padStart(2, "0")).join("");
+}
+/* 预设色卡在当前深度下的预览色(所见即所得) */
+function bgPreviewColor(hex, depth) {
+  const t = (depth - 1) / 9;
+  let h, s1, s2;
+  if (HEX_COLOR_RE.test(hex)) { const c = hexToHsl(hex); h = c.h; s1 = c.s; s2 = c.s; }
+  else { h = 220; s1 = 44; s2 = 18; }
+  return hslToHex(h, Math.round(s1 + (s2 - s1) * t), Math.round((96 + (7 - 96) * t) * 10) / 10);
+}
+/* 原生标签栏配色方案(页面算好推送, GDI 只管画) */
+function bgStripScheme() {
+  const theme = localStorage.getItem("theme") || "dark";
+  const depth = bgDepthNow(theme);
+  const hex = (localStorage.getItem("bgHex") || "").toLowerCase();
+  const t = (depth - 1) / 9;
+  let h, s1, s2;
+  if (HEX_COLOR_RE.test(hex)) { const c = hexToHsl(hex); h = c.h; s1 = c.s; s2 = c.s; }
+  else { h = 220; s1 = 44; s2 = 18; }
+  const s = Math.round(s1 + (s2 - s1) * t);
+  const L = (a, b) => Math.round((a + (b - a) * t) * 10) / 10;
+  const dark = depth >= 6;
+  return {
+    hex: hex, depth: depth,
+    bar: hslToHex(h, s, L(92, 3)),        // 栏底: 比页面底色再深一档
+    active: hslToHex(h, s, L(100, 11)),   // 激活标签 = 面板色
+    hover: hslToHex(h, s, L(93, 15)),     // 悬停 = 软底色
+    fgon: dark ? "#e8eaf0" : "#20242f",
+    fgoff: dark ? "#969eac" : "#5d6675",
+    sep: dark ? "#343944" : "#dfe3ec",
+  };
+}
+
 function addCustomAccent(color) {
   const normalized = color.toLowerCase();
   if (!HEX_COLOR_RE.test(normalized)) return;
@@ -253,7 +414,68 @@ function addCustomAccent(color) {
 }
 document.addEventListener("click", (e) => {
   const b = e.target.closest("#themeRow .seg");
-  if (b) { localStorage.setItem("theme", b.dataset.theme); applyTheme(); }
+  if (b) {
+    localStorage.setItem("theme", b.dataset.theme);
+    // 界面模式联动深度: 黑夜=10, 白天=1(文字深浅与背景深度保持一致)
+    localStorage.setItem("bgDepth", b.dataset.theme === "light" ? "1" : "10");
+    applyTheme();
+  }
+  const f = e.target.closest("#fontRow .seg");
+  if (f) { localStorage.setItem("fontLv", f.dataset.font); applyTheme(); }
+  /* 超分分辨率倍率: 1 / 1.25 / 1.5 / 2 —— 用户自己选, 选哪档就跑哪档 */
+  const scl = e.target.closest("#srScaleRow .seg");
+  if (scl) {
+    document.querySelectorAll("#srScaleRow .seg").forEach((x) => x.classList.toggle("on", x === scl));
+    api("/api/settings", { method: "POST", body: { ui_sr_scale: scl.dataset.scale } }).catch(() => {});
+    toast("超分倍率已设为「" + scl.dataset.scale + "×」，新打开的B站标签页生效");
+  }
+  /* 画质增强: 档位即开关(与 AI超分 同一套) —— 「关闭」= ui_bq 0, 其余档位 = ui_bq 1 + 档位名 */
+  const sl = e.target.closest("#srLevelRow .seg");
+  if (sl) {
+    document.querySelectorAll("#srLevelRow .seg").forEach((x) => x.classList.toggle("on", x === sl));
+    /* 开关并入档位: 「关」= ui_sr 0, 其余档位 = ui_sr 1 + 档位名 */
+    const body = sl.dataset.level === "关"
+      ? { ui_sr: "0" }
+      : { ui_sr: "1", ui_sr_level: sl.dataset.level };
+    api("/api/settings", { method: "POST", body }).catch(() => {});
+    toast(sl.dataset.level === "关"
+      ? "AI超分已关闭"
+      : "AI超分已设为「" + sl.dataset.level + "」，新打开的B站标签页生效");
+  }
+  const bl = e.target.closest("#bqLevelRow .seg");
+  if (bl) {
+    document.querySelectorAll("#bqLevelRow .seg").forEach((x) => x.classList.toggle("on", x === bl));
+    /* 档位即开关(与 AI超分 同一套存储): 「关闭」= ui_bq 0, 其余档位 = ui_bq 1 + 档位名 */
+    const body = bl.dataset.level === "关闭"
+      ? { ui_bq: "0" }
+      : { ui_bq: "1", ui_bq_level: bl.dataset.level };
+    api("/api/settings", { method: "POST", body }).catch(() => {});
+    toast(bl.dataset.level === "关闭"
+      ? "画质增强已关闭"
+      : "增强强度已设为「" + bl.dataset.level + "」，新打开的B站标签页生效");
+  }
+  if (e.target.closest("#bgResetBtn")) {
+    localStorage.removeItem("bgHex");
+    localStorage.removeItem("bgDepth");
+    applyTheme();
+  }
+});
+const bgColorInput = document.getElementById("bgColorInput");
+if (bgColorInput) bgColorInput.addEventListener("change", (e) => {
+  const v = (e.target.value || "").toLowerCase();
+  if (!HEX_COLOR_RE.test(v)) return;
+  localStorage.setItem("bgHex", v);
+  saveBgCustoms([v, ...bgCustoms()]);   // 存入自定义历史(强调色同款交互)
+  applyTheme();
+});
+const bgDepthInput = document.getElementById("bgDepth");
+if (bgDepthInput) bgDepthInput.addEventListener("input", (e) => {
+  const d = parseInt(e.target.value, 10) || 1;
+  localStorage.setItem("bgDepth", String(d));
+  // 深度过半自动切文字深浅(背景已偏暗/偏亮), 界面模式按钮仍可手动切
+  const want = d >= 6 ? "dark" : "light";
+  if ((localStorage.getItem("theme") || "dark") !== want) localStorage.setItem("theme", want);
+  applyTheme();
 });
 applyTheme();   // 立即应用, 避免闪烁
 const customAccentInput = document.getElementById("customAccentInput");
@@ -484,9 +706,11 @@ function loadFeed(force) {
   clearFeed();
   feedFetch(force, feedState.gen);
 }
+/* 滚动预取: 哨兵距可视区底部还有1200px就请求下一页(而非等真正滚到底),
+   新卡片在用户到达前已渲染好, 也让服务端提前补池的信号更早触发 */
 new IntersectionObserver((es) => {
   es.forEach((e) => { if (e.isIntersecting) feedFetch(false, feedState.gen); });
-}, { root: $("#feedList"), threshold: 0 }).observe($("#feedMore"));
+}, { root: $("#feedList"), rootMargin: "0px 0px 1200px 0px", threshold: 0 }).observe($("#feedMore"));
 function cardHTML(it) {
   const isTb = it.platform === "贴吧";
   const isXhh = it.platform === "小黑盒";
@@ -523,12 +747,15 @@ function cardHTML(it) {
   const reason = it.reason ? '<div class="reason">' + esc(it.reason) + "</div>" : "";
   const authorHtml = follow ? '<span class="follow-author">' + esc(it.author) + '</span>' : esc(it.author);
   const bvid = (!isTb && !isXhh) ? ((it.url || "").match(/BV[0-9A-Za-z]{8,12}/) || [])[0] : "";
-  const playBtn = (bvid && !isTouchDevice())
-    ? '<button data-act="play" data-bvid="' + bvid + '" data-title="' + esc(it.title) + '" title="站内播放"><i class="ic ic-play"></i></button>' : "";
+  // 电脑端隐藏「站内播放 / 站内阅读·站内预览」按钮: 内容统一走点卡片开内置浏览器标签;
+  // 触屏端(安卓壳)保留站内阅读入口(播放按钮触屏端原本就没有)
+  const onMobile = isTouchDevice();
   const tid = isTb ? ((it.url || "").match(/\/p\/(\d+)/) || [])[1] : "";
   const xhhLid = isXhh ? ((it.url || "").match(/bbs\/link\/([0-9a-f]+)/) || [])[1] : "";
-  const readBtn = tid ? '<button data-act="read" data-tid="' + tid + '" title="站内阅读"><i class="ic ic-read"></i></button>' :
-    (xhhLid ? '<button data-act="xread" data-lid="' + xhhLid + '" title="站内预览"><i class="ic ic-read"></i></button>' : "");
+  const readBtn = onMobile
+    ? (tid ? '<button data-act="read" data-tid="' + tid + '" title="站内阅读"><i class="ic ic-read"></i></button>' :
+      (xhhLid ? '<button data-act="xread" data-lid="' + xhhLid + '" title="站内预览"><i class="ic ic-read"></i></button>' : ""))
+    : "";
   const meta = (isTb || isXhh)
     ? '<div class="meta-text">' + esc(it.author || "用户") + " · " + ago(it.pubdate) +
       (isTb ? " · " + esc(it.tname || "") : "") + "</div>"
@@ -539,7 +766,7 @@ function cardHTML(it) {
       '<div class="card-side">' + meta + desc + '</div></div>'
       : '<div class="card-media no-cover"><div class="card-side">' + meta + desc + '</div></div>'}
     <div class="acts">
-      ${playBtn}${readBtn}
+      ${readBtn}
       <button data-act="refresh" title="换一条(刷新)"><i class="ic ic-next"></i></button>
       <button data-act="like" title="喜欢"><i class="ic ic-like"></i></button>
       <button data-act="dislike" class="dis" title="不喜欢"><i class="ic ic-dislike"></i></button>
@@ -596,9 +823,11 @@ async function startPreview(tw) {
   }
   if (!src) return;
   stopPreview();
+  // 定位策略: 浮层挂到 documentElement(html)下 —— html 不在 body 的 zoom 子树里,
+  // fixed 定位直接用视觉坐标(与 getBoundingClientRect 同一坐标系), 物理上不会错位;
+  // (曾试过在 body 内除以 zoom 校正, 但 zoom 容器内的坐标语义有额外变量, 不可靠)
   const rect = tw.getBoundingClientRect();
   const zoom = pvZoom();
-  // ×1 = 原位播放: 浮层就是封面本身那么大, 贴回卡片原位即可, 不做任何位移
   const ovW = Math.round(rect.width * zoom);
   const ovH = Math.round(rect.height * zoom);
   const feed = document.getElementById("feedList");
@@ -627,7 +856,7 @@ async function startPreview(tw) {
   const img = tw.querySelector("img");
   ov.innerHTML = (img && img.src ? '<img src="' + esc(img.src) + '" referrerpolicy="no-referrer" alt="">' : "") +
     '<video muted loop playsinline preload="auto"></video>';
-  document.body.appendChild(ov);
+  document.documentElement.appendChild(ov);
   pvOverlay = ov;
   const v = ov.querySelector("video");
   v.addEventListener("canplay", () => v.classList.add("pv-ok"));   // 数据就绪才显示画面
@@ -947,12 +1176,20 @@ function tipHideNow() {   // 移出即关闭
     tipCur = "";
   }
 }
+/* 字体大小(zoom)的坐标校正系数: 视觉坐标 → zoom 容器内 CSS 坐标 需除以它 */
+function uiZoom() {
+  const z = parseFloat(document.body.style.zoom);
+  return (z > 0 && z !== 1) ? z : 1;
+}
 function tipPos(x, y) {
+  const zb = uiZoom();
+  x /= zb; y /= zb;   // clientX/Y 是视觉坐标, 浮层在 zoom 容器内需除回
   const pad = 14;
   let px = x + pad, py = y + pad;
   const r = descTip.getBoundingClientRect();
-  if (px + r.width > innerWidth - 10) px = x - r.width - pad;
-  if (py + r.height > innerHeight - 10) py = y - r.height - pad;
+  const w = r.width / zb, h = r.height / zb;
+  if (px + w > innerWidth / zb - 10) px = x - w - pad;
+  if (py + h > innerHeight / zb - 10) py = y - h - pad;
   descTip.style.left = px + "px";
   descTip.style.top = py + "px";
 }
@@ -1430,6 +1667,17 @@ async function loadSettings() {
   $("#cfgStatus").className = "hint " + (s.ai_ok ? "ok" : "off");
   applyAiModeBtn(s.ai_full_scan === "1");
   applyAiMainBtn(s.ai_enabled === "1");
+  /* 画质增强(B站): 档位即开关, 「关闭」档 = ui_bq 0; 与 AI超分 同一套回显逻辑 */
+  const bqLvl = (s.ui_bq !== "0") ? (s.ui_bq_level || "中") : "关闭";
+  document.querySelectorAll("#bqLevelRow .seg").forEach((b) =>
+    b.classList.toggle("on", b.dataset.level === bqLvl));
+  const srOn = s.ui_sr === "1";
+  const srLvl = srOn ? (s.ui_sr_level || "高") : "关";
+  document.querySelectorAll("#srLevelRow .seg").forEach((b) =>
+    b.classList.toggle("on", b.dataset.level === srLvl));
+  const srScale = s.ui_sr_scale || "2";
+  document.querySelectorAll("#srScaleRow .seg").forEach((b) =>
+    b.classList.toggle("on", b.dataset.scale === srScale));
   aiModeVals = s;
   loadTiebaSettings();
   refreshFloatBall();
@@ -1820,9 +2068,11 @@ function bindSplitter(id, target, side, saveKey, min, reserve) {
   sp.addEventListener("pointerdown", (e) => {
     sp.classList.add("drag");
     target.classList.add("dragging");
+    const zb = uiZoom();
     const startX = e.clientX, startW = target.offsetWidth;
     const move = (ev) => {
-      let w = side === "left" ? startW + (ev.clientX - startX) : startW - (ev.clientX - startX);
+      // clientX 差值是视觉像素, flexBasis 是 zoom 容器内 CSS 像素 → 除回, 否则拖拽变倍速
+      let w = side === "left" ? startW + (ev.clientX - startX) / zb : startW - (ev.clientX - startX) / zb;
       w = clampSide(w, min, target, reserve);
       // 同时设 flexBasis: flex item 的 flex-basis 会覆盖 width, 不设则拖不动
       target.style.flexBasis = w + "px";

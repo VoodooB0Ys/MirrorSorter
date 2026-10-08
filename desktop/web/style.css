@@ -12,6 +12,8 @@ body.light {
   --bg:#f2f4f9; --panel:#ffffff; --card:#ffffff; --line:#dfe3ec;
   --txt:#20242f; --sub:#5d6675; --soft:#ecf0f6; --input:#f4f6fa;
 }
+/* 深度滑条等表单控件跟随强调色 */
+input[type="range"] { accent-color: var(--accent); }
 /* 强调色(特殊颜色显示) */
 body.accent-blue { --accent:#4a9eff; }
 body.accent-green { --accent:#2fbf71; }
@@ -26,7 +28,9 @@ body {
   background:var(--bg); color:var(--txt); overflow:hidden;
   font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif; font-size:14px;
 }
-#app { display:flex; height:100vh; }
+/* 100vh 在 body zoom 下会被乘以缩放系数(实测 Chromium), 应用会比视口高出 (Z-1)/Z,
+   侧栏底部(黑名单设置)永远滚不到 → 高度除以 --ui-zoom(app.js 随字体档位设置) */
+#app { display:flex; height:calc(100vh / var(--ui-zoom, 1)); }
 /* 显式分层: 设置栏在下层, 内容区在上层(保证播放预览等浮层不被设置栏遮挡) */
 #rail { z-index:0; }
 #main { position:relative; z-index:1; }
@@ -630,7 +634,7 @@ body.hide-reason .card .reason { display:none !important; }
 @media (max-width: 1023.9px) {
 
   /* ---- 骨架 ---- */
-  #app { display:block; height:100vh; height:100dvh; }
+  #app { display:block; height:calc(100vh / var(--ui-zoom, 1)); height:calc(100dvh / var(--ui-zoom, 1)); }
   .splitter { display:none !important; }
   #main { height:100%; }
   #content { position:relative; }

@@ -9,6 +9,7 @@
 任意线程调用。pythonnet 注意: 控件必须在 UI 线程创建(跨线程建父子会抛
 ArgumentException); Anchor 必须显式四边(主控件 Dock=Fill 时其 Anchor 值不可拷贝)。
 """
+import json
 import os
 import threading
 import time
@@ -145,7 +146,10 @@ def _dbg_log(msg):
         import time as _t
         with open(os.path.join(app.DATA_DIR, "shell_debug.log"), "a",
                   encoding="utf-8") as f:
-            print("[shell] " + msg, flush=True); f.write("[" + NL + "] %s" % (_t.strftime("%H:%M:%S"), msg))
+            print("[shell] " + msg, flush=True)
+            # (历史笔误: 曾写成 "[" + NL + "] %s" % (t, msg) —— 一个 %s 配二元组,
+            #  每次都 TypeError 被吞, 日志文件永远是空的, 只有 stdout 有)
+            f.write("[%s] %s%s" % (_t.strftime("%H:%M:%S"), msg, NL))
     except Exception:
         pass
 
@@ -184,6 +188,100 @@ def _user_scripts():
         return out
     except Exception:
         return []
+
+
+def _read_ext_bytes(name):
+    """extensions/ 下二进制资源(Framegen 权重 .bin)。找不到返回空 bytes。"""
+    import sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (here, os.path.join(getattr(sys, "_MEIPASS", "") or "", "extensions"),
+              os.path.join(here, "extensions")):
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            try:
+                with open(p, "rb") as f:
+                    return f.read()
+            except Exception:
+                return b""
+    return b""
+
+
+# ---- AI补帧(Framegen, github.com/MONZikWasTaken/Framegen) ----
+# 原项目是 Chrome 扩展: 内容脚本依赖 chrome.runtime.getURL(取权重/运行时)与
+# chrome.storage.local(设置持久化)。我们的注入跑在页面主世界 —— 引导垫片把
+# 权重/运行时以 base64 内嵌转 Blob URL 供其 fetch/import(动态 import Blob 模块
+# 与扩展资源行为一致), chrome.storage 落到页面 localStorage(键 fc_*, 浮窗面板
+# 的调整跨刷新保留)。代码 MIT; 模型权重仅限个人/非商用(见 framegen-NOTICE.txt)。
+_FG_ASSETS = (
+    ("rt/rt.js", "framegen-rt.js", "text/javascript"),
+    ("rt/sr.js", "framegen-sr.js", "text/javascript"),
+    ("assets/rt_v7s.bin", "framegen-weights-v7s.bin", "application/octet-stream"),
+    ("assets/rt_v7s.json", "framegen-weights-v7s.json", "application/json"),
+    ("assets/rt_sr.bin", "framegen-weights-sr.bin", "application/octet-stream"),
+    ("assets/rt_sr.json", "framegen-weights-sr.json", "application/json"),
+)
+_FG_B64_CACHE = {}   # 文件名 -> base64(进程级缓存: 每个新标签页都重建注入脚本, 别反复编4MB)
+
+_FG_BOOT_JS = r"""
+(function () {
+  "use strict";
+  if (window.__msxFgBoot) return;
+  window.__msxFgBoot = 1;
+  var SRC = __MSX_FG_SRC__;
+  var RES = {};
+  try {
+    for (var k in SRC) {
+      var raw = atob(SRC[k].b64), u8 = new Uint8Array(raw.length);
+      for (var i = 0; i < raw.length; i++) u8[i] = raw.charCodeAt(i);
+      RES[k] = URL.createObjectURL(new Blob([u8], { type: SRC[k].mime }));
+    }
+    var C = window.chrome || (window.chrome = {});
+    if (!C.runtime) C.runtime = {
+      id: "msx-framegen",
+      getURL: function (p) { return RES[p] || p; },
+      sendMessage: function (_m, cb) { if (cb) cb({ ok: false }); },
+      openOptionsPage: function () {},
+      onMessage: { addListener: function () {} },
+    };
+    if (!C.storage) C.storage = {
+      local: {
+        get: function (defs, cb) {
+          var out = {};
+          try {
+            for (var k2 in defs) {
+              var raw2 = localStorage.getItem("fc_" + k2);
+              out[k2] = raw2 === null ? defs[k2] : JSON.parse(raw2);
+            }
+            cb(out);
+          } catch (e) { try { cb(defs); } catch (_) {} }
+        },
+        set: function (obj, cb) {
+          try { for (var k3 in obj) localStorage.setItem("fc_" + k3, JSON.stringify(obj[k3])); }
+          catch (e) {}
+          if (cb) cb();
+        },
+      },
+      onChanged: { addListener: function () {} },
+    };
+  } catch (e) { console.warn("[msx] framegen boot failed", e); }
+})();
+"""
+
+
+def _framegen_boot_js():
+    """组装 Framegen 引导垫片(资源 base64 表)。任一资源缺失返回空串(禁用)。"""
+    import base64
+    import json as _json
+    src = {}
+    for key, fname, mime in _FG_ASSETS:
+        if fname not in _FG_B64_CACHE:
+            data = _read_ext_bytes(fname)
+            if not data:
+                _dbg_log("framegen asset missing: %s" % fname)
+                return ""
+            _FG_B64_CACHE[fname] = base64.b64encode(data).decode("ascii")
+        src[key] = {"mime": mime, "b64": _FG_B64_CACHE[fname]}
+    return _FG_BOOT_JS.replace("__MSX_FG_SRC__", _json.dumps(src))
 
 
 def _glob_match(pattern, host):
@@ -228,6 +326,215 @@ def _build_inject_script(port):
     bsb = "" if os.environ.get("MSX_NO_INJECT") else _read_ext_file("bilibili-sponsorblock.js")
     if bsb:
         parts.append('try {\n' + bsb + '\n} catch (e) { console.warn("[msx] sponsorblock", e); }')
+    bq = _read_ext_file("bilibili-enhance.user.js")
+    if bq:
+        # 画质增强(锐化+色彩滤镜): 无 Vue/GM 依赖, 纯 CSS/SVG, 开关与档位走服务端设置
+        bq_on = "0" if app.sget("ui_bq") == "0" else "1"
+        bq_level = (app.sget("ui_bq_level") or "中").strip()[:6]
+        if "<" in bq_level or '"' in bq_level:
+            bq_level = "中"   # 白名单化: 该值会被拼进页面脚本
+        parts.append('window.__MSX_BQ__ = %s; window.__MSX_BQ_LEVEL__ = "%s";\ntry {\n'
+                     % (bq_on, bq_level) + bq + '\n} catch (e) { console.warn("[msx] quality", e); }')
+    # 内置「最高画质」脚本已下线: 用户明确说"让播放器用上账号本就有权的最高档没有意义"
+    # (extensions/bilibili-quality.user.js 保留备查, 不再注入)
+    # ACNet(Anime4KCPP f8b4) WebGL2 多趟超分: 上游 GLSL 原文当字符串注入, 运行器在
+    # extensions/acnet-webgl.js。**默认开**(由超分门控决定何时真正启用: need>1.2 且输出≤4.2Mpx);
+    # 需要关掉时设环境变量 MSX_ACNET=0。
+    if os.environ.get("MSX_ACNET") != "0":
+        _acnet_js = _read_ext_file("acnet-webgl.js")
+        _acnet_glsl = _read_ext_file(os.path.join("_acnet", "acnet_f8b4.glsl"))
+        if _acnet_js and _acnet_glsl:
+            parts.append('window.__MSX_ACNET__ = 1;\nwindow.__MSX_ACNET_GLSL__ = %s;\n'
+                         % json.dumps(_acnet_glsl))
+            if os.environ.get("MSX_ACNET_DEBUG"):
+                parts.append('window.__MSX_ACNET_DEBUG__ = %s;\n'
+                             % json.dumps(os.environ["MSX_ACNET_DEBUG"]))
+            if os.environ.get("MSX_ACNET_MAXPASS"):
+                parts.append('window.__MSX_ACNET_MAXPASS__ = %s;\n'
+                             % json.dumps(os.environ["MSX_ACNET_MAXPASS"]))
+            if os.environ.get("MSX_ACNET_WANTW"):
+                parts.append('window.__MSX_ACNET_WANTW__ = %s;\n'
+                             % json.dumps(os.environ["MSX_ACNET_WANTW"]))
+            if os.environ.get("MSX_ACNET_IWMAX"):
+                parts.append('window.__MSX_ACNET_IWMAX__ = %s;\n'
+                             % json.dumps(os.environ["MSX_ACNET_IWMAX"]))
+            parts.append('try {\n' + _acnet_js + '\n} catch (e) { console.warn("[msx] acnet", e); }')
+            _dbg_log("acnet: injected glsl %d chars + runner %d chars"
+                     % (len(_acnet_glsl), len(_acnet_js)))
+    # AI补帧(Framegen)暂时下线(易出bug: document-start注入曾致渲染进程崩溃, 已改
+    # DOMContentLoaded, 但保守起见整体停用)。注入代码保留, 需要>0重新启用:
+    # 设环境变量 MSX_FG=1 并把设置键 ui_fg 置 1。
+    fg_on = (os.environ.get("MSX_FG") == "1" and app.sget("ui_fg") == "1"
+             and not os.environ.get("MSX_NO_FG"))
+    sr_on = app.sget("ui_sr") == "1"
+    if fg_on and sr_on:
+        # 冲突兜底: 补帧与超分都要用画布接管视频画面, GPU 负担也翻倍 —— 只跑补帧
+        # (设置页已做互斥, 这里防旧存档/环境变量组合出双开)
+        sr_on = False
+        _dbg_log("ui_fg + ui_sr both on -> sr suppressed")
+    if sr_on:
+        # AI超分(Anime4K WebGPU 实时超分): 库 3.4MB, 只在 B站页注入; 开关 ui_sr, 默认关
+        sr_lib = _read_ext_file("anime4k-webgpu.js")
+        sr_glue = _read_ext_file("bilibili-sr.user.js")
+        if sr_lib and sr_glue:
+            # 档位: 轻/标准/高/旗舰(默认高=CNNx2UL, 与旧版一致) —— 白名单化后拼进页面脚本
+            sr_level = (app.sget("ui_sr_level") or "高").strip()[:4]
+            if sr_level not in ("轻", "标准", "高", "旗舰"):
+                sr_level = "高"
+            # 超分分辨率倍率: 1 / 1.25 / 1.5 / 2 (白名单, 会被拼进页面脚本)。
+            # 默认必须与设置页 UI 的默认(web/app.js 读档回显 `s.ui_sr_scale || "2"`)一致 ——
+            # 旧壳默认 1.25 而 UI 显示 2, 用户看到的和实际跑的不一样。它决定网络输入档位
+            # (档位越高越清晰越吃显卡, 无自动升降); 显卡吃不下时帧节奏门隔帧跑网络兜底。
+            sr_scale = (app.sget("ui_sr_scale") or "2").strip()[:4]
+            if os.environ.get("MSX_SR_SCALE"):        # 测试用覆盖
+                sr_scale = os.environ["MSX_SR_SCALE"].strip()[:4]
+            if sr_scale not in ("1", "1.25", "1.5", "2"):
+                sr_scale = "2"
+            # MSX_SR_DEBUG=1: 周期性回报超分状态(画布是否创建/原视频是否隐藏), 排障用
+            sr_probe = ""
+            if os.environ.get("MSX_SR_DEBUG"):
+                # 排障探针: 回报超分画布状态 + 源/显示分辨率(1080p 是否进门控) + 弹幕层是否在
+                # 画布之上(逐层读 computed z-index, 只要有一层 <= 画布层级就算不合格)
+                sr_probe = ('var __srN = 0;\n'
+                            'var __srT = setInterval(function () {\n'
+                            '  try {\n'
+                            '    var c = document.querySelector("canvas.msx-sr-canvas");\n'
+                            '    var v = document.querySelector("#bilibili-player video, .bpx-player-container video");\n'
+                            '    var zc = c ? (parseInt(getComputedStyle(c).zIndex, 10) || 0) : null;\n'
+                            '    if (!window.__srTick) { window.__srTick = { f: 0, lt: Date.now() };\n'
+                            '      (function l(){ window.__srTick.f++; requestAnimationFrame(l); })(); }\n'
+                            '    var tk = window.__srTick, nw = Date.now();\n'
+                            '    var fps = Math.round((tk.f - (tk.lf || 0)) * 1000 / Math.max(1, nw - tk.lt) * 10) / 10;\n'
+                            '    tk.lf = tk.f; tk.lt = nw;\n'
+                            '    var dq = -1, tq = -1;\n'
+                            '    try { var q = v.getVideoPlaybackQuality();\n'
+                            '      dq = q.droppedVideoFrames - (window.__srD0 || 0);\n'
+                            '      tq = q.totalVideoFrames - (window.__srT0 || 0);\n'
+                            '      window.__srD0 = q.droppedVideoFrames; window.__srT0 = q.totalVideoFrames; } catch (e) {}\n'
+                            '    var dm = document.querySelectorAll(".bpx-player-row-dm-wrap,'
+                            ' .bpx-player-bas-dm-wrap, .bpx-player-adv-dm-wrap,'
+                            ' .bpx-player-cmd-dm-wrap, .bpx-player-dm-mask-wrap, .bili-danmaku-x-dm");\n'
+                            '    var dmz = [], dmAbove = true;\n'
+                            '    for (var i = 0; i < dm.length && i < 40; i++) {\n'
+                            '      var z = parseInt(getComputedStyle(dm[i]).zIndex, 10);\n'
+                            '      dmz.push(isNaN(z) ? "auto" : z);\n'
+                            '      if (zc !== null && (isNaN(z) || z <= zc)) dmAbove = false;\n'
+                            '    }\n'
+                            '    window.open("msx-debug:SRPROBE" + __srN + " canvas=" + (c ? c.width + "x" + c.height : "none") +\n'
+                            '      " videoHidden=" + !!(v && /msx-sr-hide/.test(v.className)) +\n'
+                            '      " level=" + window.__MSX_SR_LEVEL__ +\n'
+                            '      " src=" + (v && v.videoWidth ? v.videoWidth + "x" + v.videoHeight : "none") +\n'
+                            '      " dispW=" + (v ? Math.round(v.getBoundingClientRect().width) : 0) +\n'
+                            '      " dpr=" + (window.devicePixelRatio || 1) +\n'
+                            '      " canvasZ=" + zc + " fps=" + fps +\n'
+                            '      " dropPer5s=" + dq + "/" + tq +\n'
+                            '      " mode=" + (window.__msxSrMode || "none") +\n'
+                            '      " builds=" + (window.__msxSrBuilds || 0) +\n'
+                            '      " dmCount=" + dm.length + " dmAboveCanvas=" + dmAbove +\n'
+                            '      " dmZ=" + dmz.join("/"), "_blank");\n'
+                            '  } catch (e) {}\n'
+                            '  if (++__srN >= 12) clearInterval(__srT);\n'
+                            '}, 5000);\n')
+            parts.append(
+                'if ((function(){var h=location.hostname; return h==="bilibili.com"||'
+                'h.endsWith(".bilibili.com")})()) {\nwindow.__MSX_SR__ = 1;\n'
+                'window.__MSX_SR_LEVEL__ = "%s";\n' % sr_level
+                + 'window.__MSX_SR_SCALE__ = %s;\n' % sr_scale
+                + ('window.__MSX_SR_FORCE_DISP__ = %s;\n' % os.environ["MSX_SR_FORCE_DISP"]
+                   if os.environ.get("MSX_SR_FORCE_DISP") else "")
+                + ('window.__MSX_SR_BYPASS_GATE__ = 1;\n' if os.environ.get("MSX_SR_BYPASS_GATE") else "")
+                + ('window.__MSX_SR_FORCE_UP2X__ = 1;\n' if os.environ.get("MSX_SR_FORCE_UP2X") else "")
+                + ('window.__MSX_SR_FORCE_K1__ = 1;\n' if os.environ.get("MSX_SR_FORCE_K1") else "")
+                + ('window.__MSX_SR_TRY_FSR__ = 1;\n' if os.environ.get("MSX_SR_TRY_FSR") else "")
+                + sr_lib + '\n' + sr_glue + '\n' + sr_probe + '\n}')
+    if fg_on:
+        # AI补帧(Framegen): 运行时+权重(~4MB base64)只在 B站页注入, 默认关
+        fg_boot = _framegen_boot_js()
+        cad = _read_ext_file("framegen-cadence.js")
+        prof = _read_ext_file("framegen-profiles.js")
+        cont = _read_ext_file("framegen-content.js")
+        if fg_boot and cad and prof and cont:
+            n = len(fg_boot) + len(cad) + len(prof) + len(cont)
+            # MSX_FG_STUB=1: 照常注入全部资源(体积一致)但让 content.js 立即退出 ——
+            # 区分"注入体积/IPC 问题"与"Framegen 运行时问题"的调试钩子
+            stub = "window.__framegen = 1;\n" if os.environ.get("MSX_FG_STUB") else ""
+            if os.environ.get("MSX_FG_DEBUG"):
+                # 调试钩子: 预置 localStorage( Framegen 的 chrome.storage 垫片从这里读),
+                # 打开它的调试 HUD, 验证引擎是否真的在跑(画面上应出现性能面板)
+                stub += ('try { localStorage.setItem("fc_debug", "true");'
+                         ' localStorage.setItem("fc_showFps", "true"); } catch (e) {}\n')
+                # 25s后回报引擎状态: 视频存在/覆盖画布(overlay canvas)是否已创建/FG浮层是否就位
+                stub += ('setTimeout(function () {\n'
+                         '  try {\n'
+                         '    var v = document.querySelector("#bilibili-player video, .bpx-player-container video");\n'
+                         '    var sib = v && v.previousElementSibling;\n'
+                         '    var any = v && v.parentElement && v.parentElement.querySelector("canvas");\n'
+                         '    var msg = "FGPROBE video=" + !!v + " webgpu=" + !!navigator.gpu +\n'
+                         '      " fg=" + !!window.__framegen +\n'
+                         '      " sibCanvas=" + !!(sib && sib.tagName === "CANVAS") +\n'
+                         '      " anyCanvas=" + !!any +\n'
+                         '      " btn=" + !!document.querySelector(".fc-controls-root, .fc-panel");\n'
+                         '    window.open("msx-debug:" + msg, "_blank");\n'
+                         '  } catch (e) {}\n'
+                         '}, 25000);\n')
+            # Framegen 原版走 Chrome 扩展的 document_idle; 我们的通道是 document-created
+            # (早于 DOM 解析), 实测 document-start 就跑它的引导/观察器会触发渲染进程
+            # RESULT_CODE_KILLED_BAD_MESSAGE —— 垫片+引擎推迟到 DOMContentLoaded 执行
+            parts.append(
+                'if ((function(){var h=location.hostname; return h==="bilibili.com"||'
+                'h.endsWith(".bilibili.com")})()) {(function(){\n'
+                'function __msxFgRun() {\nwindow.__MSX_FG__ = 1;\n' + stub +
+                fg_boot + '\n;\n' + cad + '\n;\n' + prof + '\n;\n' + cont + '\n}\n'
+                'try { if (document.readyState === "loading")\n'
+                '  document.addEventListener("DOMContentLoaded", __msxFgRun, { once: true });\n'
+                'else __msxFgRun(); } catch (e) { console.warn("[msx] framegen", e); }\n'
+                # Framegen 原设计要手动点浮层按钮才开始补帧 —— 桌面端开关(ui_fg)开着就
+                # 自动点火: 检测到"播放中的视频 + 按钮未激活"时替用户点一次(每文档一次)
+                '(function () {\n'
+                '  var tries = 0;\n'
+                '  var t = setInterval(function () {\n'
+                '    tries++;\n'
+                '    var b = document.querySelector(\'button[aria-label="Toggle Framegen"]\');\n'
+                '    var v = document.querySelector("#bilibili-player video, .bpx-player-container video");\n'
+                '    if (b && v && !v.paused && b.dataset.active !== "true") {\n'
+                '      try { b.click(); } catch (e) {}\n'
+                '      clearInterval(t);\n'
+                '    }\n'
+                '    if (tries > 60) clearInterval(t);\n'
+                '  }, 1000);\n'
+                '})();\n'
+                '})();}')
+            _dbg_log("framegen inject assembled (%d chars)" % n)
+        else:
+            _dbg_log("framegen inject SKIPPED (asset files missing)")
+    if os.environ.get("MSX_TEST_PLAYBACK"):
+        # 对照测试钩子: MSX_TEST_PLAYBACK="定位秒,暂停秒" (如 "120,126") ——
+        # B站页自动: 跳到定位秒 → 静音播放 → 到暂停秒暂停 → 点「网页全屏」。
+        # 全关/开超分两组对照都走同一时间点, 截图才有可比性。
+        try:
+            _t0, _t1 = [float(x) for x in os.environ["MSX_TEST_PLAYBACK"].split(",")[:2]]
+            parts.append(
+                'if ((function(){var h=location.hostname; return h==="bilibili.com"||'
+                'h.endsWith(".bilibili.com")})()) {(function(){\n'
+                'var tries = 0;\n'
+                '(function go(){\n'
+                '  var v = document.querySelector("#bilibili-player video");\n'
+                '  if (!v || !v.videoWidth) { if (++tries < 90) setTimeout(go, 500); return; }\n'
+                '  v.muted = true;\n'
+                '  try { v.currentTime = %d; } catch (e) {}\n'
+                '  v.play();\n'
+                '  var iv = setInterval(function () {\n'
+                '    if (v.currentTime >= %d) {\n'
+                '      v.pause(); clearInterval(iv);\n'
+                '      var b = document.querySelector(".bpx-player-ctrl-web");\n'
+                '      if (b) b.click();\n'
+                '    }\n'
+                '  }, 150);\n'
+                '})();\n'
+                '})();}' % (_t0, _t1))
+            _dbg_log("test playback hook: seek=%s pause=%s" % (_t0, _t1))
+        except Exception:
+            _dbg_log("MSX_TEST_PLAYBACK parse failed")
     for us in _user_scripts():
         parts.append('try { (function(){\n' + us + '\n})(); }'
                      ' catch (e) { console.warn("[msx] userscript", e); }')
@@ -270,6 +577,7 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000):
     class _Pool:
         ctrls = {0: None}   # tab_key -> WebView2 控件(0 = 信息流主控件)
         _bili_reloaded = {}  # id(ctrl) -> 上次重载时的主题(B站深色cookie生效防循环)
+        _dead = set()        # 已关闭标签的key: 迟到的create直接丢弃(防僵尸控件)
 
         def _is_dark(self):
             try:
@@ -383,12 +691,15 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000):
 
             def go():
                 try:
+                    if tab_key in _Pool._dead:   # 标签已关: 丢弃迟到的创建(否则造出不可见
+                        _Pool._dead.discard(tab_key)   # 僵尸控件, 还会抢走键盘焦点)
+                        return
                     from Microsoft.Web.WebView2.WinForms import (
                         WebView2, CoreWebView2CreationProperties)
-                    from System.Drawing import Color
+                    from System.Drawing import Color, Point, Size
                     from System import Uri
                     form = box["form"]
-                    home = _Pool.ctrls[0]
+                    home = self._ctrl(0)
                     cp = home.CreationProperties
                     props = CoreWebView2CreationProperties()
                     props.UserDataFolder = cp.UserDataFolder
@@ -399,8 +710,12 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000):
                         c.DefaultBackgroundColor = Color.FromArgb(255, 15, 17, 21)
                     except Exception:
                         pass
-                    c.Location = home.Location
-                    c.Size = home.Size
+                    # 外部页签画面整体右移20px(逻辑): 左侧留空隙, 右缘与滚动条位置不变;
+                    # Anchor 四边让窗口缩放时这个 inset 原样保持。home(信息流)不动。
+                    dx = int(20 * float(getattr(form, "_scale", 1.0) or 1.0)) \
+                        if tab_key != 0 else 0
+                    c.Location = Point(home.Location.X + dx, home.Location.Y)
+                    c.Size = Size(home.Size.Width - dx, home.Size.Height)
                     c.Anchor = (WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Bottom |
                                 WinForms.AnchorStyles.Left | WinForms.AnchorStyles.Right)
                     c.Visible = False
@@ -444,7 +759,16 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000):
             _ui(go)
 
         def _ctrl(self, key):
-            return _Pool.ctrls.get(key)
+            c = _Pool.ctrls.get(key)
+            if c is None and key == 0 and box.get("form") is not None:
+                # 自愈: init_ui 若因时序失败, ctrls[0] 永久缺位 → show(0) 永远失活,
+                # 关掉外部标签后信息流再也回不来(整窗黑屏)。
+                try:
+                    c = box["form"].webview
+                    _Pool.ctrls[0] = c
+                except Exception:
+                    pass
+            return c
 
         def show(self, key):
             def go():
@@ -471,6 +795,7 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000):
         def dispose(self, key):
             def go():
                 try:
+                    _Pool._dead.add(key)   # 迟到的create看到即弃
                     c = _Pool.ctrls.pop(key, None)
                     if c is not None:
                         c.Visible = False
@@ -479,5 +804,28 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000):
                 except Exception:
                     pass
             _ui(go)
+
+        def navigate_history(self, key, back):
+            """当前标签页内回退/前进(back=False)。执行了导航返回 True, 无历史返回 False。
+            必须在 UI 线程调用(鼠标侧键过滤器就在 UI 线程) —— 跨线程时 BeginInvoke
+            异步返回 False, 调用方会误判"无历史"。"""
+            done = {"v": False}
+
+            def go():
+                try:
+                    c = self._ctrl(key)
+                    core = c.CoreWebView2 if c is not None else None
+                    if core is None:
+                        return
+                    if back and core.CanGoBack:
+                        core.GoBack()
+                        done["v"] = True
+                    elif not back and core.CanGoForward:
+                        core.GoForward()
+                        done["v"] = True
+                except Exception:
+                    pass
+            _ui(go)
+            return done["v"]
 
     return _Pool()
