@@ -18,11 +18,13 @@ import app   # DATA_DIR(日志/用户脚本目录); 由 app_window 一并加载,
 
 NL = "\n"   # _dbg_log 落盘换行(历史上曾漏定义 → NameError 被吞, shell_debug.log 一直是空的)
 
-# 截屏黑屏根治(v0.3.1.7dsk): 新标签页控件的浏览器参数在 home 控件的基础上
-# 显式追加"禁用 DC 视频 overlay"开关。环境变量 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
-# (app_window.py 设置)已覆盖主控件路; 这里显式带上是为了不依赖"属性值与环境变量
-# 谁覆盖谁"的实现语义——两条路都给到, 重复开关无害。
-MSX_WV2_CAPTURE_FLAG = "--disable-direct-composition-video-overlays"
+# 截屏黑屏根治(v0.3.1.8dsk): 新标签页控件在 home 控件参数基础上显式追加同一组开关。
+# 环境变量 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS(app_window.py 设置)已覆盖主控件路;
+# 这里是第二条路, 不依赖"属性值与环境变量谁覆盖谁"的实现语义, 重复开关无害。
+# ⚠️ 关键是 --disable-direct-composition: 只带 --disable-direct-composition-video-overlays
+# 在 Chromium 154 上挡不住视频层(实证 8/8 黑)。详见 app_window.py 顶部注释。
+MSX_WV2_CAPTURE_FLAG = ("--disable-direct-composition-video-overlays "
+                        "--disable-direct-composition")
 
 
 # 自愈式智能深色: 脚本在页面内常驻定时器, 每1.2s重测背景亮度 ——

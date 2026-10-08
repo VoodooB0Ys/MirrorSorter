@@ -33,17 +33,23 @@ import app  # noqa: E402  本地服务(纯标准库)
 APP_NAME = "洞鉴虚明"
 APP_VER = app.APP_VER
 
-# ── 整屏截屏黑屏根治(浏览器级, v0.3.1.7dsk) ──────────────────────────────────
-# 症状: 微信/QQ/PrntScr 等 GDI BitBlt 截屏, 播放器区域黑屏(偶发)。
-# 根因: Chromium 会把视频(以及不透明轴对齐无滤镜的简单四边形, 如超分画布)提升为
-# DirectComposition 硬件 overlay 平面——屏幕上可见, 但 GDI 截屏取不到 overlay,
-# 截到的就是下面的黑色播放器背景。v0.3.1.6 已在页内给画布加 0.5px 圆角破坏资格,
-# 但 SR 拆管窗口期"可见的原视频"仍会被提升(v0.3.1.6 把视频改回可见后新开的口子)。
-# 这里从引擎层面禁掉视频 overlay 提升——所有 WebView2 控件(主控件+标签页)一并生效。
-# 代价: 视频合成多走一点 GPU 主通道, 省电收益略降, 桌面应用可接受。
+# ── 整屏截屏黑屏根治(浏览器级, v0.3.1.8dsk) ──────────────────────────────────
+# 症状: 微信/QQ/PrntScr 等 GDI BitBlt 截屏, 播放器区域整块黑(概率性; 开不开超分都黑)。
+# 根因(实证定位): Chromium 经 **DirectComposition** 把视频层当独立平面呈现到屏幕,
+#   GDI 系截屏读不到该平面 → 截到黑色播放器背景; 窗口/全屏都会犯, 全屏更频繁。
+# 关键实证(本机 2560x1600, `_fs_cap.py` 连发 BitBlt 判黑):
+#   · 只带 --disable-direct-composition-video-overlays → 8/8、5/8 黑(现网配置, 无效)
+#     —— 该开关在 Chromium 154 上已挡不住视频层; 页内 border-radius 也只是启发式。
+#   · 加 --disable-direct-composition → 窗口 0/10、全屏 0/10, 黑帧清零。
+#   · 该开关只把浏览器"呈现到窗口"这一步从 DComp 换回普通路径, **GPU 渲染照旧**:
+#     带它跑超分, 探针仍报 mode=acnet/高/2x、canvas 1724x969 已建, 管线正常。
+#   · 反例: --disable-gpu 也能清零, 但整条渲染退回软件(视频/弹幕极卡、超分 WebGL 报废),
+#     故不采用; --disable-gpu-compositing 会把全屏窗口截成空白, 亦不采用。
+# 代价: 合成多一次拷贝, 桌面场景可忽略。所有 WebView2 控件(主控件+标签页)一并生效。
 # setdefault: 用户若自己设了该环境变量则以用户的为准。
 os.environ.setdefault("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-                      "--disable-direct-composition-video-overlays")
+                      "--disable-direct-composition-video-overlays "
+                      "--disable-direct-composition")
 MAIN_W, MAIN_H = 1440, 920
 MAIN_MIN = (1080, 700)
 BG_DARK = "#0f1115"   # 与 web/style.css 暗色 --bg 一致, 避免窗口加载瞬间白闪

@@ -327,8 +327,10 @@
          留在主合成面里, 截屏即画面。①画布本体现在已覆盖; ②堵的是 SR 拆管窗口期
          (激活前/管线停滞/换 video 元素)画布不在、视频可见的那一刻(v0.3.1.6 把视频
          改回可见后新开的口子); 画布 teardown 只是 display:none 不移除, 所以这条
-         :has 规则在该视频的全部生命周期持续生效。引擎级兜底:
-         --disable-direct-composition-video-overlays(app_window.py), 三层互为冗余。 */
+         :has 规则在该视频的全部生命周期持续生效。引擎级兜底(v0.3.1.8 修正):
+         --disable-direct-composition --disable-direct-composition-video-overlays
+         (app_window.py / shell_pages.py) —— 只带 video-overlays 那条挡不住, 必须
+         关掉 DComp 呈现; 圆角规则保留为冗余兜底。 */
       /* 不写 display: 未激活时要能被内联 display:none 藏起来 */
     (document.head || document.documentElement).appendChild(st);
   }
