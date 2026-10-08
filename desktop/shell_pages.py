@@ -343,6 +343,31 @@ def _build_inject_script(port):
     ownui = "" if os.environ.get("MSX_NO_OWNUI") else _read_ext_file("bilibili-ownui.user.js")
     if ownui:
         ownui_on = "0" if app.sget("ui_ownui") == "0" else "1"
+        # 播放页推荐筛选规则(m_play_related): 与信息流 machine_filter 同源的页面端子集,
+        # 词表/正则/拉黑/厌恶词在此序列化, 供 ownui 脚本本地执行; 读失败注入 null → 页面回退现状。
+        try:
+            mf = {
+                "on": app.sget("m_play_related") != "0",
+                "min_views": int(app.sget("m_min_views") or 0),
+                "max_views": int(app.sget("m_max_views") or 0),
+                "max_dur": int(app.sget("m_max_duration") or 0),
+                "min_dur": int(app.sget("m_min_duration") or 0),
+                "max_age": int(app.sget("m_max_age_months") or 0),
+                "dedup": app.sget("m_dedup") == "1",
+                "emotion": app.sget("m_emotion") != "0",
+                "flame": list(getattr(app, "FLAME_SLURS", ())),
+                "cb": list(getattr(app, "CLICKBAIT_KWS", ())),
+                "cbre": getattr(app, "CLICKBAIT_RE").pattern if hasattr(app, "CLICKBAIT_RE") else "",
+                "dkws": app.dislike_keywords(),
+                "ablock": [r[0] for r in app.db().execute(
+                    "SELECT name FROM ablock")] if app.sget("m_blocklist_sync") == "1" else [],
+            }
+            mf_js = json.dumps(mf, ensure_ascii=True)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            mf_js = "null"
+        parts.append('window.__MSX_MF__ = %s;\n' % mf_js)
         parts.append('window.__MSX_OWNUI__ = %s;\ntry {\n' % ownui_on + ownui
                      + '\n} catch (e) { console.warn("[msx] ownui", e); }')
     # 内置「最高画质」脚本已下线: 用户明确说"让播放器用上账号本就有权的最高档没有意义"

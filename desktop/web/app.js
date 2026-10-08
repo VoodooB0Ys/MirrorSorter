@@ -2494,6 +2494,7 @@ async function loadMachine() {
   $("#mDedup").checked = s.m_dedup === "1";
   if ($("#mEmotion")) $("#mEmotion").checked = s.m_emotion !== "0";
   if ($("#mNewsFresh")) $("#mNewsFresh").checked = s.m_news_fresh !== "0";
+  if ($("#mPlayRel")) $("#mPlayRel").checked = s.m_play_related !== "0";
   $("#mMinViews").value = s.m_min_views || "0";
   $("#mMaxViews").value = s.m_max_views || "0";
   $("#mMaxDur").value = Math.round((parseInt(s.m_max_duration, 10) || 0) / 60);
@@ -2572,6 +2573,7 @@ $("#mSave").onclick = async () => {
     m_dedup: $("#mDedup").checked ? "1" : "0",
     m_emotion: $("#mEmotion").checked ? "1" : "0",
     m_news_fresh: $("#mNewsFresh").checked ? "1" : "0",
+    m_play_related: $("#mPlayRel").checked ? "1" : "0",
     bili_follow_emph: $("#mFollowEmph").checked ? "1" : "0",
     bili_follow_months: String(parseInt($("#mFollowMonths").value, 10) || 0),
     m_sources: Object.keys(srcOn).filter((id) => srcOn[id]),

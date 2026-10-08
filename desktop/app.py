@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.3.1.1dsk)
+洞鉴虚明 · 基础版 (v0.3.1.2dsk)
 =========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -47,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORTS = (8000, 8010, 8020)
-APP_VER = "v0.3.1.1dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.3.1.2dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -231,6 +231,7 @@ DEFAULTS = {
     "m_cold_start_n": "10",   # 启动预缓存: 退出时缓存池首未展示条目N条, 下次打开直接展示(0=关闭)
     "m_repeat_limit": "4",    # 通用筛选: 同一信息累计展示N次后进入冷却
     "m_repeat_cooldown_hours": "72",  # 通用筛选: 冷却N小时后再显示
+    "m_play_related": "1",    # 机器筛选: 播放页推荐视频按规则筛选并与泛热门7:3混排(默认开)
     "m_emotion": "1",         # 机器筛选: 情绪过滤器(感叹号轰炸/引战黑话/标题党句式, 零token)
     "m_news_fresh": "1",      # 机器筛选: 资讯/热点类只推送24小时内(干货/教程不受此限)
     "bili_follow_emph": "1",  # B站关注的人: 强调关注up发布的视频(入池+视觉强调)
@@ -8833,7 +8834,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/machine":
             keys = ("m_min_views", "m_max_views", "m_max_duration", "m_min_duration", "m_repeat_limit", "m_repeat_cooldown_hours", "m_dedup", "m_blocklist_sync",
                     "m_max_age_months", "ser_max_age_months", "m_seen_hours", "m_emotion",
-                    "m_news_fresh", "xhh_comm", "xhh_topic", "bili_follow_emph", "bili_follow_months",
+                    "m_news_fresh", "m_play_related", "xhh_comm", "xhh_topic", "bili_follow_emph", "bili_follow_months",
                     "m_cold_start_n")
             enabled = enabled_source_ids()
             blocked = [{"name": r[0], "ts": r[1]} for r in
@@ -9194,7 +9195,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/machine":
             for k in ("m_min_views", "m_max_views", "m_max_duration", "m_min_duration", "m_repeat_limit", "m_repeat_cooldown_hours", "m_dedup", "m_blocklist_sync",
                       "m_max_age_months", "ser_max_age_months", "m_seen_hours", "m_emotion",
-                      "m_news_fresh", "xhh_comm", "xhh_topic", "bili_follow_emph", "bili_follow_months",
+                      "m_news_fresh", "m_play_related", "xhh_comm", "xhh_topic", "bili_follow_emph", "bili_follow_months",
                     "m_cold_start_n"):
                 if k in body:
                     sset(k, body[k])

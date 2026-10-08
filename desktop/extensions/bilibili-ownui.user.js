@@ -1,4 +1,4 @@
-/* 洞鉴虚明 · B站播放页自有UI (v0.3.2) —— 注入脚本(document-start, MAIN world)
+/* 洞鉴虚明 · B站播放页自有UI (v0.3.1.2) —— 注入脚本(document-start, MAIN world)
  *
  * 门控: window.__MSX_OWNUI__ === 1(壳按设置键 ui_ownui 注入) 且 www.bilibili.com/video/*。
  * 作用: 评论区 + 右侧栏整块替换为自有UI(Shadow DOM, 数据走B站官方web API+壳内登录态);
@@ -13,6 +13,81 @@
   if (window.__MSX_OWNUI__ !== 1) return;
   if (location.hostname !== "www.bilibili.com") return;
   if (!/^\/video\//.test(location.pathname)) return;
+
+  /* ---------------- 顶栏精简: 只去左侧频道导航(搜索框/用户区保留) ---------------- */
+  try {
+    var navSt = document.createElement("style");
+    navSt.id = "msx-ownui-nav";
+    navSt.textContent = ".bili-header .left-entry{display:none!important}"
+      + ".bili-header .bili-header__channel{display:none!important}";
+    (document.head || document.documentElement).appendChild(navSt);
+  } catch (e) { /* 静默 */ }
+
+  /* ---------------- 播放页推荐筛选(与信息流 machine_filter 同源的页面端子集) ----------------
+   * 规则由壳注入 window.__MSX_MF__; 缺失/null 时回退原始列表。 */
+  var MF = window.__MSX_MF__ || null;
+  function normTitle(t) {
+    return String(t || "").toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+  }
+  function emoBad(t) {
+    t = String(t || "").toLowerCase();
+    var ex = (t.match(/[!！‼⁉]/g) || []).length;
+    var qm = (t.match(/[?？]/g) || []).length;
+    if (ex >= 3 || (ex >= 2 && t.length <= 16)) return 1;
+    if (qm >= 4 || (qm >= 3 && t.length <= 14) || (ex >= 1 && qm >= 2)) return 1;
+    if (/([\u4e00-\u9fff])\1{3}/.test(t) || /([\u4e00-\u9fff]{2})\1\1/.test(t)) return 1;
+    var i;
+    for (i = 0; i < MF.flame.length; i++) if (t.indexOf(MF.flame[i]) >= 0) return 1;
+    for (i = 0; i < MF.cb.length; i++) if (t.indexOf(MF.cb[i]) >= 0) return 1;
+    if (MF.cbre) { try { if (new RegExp(MF.cbre).test(t)) return 1; } catch (e) {} }
+    return 0;
+  }
+  function mfPass(b) {
+    var now = Date.now() / 1000;
+    var views = Number(b.stat && b.stat.view) || 0;
+    var dur = Number(b.duration) || 0;
+    if (MF.min_views && views < MF.min_views) return false;
+    if (MF.max_views && views > MF.max_views) return false;
+    if (MF.max_dur && dur > MF.max_dur) return false;
+    if (MF.min_dur && dur < MF.min_dur) return false;
+    if (MF.max_age && b.pubdate && now - Number(b.pubdate) > MF.max_age * 30.44 * 86400) return false;
+    var blob = String(b.title || "") + " " + String(b.desc || "") + " " + String(b.owner && b.owner.name || "");
+    var low = blob.toLowerCase();
+    var i;
+    for (i = 0; i < MF.dkws.length; i++) if (low.indexOf(MF.dkws[i].toLowerCase()) >= 0) return false;
+    var bl = String(b.owner && b.owner.name || "");
+    for (i = 0; i < MF.ablock.length; i++) if (bl === MF.ablock[i]) return false;
+    if (MF.emotion && emoBad(b.title)) return false;
+    return true;
+  }
+  function mfFilter(list) {
+    if (!MF || !MF.on || !Array.isArray(list)) return list || [];
+    var kept = list.filter(mfPass);
+    if (MF.dedup) {
+      kept.sort(function (a, b) { return (Number(b.stat && b.stat.view) || 0) - (Number(a.stat && a.stat.view) || 0); });
+      var keptN = [], seen = [];
+      kept.forEach(function (b) {
+        var nt = normTitle(b.title);
+        if (!nt) { keptN.push(b); return; }
+        for (var i = 0; i < seen.length; i++) {
+          if (nt === seen[i] || (nt.length > 6 && seen[i].length > 6 && (nt.indexOf(seen[i]) >= 0 || seen[i].indexOf(nt) >= 0))) return;
+        }
+        seen.push(nt);
+        keptN.push(b);
+      });
+      kept = keptN;
+    }
+    return kept;
+  }
+  /* 相关:探索 = 7:3 交错(每7条相关后插3条探索; 任一列表耗尽则接续剩余) */
+  function mixRel(rel, unrel) {
+    var out = [], i = 0, j = 0;
+    while (i < rel.length || j < unrel.length) {
+      for (var k = 0; k < 7 && i < rel.length; k++) out.push({ b: rel[i++], explore: false });
+      for (var k2 = 0; k2 < 3 && j < unrel.length; k2++) out.push({ b: unrel[j++], explore: true });
+    }
+    return out;
+  }
 
   /* ---------------- 工具 ---------------- */
   function qs(sel, root) { return (root || document).querySelector(sel); }
@@ -178,25 +253,53 @@
     } else {
       upEl.innerHTML = '<span class="sub">未取到UP主信息</span>';
     }
-    // 相关推荐
+    // 相关推荐(+可选筛选与7:3探索混排)
     var listEl = root.getElementById("msxRel");
+    var relTitle = qs(".rel", root);
+    function renderItem(b, explore) {
+      var d = document.createElement("div");
+      d.className = "it";
+      d.dataset.bvid = b.bvid || "";
+      d.innerHTML = '<div class="cv"><img loading="lazy" src="'
+        + esc(String(b.pic || "").replace(/^http:/, "https:")) + '@200w_112h.webp" referrerpolicy="no-referrer">'
+        + '<span class="du">' + fmtDur(b.duration) + '</span></div>'
+        + '<div class="tx"><div class="tt">' + esc(b.title) + (explore ? ' <span class="ex">探索</span>' : '') + '</div>'
+        + '<div class="mt sub">' + esc(b.owner && b.owner.name || "") + '</div>'
+        + '<div class="sub">' + fmtCount(b.stat && b.stat.view) + '播放 ' + fmtCount(b.stat && b.stat.danmaku) + '弹幕</div></div>';
+      d.addEventListener("click", function () {
+        location.href = "https://www.bilibili.com/video/" + d.dataset.bvid;
+      });
+      return d;
+    }
+    function renderList(mixed) {
+      listEl.innerHTML = "";
+      mixed.forEach(function (m) { listEl.appendChild(renderItem(m.b, m.explore)); });
+    }
     apiGet("https://api.bilibili.com/x/web-interface/archive/related?bvid=" + encodeURIComponent(S.bvid))
       .then(function (j) {
         if (!j || j.code !== 0 || !j.data || !j.data.length) throw (j && j.message) || "empty";
         listEl.className = "";
-        listEl.innerHTML = j.data.map(function (b) {
-          return '<div class="it" data-bvid="' + esc(b.bvid) + '">'
-            + '<div class="cv"><img loading="lazy" src="' + esc(String(b.pic || "").replace(/^http:/, "https:")) + '@200w_112h.webp" referrerpolicy="no-referrer">'
-            + '<span class="du">' + fmtDur(b.duration) + '</span></div>'
-            + '<div class="tx"><div class="tt">' + esc(b.title) + '</div>'
-            + '<div class="mt sub">' + esc(b.owner && b.owner.name || "") + '</div>'
-            + '<div class="sub">' + fmtCount(b.stat && b.stat.view) + '播放 ' + fmtCount(b.stat && b.stat.danmaku) + '弹幕</div></div></div>';
-        }).join("");
-        qsa(".it", listEl).forEach(function (el) {
-          el.addEventListener("click", function () {
-            location.href = "https://www.bilibili.com/video/" + el.dataset.bvid;
-          });
-        });
+        var filteredRel = mfFilter(j.data);
+        if (!MF || !MF.on) {   // 关闭筛选 → 原始顺序直出
+          renderList(j.data.map(function (b) { return { b: b, explore: false }; }));
+        } else {
+          relTitle.innerHTML = '相关推荐 <span class="sub" style="font-weight:400;font-size:12px">已按机器筛选 · 相关:探索=7:3</span>';
+          apiGet("https://api.bilibili.com/x/web-interface/popular?ps=50&pn=1")
+            .then(function (pj) {
+              var pool = (pj && pj.code === 0 && pj.data && pj.data.list || [])
+                .filter(function (b) {   // 探索池: 去掉当前视频与已在相关列表里的条目
+                  if (b.bvid === S.bvid) return false;
+                  var nt = normTitle(b.title);
+                  return !filteredRel.some(function (r) {
+                    return r.bvid === b.bvid || (nt && normTitle(r.title) === nt);
+                  });
+                });
+              renderList(mixRel(filteredRel, mfFilter(pool)));
+            })
+            .catch(function () {   // popular 失败 → 只显示过滤后的相关列表
+              renderList(filteredRel.map(function (b) { return { b: b, explore: false }; }));
+            });
+        }
       })
       .catch(function (e) {
         listEl.textContent = "相关推荐加载失败(" + e + ")";
