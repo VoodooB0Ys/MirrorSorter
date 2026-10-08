@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import webbrowser
+from urllib.parse import urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -36,6 +37,28 @@ MAIN_MIN = (1080, 700)
 BG_DARK = "#0f1115"   # 与 web/style.css 暗色 --bg 一致, 避免窗口加载瞬间白闪
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def _norm_nav_url(raw):
+    """地址栏输入 → 可导航 URL; 不合法返回 None。
+    无协议头自动补 https://; 只放行 http(s) 且主机名像主机(有点分/localhost)。"""
+    u = (raw or "").strip()
+    if not u:
+        return None
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", u):
+        u = "https://" + u
+    if not _URL_RE.match(u):
+        return None   # file:/javascript:/data: 等一律拒绝(安全约束同 open_in_app)
+    try:
+        p = urlparse(u)
+    except ValueError:
+        return None
+    host = p.hostname or ""
+    if not host or " " in host:
+        return None
+    if host != "localhost" and "." not in host:
+        return None
+    return u
 _WV2_CLIENT_ID = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"   # WebView2 Evergreen 运行时
 _WV2_BOOTSTRAP = ("WebView2Runtime", "MicrosoftEdgeWebview2Setup.exe")   # 微软官方引导包(随包分发)
 
@@ -219,6 +242,7 @@ class ShellApi:
         self._pages = None        # WebView2 控件池, bind_pages() 注入
         self._visible_id = self.HOME_ID
         self._strip_update = None  # 原生标签栏重绘回调, bind_strip() 注入
+        self._navbar_update = None  # 导航工具栏重绘回调, bind_navbar() 注入
         self._lock = threading.Lock()
         self._tabs = [{"id": self.HOME_ID, "url": None, "title": "信息流",
                        "pinned": True, "opened": True}]
@@ -322,6 +346,43 @@ class ShellApi:
             return   # 前进无历史: 无事可做
         self.tab_close(tid)
 
+    # ---- 导航工具栏(navbar 按钮/地址栏走这套; 语义与鼠标侧键不同 —— 首页无历史
+    #      时按钮禁用/无事发生, 绝不"关标签") ----
+    def _active_id(self):
+        with self._lock:
+            return self._active
+
+    def nav_back(self):
+        pages = self._pages
+        if pages is not None:
+            pages.navigate_history(self._active_id(), True)
+        return "ok"
+
+    def nav_forward(self):
+        pages = self._pages
+        if pages is not None:
+            pages.navigate_history(self._active_id(), False)
+        return "ok"
+
+    def nav_reload(self):
+        pages = self._pages
+        if pages is not None:
+            pages.reload(self._active_id())
+        return "ok"
+
+    def nav_goto(self, url):
+        """地址栏回车: 当前标签页内导航(不新开标签, 与浏览器一致)。"""
+        u = _norm_nav_url(url)
+        if u is None:
+            return "bad-url"
+        pages = self._pages
+        if pages is None:
+            return "no-pages"
+        tid = self._active_id()
+        pages.goto(tid, u)
+        pages.show(tid)   # 焦点交回页面(浏览器习惯: 导航后地址栏失焦)
+        return "ok"
+
     # ---- 内部 ----
     def _activate(self, tab):
         """显示 tab(无控件则异步创建), 隐藏当前控件 —— 纯可见性切换, 页面零重载。"""
@@ -337,6 +398,7 @@ class ShellApi:
         if prev_id != tab["id"]:
             pages.hide(prev_id)
         pages.show(tab["id"])
+        pages.push_nav(tab["id"])   # 切标签后补推导航状态(防地址栏显示旧 URL)
 
     def update_title(self, tab_key, title):
         """站点控件的 DocumentTitleChanged 回调 → 刷新标签标题。"""
@@ -359,6 +421,29 @@ class ShellApi:
         """注入原生标签栏重绘回调(shell_tabstrip.install_strip 的返回值)。"""
         self._strip_update = update_fn
         self._render()
+
+    def bind_navbar(self, update_fn):
+        """注入导航工具栏重绘回调(shell_navbar.install_navbar 的返回值)。"""
+        self._navbar_update = update_fn
+        self._push_nav(self._app_url or "", False, False)   # 初值(控件未就绪也能先显示)
+
+    def _on_nav(self, tab_key, url, can_back, can_fwd):
+        """控件池的导航状态回调(HistoryChanged/SourceChanged/push_nav)。
+        只反映激活标签 —— 后台标签的导航不刷地址栏。"""
+        with self._lock:
+            active = self._active
+        if tab_key != active:
+            return
+        self._push_nav(url, can_back, can_fwd)
+
+    def _push_nav(self, url, can_back, can_fwd):
+        fn = self._navbar_update
+        if fn is None:
+            return
+        try:
+            fn(str(url or ""), bool(can_back), bool(can_fwd))
+        except Exception:
+            pass
 
     def _render(self):
         """把标签表同步到原生标签栏(跨线程安全, 由 strip 侧 marshal 到 UI 线程)。"""
@@ -569,7 +654,7 @@ def shell_main(e2e_url=None):
                 return v
             pages = create_pool(
                 win, api.update_title, lambda _k, u: api.open_in_app(u),
-                theme_getter=_current_theme, port=port)
+                theme_getter=_current_theme, port=port, on_nav=api._on_nav)
             pages.init()          # 等窗体就绪 + WS_THICKFRAME 无边框缩放补丁
             api.bind_pages(pages)
         except Exception:
@@ -577,9 +662,21 @@ def shell_main(e2e_url=None):
             traceback.print_exc()
         try:
             from shell_tabstrip import install_strip
-            api.bind_strip(install_strip(
+            strip_update = install_strip(
                 win, api, accent_getter=lambda: app.sget("float_ball_accent"),
-                bg_getter=lambda: app.sget("ui_bg_scheme")))
+                bg_getter=lambda: app.sget("ui_bg_scheme"))
+            api.bind_strip(strip_update)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            strip_update = None
+        try:
+            from shell_navbar import install_navbar
+            # top=标签栏高度(install_strip 暴露): 工具栏紧贴标签栏下沿
+            nav_update = install_navbar(
+                win, api, top=getattr(strip_update, "bar_h", 32) if strip_update else 32,
+                bg_getter=lambda: app.sget("ui_bg_scheme"))
+            api.bind_navbar(nav_update)
         except Exception:
             import traceback
             traceback.print_exc()

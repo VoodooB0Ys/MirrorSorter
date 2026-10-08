@@ -16,6 +16,8 @@ import time
 
 import app   # DATA_DIR(日志/用户脚本目录); 由 app_window 一并加载, 无循环依赖
 
+NL = "\n"   # _dbg_log 落盘换行(历史上曾漏定义 → NameError 被吞, shell_debug.log 一直是空的)
+
 
 # 自愈式智能深色: 脚本在页面内常驻定时器, 每1.2s重测背景亮度 ——
 # 页面已深色(原生夜间/PreferredColorScheme生效) → 保持不动;
@@ -541,16 +543,20 @@ def _build_inject_script(port):
     return "\n;\n".join(parts)
 
 
-def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000):
+def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=None):
     """创建控件池。须在窗口壳启动后调用(任意线程, 内部自行 marshal)。
 
     on_title(tab_key, title) / on_newtab(tab_key, url): 站点控件的
     DocumentTitleChanged / NewWindowRequested(UI 线程)回调。
-    返回管理器: init/create/show/hide/dispose —— 均以 tab_key 为键
-    (key 0 = 信息流主控件); 控件对象由池内部持有。
+    on_nav(tab_key, url, can_back, can_fwd): 导航状态变化回调 —— 历史可用态/URL
+    变化(含首页标签)都经这里推给 ShellApi → 导航工具栏; 非激活标签的推送由
+    ShellApi 侧忽略。控件未就绪/标签已关时不上报。
+    返回管理器: init/create/show/hide/dispose/get_nav/push_nav/reload/goto/
+    navigate_history —— 均以 tab_key 为键(key 0 = 信息流主控件); 控件对象由池内部持有。
     """
     import System.Windows.Forms as WinForms  # noqa: F401  提前加载 CLR(pythonnet)
-    box = {"form": None, "theme": None, "stopping": False, "port": port}
+    box = {"form": None, "theme": None, "stopping": False, "port": port,
+           "on_nav": on_nav}
 
     def _ui(fn):
         """marshal 到 UI 线程(窗体未绑定时直接执行, 供测试注入)。"""
@@ -641,6 +647,41 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000):
                     pass
                 _t.sleep(3)
 
+        def _wire_nav(self, c, tab_key):
+            """给控件挂导航状态上报(HistoryChanged/SourceChanged → on_nav 回调)。
+            控件 core 未就绪时等 CoreWebView2InitializationCompleted 再挂 ——
+            主控件(0号)常在 gui_ready 时早已就绪, 走立即挂分支。"""
+            if not box.get("on_nav"):
+                return
+
+            def emit(_s=None, _a=None):
+                try:
+                    if tab_key in _Pool._dead:   # 标签已关: 迟到事件丢弃
+                        return
+                    core = c.CoreWebView2
+                    if core is None:
+                        return
+                    box["on_nav"](tab_key, str(c.Source or core.Source or ""),
+                                  bool(core.CanGoBack), bool(core.CanGoForward))
+                except Exception:
+                    pass
+
+            def on_core_ready(_s, _a):
+                try:
+                    core = c.CoreWebView2
+                    core.HistoryChanged += emit
+                    core.SourceChanged += emit
+                except Exception:
+                    _dbg_log("wire_nav(%s) subscribe FAILED: %r" % (tab_key, _s))
+
+            try:
+                if c.CoreWebView2 is not None:
+                    on_core_ready(None, None)
+                else:
+                    c.CoreWebView2InitializationCompleted += on_core_ready
+            except Exception as e:
+                _dbg_log("wire_nav(%s) FAILED: %r" % (tab_key, e))
+
         def init(self):
             """等原生窗体就绪, 记录主控件, 打无边框缩放补丁(WS_THICKFRAME)。"""
             end = time.time() + 30
@@ -681,6 +722,8 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000):
                     except Exception:
                         pass
                     _Pool.ctrls[0] = form.webview
+                    # 信息流主控件也上报导航状态(地址栏显示/后退前进按钮启停)
+                    self._wire_nav(form.webview, 0)
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -749,6 +792,7 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000):
                         core.NavigationCompleted += on_nav_done
                         self._apply_theme(c, self._is_dark())
                     c.CoreWebView2InitializationCompleted += on_ready
+                    self._wire_nav(c, tab_key)   # 导航状态上报(地址栏/按钮启停)
                     form.Controls.Add(c)
                     _Pool.ctrls[tab_key] = c
                     c.EnsureCoreWebView2Async(None)
@@ -827,5 +871,47 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000):
                     pass
             _ui(go)
             return done["v"]
+
+        def push_nav(self, key):
+            """读当前控件导航状态并主动推一次 on_nav(切标签后补推, 防地址栏显示旧 URL)。"""
+            if not box.get("on_nav"):
+                return
+
+            def go():
+                try:
+                    c = self._ctrl(key)
+                    core = c.CoreWebView2 if c is not None else None
+                    if core is None:
+                        return
+                    box["on_nav"](key, str(c.Source or ""),
+                                  bool(core.CanGoBack), bool(core.CanGoForward))
+                except Exception:
+                    pass
+            _ui(go)
+
+        def reload(self, key):
+            """当前标签页整页重载(⟳)。"""
+            def go():
+                try:
+                    c = self._ctrl(key)
+                    core = c.CoreWebView2 if c is not None else None
+                    if core is not None:
+                        core.Reload()
+                except Exception:
+                    pass
+            _ui(go)
+
+        def goto(self, key, url):
+            """当前标签页内导航到 url(地址栏回车)。调用方已做 http(s) 白名单校验。"""
+            def go():
+                try:
+                    from System import Uri
+                    c = self._ctrl(key)
+                    if c is not None:
+                        c.Source = Uri(url)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+            _ui(go)
 
     return _Pool()

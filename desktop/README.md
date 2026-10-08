@@ -58,6 +58,13 @@ that used to open your system browser — now opens as a **tab in the app window
   edge of the tab bar) resize it.
 - The tab bar is part of the window chrome (WinForms-drawn) — it never overlaps or
   blocks any website's own UI.
+- **Browser-style navigation toolbar (v0.3.1+)**: right below the tab bar, every
+  tab (the home feed and embedded browser pages alike) gets the toolbar all
+  browsers have — `←` back, `→` forward, `⟳` reload and an **editable address bar**
+  showing the active tab's URL in real time. Type a URL and press Enter to
+  navigate in the current tab (`https://` is added automatically; non-http(s)
+  input is rejected); buttons enable/disable with the page history. Mouse side
+  buttons keep their "back, at end close tab" behaviour.
 - Site logins (e.g. Bilibili) persist across restarts (WebView2 non-private mode).
 - No WebView2 runtime on the machine? The app falls back to the old
   external-browser mode automatically (with a one-time notice) — never a blank window.

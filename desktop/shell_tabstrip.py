@@ -385,8 +385,12 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
             wv.Dock = getattr(WinForms.DockStyle, "None")
             form.Controls.Add(strip)
             strip.BringToFront()
-            wv.Location = Point(0, bar_h)
-            wv.Size = Size(form.ClientSize.Width, form.ClientSize.Height - bar_h)
+            # 内容区 = 标签栏 + 导航工具栏(shell_navbar) 之下; 高度唯一来源在
+            # shell_navbar.nav_h(), 本模块只消费, 不得再写一份常量
+            from shell_navbar import nav_h as _nav_h
+            content_top = bar_h + _nav_h(scale)
+            wv.Location = Point(0, content_top)
+            wv.Size = Size(form.ClientSize.Width, form.ClientSize.Height - content_top)
             wv.Anchor = (WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Bottom |
                          WinForms.AnchorStyles.Left | WinForms.AnchorStyles.Right)
 
@@ -458,4 +462,5 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
             _repaint()
 
     update.fill_toggle = _toggle_max   # 窗口化全屏开关(测试可直调; app_window 只用调用签名)
+    update.bar_h = bar_h               # 标签栏逻辑高度(app_window 定位导航工具栏用)
     return update

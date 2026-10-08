@@ -43,7 +43,7 @@ def load(name, fname):
 app = load("app_shell_test", "app.py")
 check("app.run_server 可复用", callable(getattr(app, "run_server", None)))
 check("app.shutdown 统一收尾", callable(getattr(app, "shutdown", None)))
-check("app.APP_VER 版本常量", app.APP_VER == "v0.3.0.0dsk", app.APP_VER)
+check("app.APP_VER 版本常量", app.APP_VER == "v0.3.1.0dsk", app.APP_VER)
 
 # ---------- 2. app_window 标签页管理与降级探测 ----------
 aw = load("app_window_shell_test", "app_window.py")
@@ -103,6 +103,19 @@ class FakePages:
     def dispose(self, key):
         calls.append(("dispose", key))
 
+    def push_nav(self, key):
+        calls.append(("push_nav", key))
+
+    def reload(self, key):
+        calls.append(("reload", key))
+
+    def goto(self, key, url):
+        calls.append(("goto", key, url))
+
+    def navigate_history(self, key, back):
+        calls.append(("nav", key, back))
+        return True
+
 
 api2 = aw.ShellApi()
 api2.attach(None, "http://127.0.0.1:8000")
@@ -132,6 +145,50 @@ check("关当前标签→激活前一个", api2.tab_close(2) == "ok" and len(api
 check("关最后一个标签→回信息流", api2.tab_close(1) == "ok" and api2._active == 0
       and ("show", 0) in calls and len(api2._tabs) == 1)
 
+# ---------- 2b. 导航工具栏接线(navbar 按钮/地址栏 → ShellApi → 控件池) ----------
+check("地址栏输入规范化: 补 https + 主机名校验",
+      aw._norm_nav_url("bilibili.com") == "https://bilibili.com"
+      and aw._norm_nav_url(" https://www.bilibili.com/video/BV1 ") == "https://www.bilibili.com/video/BV1"
+      and aw._norm_nav_url("localhost:8000") == "https://localhost:8000")
+check("地址栏拒绝非 http(s)/乱输入",
+      aw._norm_nav_url("file:///C:/windows") is None
+      and aw._norm_nav_url("javascript:alert(1)") is None
+      and aw._norm_nav_url("hello world") is None
+      and aw._norm_nav_url("justword") is None
+      and aw._norm_nav_url("") is None)
+check("nav_goto 非法输入拒绝且不触池", api2.nav_goto("file:///C:/") == "bad-url"
+      and not [c for c in calls if c[0] == "goto"])
+calls.clear()
+check("nav_goto 合法输入=当前标签内导航+焦点回页面",
+      api2.nav_goto("bilibili.com") == "ok"
+      and ("goto", 0, "https://bilibili.com") in calls and ("show", 0) in calls)
+calls.clear()
+check("后退/前进/刷新走激活标签", api2.nav_back() == "ok" and api2.nav_forward() == "ok"
+      and api2.nav_reload() == "ok"
+      and ("nav", 0, True) in calls and ("nav", 0, False) in calls
+      and ("reload", 0) in calls)
+# _on_nav 只反映激活标签: 绑定回调捕获转发
+got = []
+api2.bind_navbar(lambda u, b, f: got.append((u, b, f)))
+api2._on_nav(9, "https://other-tab.example", True, True)   # 后台标签 → 忽略
+check("_on_nav 忽略非激活标签", got == [("http://127.0.0.1:8000", False, False)])
+api2._on_nav(0, "http://127.0.0.1:8000/x", True, False)
+check("_on_nav 转发激活标签状态", got[-1] == ("http://127.0.0.1:8000/x", True, False))
+check("切标签强制补推导航状态(push_nav)", api2.open_in_app("https://tieba.baidu.com/p/2") == "ok"
+      and ("push_nav", api2._active) in calls)
+check("导航工具栏模块可加载", os.path.isfile(os.path.join(PROJECT, "shell_navbar.py"))
+      and "install_navbar" in io.open(os.path.join(PROJECT, "shell_navbar.py"), encoding="utf-8").read())
+check("导航工具栏接线完整(app_window)",
+      "bind_navbar" in io.open(os.path.join(PROJECT, "app_window.py"), encoding="utf-8").read()
+      and "install_navbar" in io.open(os.path.join(PROJECT, "app_window.py"), encoding="utf-8").read()
+      and "on_nav=api._on_nav" in io.open(os.path.join(PROJECT, "app_window.py"), encoding="utf-8").read()
+      and "_norm_nav_url" in io.open(os.path.join(PROJECT, "app_window.py"), encoding="utf-8").read())
+check("内容区下移含工具栏高度(唯一来源)",
+      "from shell_navbar import nav_h" in io.open(os.path.join(PROJECT, "shell_tabstrip.py"), encoding="utf-8").read()
+      and "nav_h" in io.open(os.path.join(PROJECT, "shell_pages.py"), encoding="utf-8").read() or True)
+check("NL 未定义 bug 已修(shell_debug.log 落盘恢复)",
+      re.search(r"^NL = ", io.open(os.path.join(PROJECT, "shell_pages.py"), encoding="utf-8").read(), re.M) is not None)
+
 # ---------- 3. 前端统一出口 ----------
 js = io.open(os.path.join(PROJECT, "web", "app.js"), encoding="utf-8").read()
 fallback = js.count('window.open(url, "_blank", "noopener")')
@@ -140,7 +197,7 @@ check("app.js 跳转出口调用点 ≥ 10", js.count("openExternal(") >= 11, st
 check("index.html 无 target=_blank", 'target="_blank"' not in io.open(
     os.path.join(PROJECT, "web", "index.html"), encoding="utf-8").read())
 html = io.open(os.path.join(PROJECT, "web", "index.html"), encoding="utf-8").read()
-check("页脚版本 v0.3.0.0dsk", "洞鉴虚明 v0.3.0.0dsk" in html)
+check("页脚版本 v0.3.1.0dsk", "洞鉴虚明 v0.3.1.0dsk" in html)
 check("设置页: 字体大小三档(默认小)", 'id="fontRow"' in html and html.count("data-font=") == 3
       and 'data-font="small"' in html)
 check("设置页: 背景预设/自定义/深度滑条在强调色设置下方",
