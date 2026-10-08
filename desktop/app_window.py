@@ -425,16 +425,18 @@ class ShellApi:
     def bind_navbar(self, update_fn):
         """注入导航工具栏重绘回调(shell_navbar.install_navbar 的返回值)。"""
         self._navbar_update = update_fn
-        self._push_nav(self._app_url or "", False, False)   # 初值(控件未就绪也能先显示)
+        self._push_nav("", False, False)   # 初值: 首页是本地服务, 地址栏留空
 
     def _on_nav(self, tab_key, url, can_back, can_fwd):
         """控件池的导航状态回调(HistoryChanged/SourceChanged/push_nav)。
         只反映激活标签 —— 后台标签的导航不刷地址栏。"""
         with self._lock:
             active = self._active
+            pinned = next((x["pinned"] for x in self._tabs if x["id"] == active), True)
         if tab_key != active:
             return
-        self._push_nav(url, can_back, can_fwd)
+        # 信息流是本地服务(127.0.0.1), 网址没有意义 —— 地址栏留空(用户要求)
+        self._push_nav("" if pinned else url, can_back, can_fwd)
 
     def _push_nav(self, url, can_back, can_fwd):
         fn = self._navbar_update

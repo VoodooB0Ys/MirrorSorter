@@ -224,7 +224,8 @@ def install_navbar(win, api, top=0, bg_getter=None):
     def _install():
         try:
             form.Controls.Add(bar)
-            form.Controls.Add(tb)
+            # tb 必须是 bar 的子控件(坐标相对工具栏) —— 挂到 form 上会落到标签栏那行
+            bar.Controls.Add(tb)
             tb.BringToFront()
         except Exception:
             import traceback

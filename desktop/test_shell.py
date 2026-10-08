@@ -171,11 +171,14 @@ check("后退/前进/刷新走激活标签", api2.nav_back() == "ok" and api2.na
 got = []
 api2.bind_navbar(lambda u, b, f: got.append((u, b, f)))
 api2._on_nav(9, "https://other-tab.example", True, True)   # 后台标签 → 忽略
-check("_on_nav 忽略非激活标签", got == [("http://127.0.0.1:8000", False, False)])
+check("_on_nav 忽略非激活标签", got == [("", False, False)])
 api2._on_nav(0, "http://127.0.0.1:8000/x", True, False)
-check("_on_nav 转发激活标签状态", got[-1] == ("http://127.0.0.1:8000/x", True, False))
+check("_on_nav 转发激活标签状态", got[-1] == ("", True, False))
+check("信息流(本地服务)地址栏留空不显示网址", got[-1][0] == "")
 check("切标签强制补推导航状态(push_nav)", api2.open_in_app("https://tieba.baidu.com/p/2") == "ok"
       and ("push_nav", api2._active) in calls)
+api2._on_nav(api2._active, "https://tieba.baidu.com/p/2", True, False)
+check("内置浏览器标签显示完整网址", got[-1] == ("https://tieba.baidu.com/p/2", True, False))
 check("导航工具栏模块可加载", os.path.isfile(os.path.join(PROJECT, "shell_navbar.py"))
       and "install_navbar" in io.open(os.path.join(PROJECT, "shell_navbar.py"), encoding="utf-8").read())
 check("导航工具栏接线完整(app_window)",
