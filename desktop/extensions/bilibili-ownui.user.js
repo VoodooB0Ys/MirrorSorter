@@ -21,18 +21,19 @@
   function slimNav() {
     try {
       qsa(".bili-header .left-entry").forEach(function (ul) {
-        qsa(":scope > *", ul).forEach(function (el) {
+        // 两种头部变体统一取"条目容器": 旧 mini-header = left-entry 本体;
+        // 新 bili-header__menu = left-entry > .left-entry-main(整条藏它会把 LOGO 一起带走)
+        var host = qs(":scope > .left-entry-main", ul) || ul;
+        qsa(":scope > *", host).forEach(function (el) {
           // 搜索/用户区(及任何包含它们的包装)绝不动
           if (qs(".center-search-container, .right-entry", el)) return;
-          var t = String(el.textContent || "").replace(/\s+/g, "");
-          if (qs(".mini-header__logo", el)) {
-            // LOGO 融合条目(logo+「首页」文字+下拉箭头+频道弹出层同住一个 li):
-            // 剥掉文字/非 LOGO 图标/弹出层与文字锚, 只留 LOGO 本体。
-            qsa('[class*="popover"], [class*="channel"]', el).forEach(function (n) {
-              n.style.setProperty("display", "none", "important");
-            });
+          // LOGO 融合条目(新旧变体都存在): 只留 LOGO 本体, 文字/箭头/弹出层全藏
+          var logo = qs(".big-logo, .mini-header__logo", el);
+          if (logo) {
+            qsa('[class*="popover"], [class*="channel"], .trigger-text, .trigger-arrow, .mini-header__title', el)
+              .forEach(function (n) { n.style.setProperty("display", "none", "important"); });
             qsa("a", el).forEach(function (a) {
-              if (!qs(".mini-header__logo", a)) {   // 纯文字锚(如"首页") → 整个隐藏
+              if (!qs(".big-logo, .mini-header__logo", a)) {   // 纯文字锚(如"首页") → 整个隐藏
                 var at = String(a.textContent || "").replace(/\s+/g, "");
                 if (at && at.length <= 14 && NAV_LABELS.some(function (k) { return at.indexOf(k) >= 0; })) {
                   a.style.setProperty("display", "none", "important");
@@ -44,7 +45,7 @@
               });
               qsa(":scope > *", a).forEach(function (n) {   // 子元素: 非LOGO的svg(箭头)与文字标签(≤12字)都藏
                 var cn = n.className && n.className.baseVal !== undefined ? n.className.baseVal : n.className;
-                var isLogo = /mini-header__logo/.test(String(cn));
+                var isLogo = /(mini-header__logo|big-logo)/.test(String(cn));
                 var nt = String(n.textContent || "").replace(/\s+/g, "");
                 if (!isLogo && (/svg/i.test(n.tagName) || (nt && nt.length <= 12))) {
                   n.style.setProperty("display", "none", "important");
@@ -54,6 +55,7 @@
             return;
           }
           // 命中规则: 文本以导航标签开头, 或文本很短(≤14)且包含标签
+          var t = String(el.textContent || "").replace(/\s+/g, "");
           var hit = NAV_LABELS.some(function (k) { return t.indexOf(k) === 0; })
             || (t.length > 0 && t.length <= 14
                 && NAV_LABELS.some(function (k) { return t.indexOf(k) >= 0; }));
@@ -652,13 +654,26 @@
     });
   }
 
+  /* B站头部就绪闸门: 播放页加载中会把旧 mini-header 整体换成新 bili-header__menu,
+   * 实测(2026-10-08 截图+DOM双探针取证): 在切换完成前隐藏 #comment/右栏容器
+   * 会打断 B站 自己的头部渲染 —— 旧头部被拆、新头部不绘制, 顶栏整条消失。
+   * 因此: 必须等新头部出现(或超时兜底)再隐藏原生容器/挂载自有UI。 */
+  function whenHeaderSettled(cb) {
+    var t0 = Date.now();
+    (function poll() {
+      var fresh = qs(".bili-header__menu") || qs(".left-entry-main");
+      if (fresh || Date.now() - t0 > 8000) setTimeout(cb, 350);   // 切完稳一下再动手
+      else setTimeout(poll, 200);
+    })();
+  }
+
   function waitAndStart() {
     // 等评论/右栏容器出现(懒加载), 15s 找不到就放弃 → 原生页面兜底
     var t0 = Date.now();
     (function tryOnce() {
       var okC = qs("#comment") || qs(".comment-container") || qs(".comment");
       var okR = qs(".right-container") || qs("#right-container");
-      if (okC || okR) init();
+      if (okC || okR) { whenHeaderSettled(init); return; }
       else if (Date.now() - t0 < 15000) setTimeout(tryOnce, 500);
     })();
   }
