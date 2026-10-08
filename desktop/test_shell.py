@@ -43,7 +43,7 @@ def load(name, fname):
 app = load("app_shell_test", "app.py")
 check("app.run_server 可复用", callable(getattr(app, "run_server", None)))
 check("app.shutdown 统一收尾", callable(getattr(app, "shutdown", None)))
-check("app.APP_VER 版本常量", app.APP_VER == "v0.3.1.4dsk", app.APP_VER)
+check("app.APP_VER 版本常量", app.APP_VER == "v0.3.1.6dsk", app.APP_VER)
 
 # ---------- 2. app_window 标签页管理与降级探测 ----------
 aw = load("app_window_shell_test", "app_window.py")
@@ -227,6 +227,17 @@ check("顶栏只隐导航条目(slimNav逐条目+LOGO豁免+tick补隐), 无整�
       and "bili-header__channel" not in _ownui and ".left-entry{" not in _ownui)
 check("播放页筛选设置行(mPlayRel 回显+保存)",
       'id="mPlayRel"' in _idx and "m_play_related" in _appj)
+check("自有UI启动遮罩(挂载前原生评论区/右栏 visibility 隐藏防闪现, 摘除+路由复位齐备)",
+      "msx-ownui-boot" in _ownui and "bootMaskOn" in _ownui and "bootMaskOff" in _ownui
+      and "visibility:hidden!important" in _ownui)
+_srjs = io.open(os.path.join(PROJECT, "extensions", "bilibili-sr.user.js"), encoding="utf-8").read()
+check("SR画布防overlay提升+原视频保持可见(整屏截屏不再黑屏)",
+      "border-radius:0.5px" in _srjs
+      and 'classList.add("msx-sr-hide")' not in _srjs
+      and 'setProperty("opacity", "0", "important")' not in _srjs)
+check("夜间模式防白闪(B站页 document-start 压深色底, 浅色模式撤除)",
+      "setProperty('background', '#0f0f0f', 'important')" in _sp
+      and "removeProperty('background')" in _sp)
 
 # ---------- 3. 前端统一出口 ----------
 js = io.open(os.path.join(PROJECT, "web", "app.js"), encoding="utf-8").read()
@@ -236,7 +247,7 @@ check("app.js 跳转出口调用点 ≥ 10", js.count("openExternal(") >= 11, st
 check("index.html 无 target=_blank", 'target="_blank"' not in io.open(
     os.path.join(PROJECT, "web", "index.html"), encoding="utf-8").read())
 html = io.open(os.path.join(PROJECT, "web", "index.html"), encoding="utf-8").read()
-check("页脚版本 v0.3.1.4dsk", "洞鉴虚明 v0.3.1.4dsk" in html)
+check("页脚版本 v0.3.1.6dsk", "洞鉴虚明 v0.3.1.6dsk" in html)
 check("设置页: 字体大小三档(默认小)", 'id="fontRow"' in html and html.count("data-font=") == 3
       and 'data-font="small"' in html)
 check("设置页: 背景预设/自定义/深度滑条在强调色设置下方",

@@ -92,6 +92,10 @@ window.__msx_theme_mode = 'dark';
     if (window.__msx_theme_mode !== 'dark') { cleanup(); return; }
     var isBili = /(^|\.)bilibili\.com$/.test(location.hostname);
     if (isBili) {
+      /* 夜间模式防白闪: B站自己的深色CSS要等页面加载才生效, document-start 先把
+         html 底色压成深色, 否则加载初期整页白闪一下(用户实测反馈)。
+         浅色模式由 _LIGHT_JS 移除该内联底色。 */
+      document.documentElement.style.setProperty('background', '#0f0f0f', 'important');
       if (document.cookie.indexOf('theme_style=dark') === -1) {
         document.cookie = 'theme_style=dark; path=/; domain=.bilibili.com; max-age=31536000';
         report('bili-cookie-set');
@@ -128,6 +132,7 @@ window.__msx_theme_mode = 'light';
   var old = document.getElementById('__msx_dark');
   if (old) old.remove();
   document.documentElement.style.removeProperty('filter');
+  document.documentElement.style.removeProperty('background');   // 撤掉夜间防白闪的深色底
   if (/(^|\.)bilibili\.com$/.test(location.hostname) &&
       document.cookie.indexOf('theme_style=dark') !== -1) {
     document.cookie = 'theme_style=; path=/; domain=.bilibili.com; max-age=0';
@@ -482,6 +487,7 @@ def _build_inject_script(port):
                 + ('window.__MSX_SR_FORCE_DISP__ = %s;\n' % os.environ["MSX_SR_FORCE_DISP"]
                    if os.environ.get("MSX_SR_FORCE_DISP") else "")
                 + ('window.__MSX_SR_BYPASS_GATE__ = 1;\n' if os.environ.get("MSX_SR_BYPASS_GATE") else "")
+                + ('window.__MSX_SR_FORCE_SR__ = 1;\n' if os.environ.get("MSX_SR_FORCE_SR") else "")
                 + ('window.__MSX_SR_FORCE_UP2X__ = 1;\n' if os.environ.get("MSX_SR_FORCE_UP2X") else "")
                 + ('window.__MSX_SR_FORCE_K1__ = 1;\n' if os.environ.get("MSX_SR_FORCE_K1") else "")
                 + ('window.__MSX_SR_TRY_FSR__ = 1;\n' if os.environ.get("MSX_SR_TRY_FSR") else "")

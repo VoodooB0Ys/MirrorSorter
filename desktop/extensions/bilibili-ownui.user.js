@@ -14,6 +14,28 @@
   if (location.hostname !== "www.bilibili.com") return;
   if (!/^\/video\//.test(location.pathname)) return;
 
+  /* ---------------- 启动遮罩: 自有UI挂载前, 原生评论区/右栏不裸露 ----------------
+   * 用户反馈: 加载时会先闪出一下B站原生UI。根因: 面板要等"头部就绪闸门"过后才隐藏
+   * 原生容器(见 whenHeaderSettled 注释), 这段窗口期原生评论区/右栏可见。
+   * 遮罩用 visibility:hidden(保留布局)而非 display:none —— 不影响 B站头部新旧
+   * 切换时对容器的几何测量/IntersectionObserver, 不会再触发顶栏消失问题。
+   * 挂载完成(或15s兜底失败)即摘除; SPA 路由重建时重新戴上。 */
+  function bootMaskOn() {
+    try { document.documentElement.classList.add("msx-ownui-boot"); } catch (e) {}
+  }
+  function bootMaskOff() {
+    try { document.documentElement.classList.remove("msx-ownui-boot"); } catch (e) {}
+  }
+  bootMaskOn();
+  try {
+    var bm = document.createElement("style");
+    bm.id = "msx-ownui-boot-style";
+    bm.textContent = "html.msx-ownui-boot #comment,html.msx-ownui-boot .comment-container,"
+      + "html.msx-ownui-boot .comment,html.msx-ownui-boot .right-container,"
+      + "html.msx-ownui-boot #right-container{visibility:hidden!important}";
+    (document.head || document.documentElement).appendChild(bm);
+  } catch (e) { bootMaskOff(); }
+
   /* ---------------- 顶栏精简: 只去左侧频道导航(保留LOGO/搜索框/用户区) ----------------
    * 不整块隐藏 left-entry(部分登录态变体下会连带整条栏消失), 改为逐条目处理:
    * 只隐藏文本命中导航标签的子条目; 含 LOGO/搜索/用户区的元素一律跳过。 */
@@ -647,9 +669,11 @@
         }
         buildRelated();
         buildComments();
+        bootMaskOff();   // 自有UI已挂上, 摘启动遮罩
       }).catch(function () {
         buildRelated();
         buildComments();
+        bootMaskOff();
       });
     });
   }
@@ -668,6 +692,7 @@
   }
 
   function waitAndStart() {
+    bootMaskOn();   // (重)戴遮罩: 路由重建期间新页面的原生容器同样不裸露
     // 等评论/右栏容器出现(懒加载), 15s 找不到就放弃 → 原生页面兜底
     var t0 = Date.now();
     (function tryOnce() {
@@ -675,6 +700,7 @@
       var okR = qs(".right-container") || qs("#right-container");
       if (okC || okR) { whenHeaderSettled(init); return; }
       else if (Date.now() - t0 < 15000) setTimeout(tryOnce, 500);
+      else bootMaskOff();   // 放弃挂载 → 恢复原生页面可见
     })();
   }
 
@@ -694,6 +720,8 @@
       if (/^\/video\//.test(S.lastPath)) {
         // 复位后重新门控(切到非视频页不再挂载)
         if (window.__MSX_OWNUI__ === 1) waitAndStart();
+      } else {
+        bootMaskOff();   // 离开视频页: .comment 是通用类名, 遮罩不能带到别的页面
       }
     }, 800);
   });

@@ -80,6 +80,25 @@
         Array.prototype.slice.call(document.body.children, 0, 12), function (c) {
         return { tag: c.tagName, id: c.id || "", cls: cls(c).slice(0, 50), disp: getComputedStyle(c).display };
       });
+      // 超分状态: 画布矩形(截图对照用) + 是否在跑 + 原视频可见性
+      try {
+        var sc = document.querySelector("canvas.msx-sr-canvas");
+        var sv = document.querySelector("#bilibili-player video, .bpx-player-container video");
+        if (sc || sv) {
+          var scr = sc ? sc.getBoundingClientRect() : null;
+          var svcs = sv ? getComputedStyle(sv) : null;
+          out.sr = {
+            mode: window.__msxSrMode || "", fail: window.__msxSrFail || "",
+            frames: window.__msxSrFrames || 0,
+            canvas: sc ? { w: sc.width, h: sc.height,
+                           rect: [Math.round(scr.left), Math.round(scr.top), Math.round(scr.width), Math.round(scr.height)],
+                           disp: getComputedStyle(sc).display, radius: getComputedStyle(sc).borderRadius } : null,
+            videoOp: svcs ? svcs.opacity : "none",
+            videoVis: svcs ? svcs.visibility : "none",
+            paused: sv ? !!sv.paused : null
+          };
+        }
+      } catch (e5) {}
       return out;
     } catch (e) { return { err: String(e), url: location.href,
       ownui: (window.__MSX_OWNUI__ === undefined ? "undef" : String(window.__MSX_OWNUI__)),
