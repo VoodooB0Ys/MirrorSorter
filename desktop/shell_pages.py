@@ -370,6 +370,10 @@ def _build_inject_script(port):
         parts.append('window.__MSX_MF__ = %s;\n' % mf_js)
         parts.append('window.__MSX_OWNUI__ = %s;\ntry {\n' % ownui_on + ownui
                      + '\n} catch (e) { console.warn("[msx] ownui", e); }')
+    # 页面诊断探针(只读 computed style, sendBeacon 回传): MSX_PROBE=1 时启用
+    probe = _read_ext_file("_probe_header.js") if os.environ.get("MSX_PROBE") == "1" else ""
+    if probe:
+        parts.append('try {\n' + probe + '\n} catch (e) { }')
     # 内置「最高画质」脚本已下线: 用户明确说"让播放器用上账号本就有权的最高档没有意义"
     # (extensions/bilibili-quality.user.js 保留备查, 不再注入)
     # ACNet(Anime4KCPP f8b4) WebGL2 多趟超分: 上游 GLSL 原文当字符串注入, 运行器在

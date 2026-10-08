@@ -1,6 +1,6 @@
-# GOAL · v0.3.1.2dsk —— 播放页推荐筛选 + 顶栏精简
+# GOAL · v0.3.1.4dsk —— 播放页推荐筛选 + 顶栏精简
 
-> 目标版本 **v0.3.1.2dsk**。上一任务（播放页自有UI）见 `GOAL_v0.3.1.1.md`。
+> 目标版本 **v0.3.1.4dsk**。上一任务（播放页自有UI）见 `GOAL_v0.3.1.1.md`。
 
 ## 一句话目标
 在「机器筛选 → B站」里新增开关「是否将播放页推荐视频进行筛选」（默认开）：开启后，播放页右栏推荐列表按本应用的机器筛选规则过滤，并按 **相关:探索 = 7:3** 混排（探索=与当前内容无关的泛热门视频）；同时播放页顶栏**只去掉左侧频道导航**（首页/番剧/直播/游戏中心/会员购/漫画/赛事/下载客户端），搜索框与右侧用户区保留。
@@ -27,8 +27,8 @@
 - `extensions/bilibili-ownui.user.js`：①脚本激活即注入隐藏 `.left-entry` 的 `<style>`；②`mfFilter()` 移植规则；③`buildRelated()` 走 过滤+popular+7:3 交错；④探索条目「探索」标。
 - `web/index.html`：B站筛选组加 `mPlayRel` 复选框行 + tip。
 - `web/app.js`：`loadMachine` 回显 + `mSave` 提交 `m_play_related`。
-- `test_shell.py`：版本断言 → v0.3.1.2dsk；新增静态检查（设置键入 API 白名单、userscript 含 left-entry 隐藏/popular/7:3 逻辑、index.html 有 mPlayRel、app.js 接线）。
-- 版本号 → **v0.3.1.2dsk**（app.py `APP_VER` / web/index.html 页脚 / spec 复制改名）。
+- `test_shell.py`：版本断言 → v0.3.1.4dsk；新增静态检查（设置键入 API 白名单、userscript 含 left-entry 隐藏/popular/7:3 逻辑、index.html 有 mPlayRel、app.js 接线）。
+- 版本号 → **v0.3.1.4dsk**（app.py `APP_VER` / web/index.html 页脚 / spec 复制改名）。
 
 ## 验收标准
 - py_compile + node --check 全过；test_shell 全过；test_smoke 无新增 FAIL。

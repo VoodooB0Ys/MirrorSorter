@@ -22,12 +22,42 @@
     try {
       qsa(".bili-header .left-entry").forEach(function (ul) {
         qsa(":scope > *", ul).forEach(function (el) {
-          // LOGO / 搜索 / 用户区(及任何包含它们的包装)绝不动
-          if (qs(".mini-header__logo, .center-search-container, .right-entry", el)) return;
+          // 搜索/用户区(及任何包含它们的包装)绝不动
+          if (qs(".center-search-container, .right-entry", el)) return;
           var t = String(el.textContent || "").replace(/\s+/g, "");
-          if (t && t.length <= 14 && NAV_LABELS.some(function (k) { return t.indexOf(k) >= 0; })) {
-            el.style.setProperty("display", "none", "important");
+          if (qs(".mini-header__logo", el)) {
+            // LOGO 融合条目(logo+「首页」文字+下拉箭头+频道弹出层同住一个 li):
+            // 剥掉文字/非 LOGO 图标/弹出层与文字锚, 只留 LOGO 本体。
+            qsa('[class*="popover"], [class*="channel"]', el).forEach(function (n) {
+              n.style.setProperty("display", "none", "important");
+            });
+            qsa("a", el).forEach(function (a) {
+              if (!qs(".mini-header__logo", a)) {   // 纯文字锚(如"首页") → 整个隐藏
+                var at = String(a.textContent || "").replace(/\s+/g, "");
+                if (at && at.length <= 14 && NAV_LABELS.some(function (k) { return at.indexOf(k) >= 0; })) {
+                  a.style.setProperty("display", "none", "important");
+                }
+                return;
+              }
+              Array.prototype.slice.call(a.childNodes).forEach(function (n) {   // LOGO 锚: 清直接文本节点
+                if (n.nodeType === 3 && String(n.textContent).replace(/\s+/g, "")) n.textContent = "";
+              });
+              qsa(":scope > *", a).forEach(function (n) {   // 子元素: 非LOGO的svg(箭头)与文字标签(≤12字)都藏
+                var cn = n.className && n.className.baseVal !== undefined ? n.className.baseVal : n.className;
+                var isLogo = /mini-header__logo/.test(String(cn));
+                var nt = String(n.textContent || "").replace(/\s+/g, "");
+                if (!isLogo && (/svg/i.test(n.tagName) || (nt && nt.length <= 12))) {
+                  n.style.setProperty("display", "none", "important");
+                }
+              });
+            });
+            return;
           }
+          // 命中规则: 文本以导航标签开头, 或文本很短(≤14)且包含标签
+          var hit = NAV_LABELS.some(function (k) { return t.indexOf(k) === 0; })
+            || (t.length > 0 && t.length <= 14
+                && NAV_LABELS.some(function (k) { return t.indexOf(k) >= 0; }));
+          if (hit) el.style.setProperty("display", "none", "important");
         });
       });
     } catch (e) { /* 静默 */ }
