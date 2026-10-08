@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.3.1.0dsk)
+洞鉴虚明 · 基础版 (v0.3.2.0dsk)
 =========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -47,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORTS = (8000, 8010, 8020)
-APP_VER = "v0.3.1.0dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.3.2.0dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -9030,7 +9030,8 @@ class Handler(BaseHTTPRequestHandler):
             # 内置浏览器标签页里的超分/画质脚本(bilibili-sr.user.js 等)轮询此端点做热更新。
             # 只回 UI 开关键(绝不含 ai_key 等敏感项); CORS 仅对 B 站源回显, 其余网站一律不给。
             return self.send_json({k: sget(k) for k in ("ui_bq", "ui_bq_level", "ui_sr",
-                                                        "ui_fg", "ui_sr_level", "ui_sr_scale")})
+                                                        "ui_fg", "ui_sr_level", "ui_sr_scale",
+                                                        "ui_ownui")})
         if path == "/api/settings":
             return self.send_json({k: sget(k) for k in ("ai_base", "ai_key", "ai_model", "mode",
                                                         "prefs_note", "dislike_note",
@@ -9038,7 +9039,8 @@ class Handler(BaseHTTPRequestHandler):
                                                         "ai_interest_min", "ai_batch", "ai_cache_hours",
                                                         "ai_enabled", "disclaimer_version",
                                                         "ui_bq", "ui_bq_level", "ui_sr",
-                                                        "ui_fg", "ui_sr_level", "ui_sr_scale")}
+                                                        "ui_fg", "ui_sr_level", "ui_sr_scale",
+                                                        "ui_ownui")}
                                   | {"ai_ok": ai_ok(), "ai_on": ai_on()})
         if path == "/api/floatball":
             env = float_ball_env()
@@ -9294,7 +9296,7 @@ class Handler(BaseHTTPRequestHandler):
             for k in ("ai_base", "ai_key", "ai_model", "mode", "prefs_note", "dislike_note",
                       "price_in", "price_out", "ai_full_scan", "ai_interest_min",
                       "ai_batch", "ai_cache_hours", "ai_enabled", "ui_bq", "ui_bq_level",
-                      "ui_sr", "ui_fg", "ui_sr_level"):
+                      "ui_sr", "ui_fg", "ui_sr_level", "ui_sr_scale", "ui_ownui"):
                 if k in body and body[k] is not None:
                     if k in ("ai_base", "ai_model") and not str(body[k]).strip():
                         continue   # 地址/模型不允许空值覆盖(保留默认/原值)

@@ -1,195 +1,156 @@
-# GOAL · 洞鉴虚明桌面版 v0.3.1 —— 浏览器式导航工具栏（标签栏下方）
+# GOAL · 洞鉴虚明桌面版 v0.3.2 —— B站播放页自有 UI（评论/推荐全替换）
 
-> 分支：`desktop-embedded-browser`（延续） · 起始版本 v0.3.0.0dsk（git 备份点 26639b8 +
-> `desktop/backups/mirror-sorter-backup-20261008-1000.tar.gz`） · 目标版本 **v0.3.1.0dsk**
-> 本文是本次任务的全部目标与任务分解，做一项勾一项；全部勾完即达成目标。
-> 上一任务（v0.2.9 内置浏览器标签页）目标见 `GOAL_v0.2.9.md`。
+> 分支：`desktop-embedded-browser`（延续） · 起始版本 v0.3.1.0dsk（git 87aa37f）
+> 目标版本 **v0.3.2.0dsk**。上一任务（导航工具栏）见 `GOAL_v0.3.1.md`。
+> 用户已选定：**方案 A · 注入重排**（真页面 + Shadow DOM 自建 UI）+ **可写完整版**（可点赞/评论/回复）。
 
 ---
 
 ## 0. 一句话目标
 
-**在顶部标签栏的正下方，给所有标签页（信息流首页 + 内置浏览器播放页）加上所有浏览器
-都有的那条导航工具栏：← 后退、→ 前进、⟳ 刷新 + 可编辑地址栏 —— 实时显示当前标签页
-的网址，按钮可用态跟随页面历史，地址栏回车即可跳转。**
+**拦截 B站视频播放页：播放器与其上方的原生工具条（三连/分享/弹幕）原封不动，
+评论区与右侧"相关推荐"整块替换为我们自己的 UI（Shadow DOM 自绘，数据走 B站官方
+web API + 壳内登录态）—— 评论区的广告/引流/垃圾信息从此绝迹，且超分管线零改动。**
 
-## 1. 背景与需求（用户原话）
+## 1. 需求（用户原话）
 
-"现在要对首页以及播放页面，也就是选项卡下方增加一个所有浏览器都有的页面"
-（附参考截图：浏览器导航条 —— ← → ⟳ 三个按钮 + 一条 URL 地址栏
-`bilibili.com/video/BV1ES5izSEhR/?...`）。
+"将B站播放页全数拦截，完全改为我们自己的ui（整体上保持B站原生ui，视频播放也是使用
+B站直接获取到的api，但是评论、右侧视频推荐、全改为我们自己的ui，这样能避免所有的
+广告和垃圾信息。……视频播放记得不要破坏现在的超分辨率管线"
 
-现状（v0.3.0.0dsk）：窗口顶部是原生标签栏，标签栏下方直接就是网页内容：
+方案讨论结论（2026-10-08）：
+- **方案 A 注入重排（采纳）**：加载真 B站页 → 注入脚本移除原生评论/右栏，原位挂
+  Shadow DOM 自建面板。播放器不动 → 超分/弹幕/清晰度/大会员画质全保留。
+- 方案 B（iframe 分享播放器）否决：清晰度锁 1080p、超分管线必坏、CSP 可能禁嵌。
+- 方案 C（全自建播放器）否决：工程量巨大且违背"保持原生播放器"。
+- 交互深度：**可写完整版** —— 评论列表/子回复 + 点赞 + 发评论 + 回复（带 csrf）。
 
-- 回退/前进只能靠鼠标侧键（XBUTTON），没有可点的按钮，没侧键的用户无路可走；
-- 看不到"当前标签页在哪个网址"，标签内多次跳转后完全迷路；
-- 刷新只能靠网页内按钮或 F5，没有浏览器习惯位置的 ⟳。
+## 2. 现有管线（绝不能破坏的约束）
 
-## 2. 目标体验（用户视角，逐条可验收）
+| 管线 | 机制 | 与本任务的关系 |
+|---|---|---|
+| AI超分 | `AddScriptToExecuteOnDocumentCreated` 注入 `anime4k-webgpu.js` + `bilibili-sr.user.js`，胶水锚定 `#bilibili-player video` / `.bpx-player-container`，检查弹幕层 z-index | **不碰播放器任何 DOM**；只在播放器以外的区域动手 |
+| 画质增强 | 同通道注入 `bilibili-enhance.user.js`（SVG 滤镜） | 同上 |
+| 净化大师 | 默认禁用（MSX_CLEANER=1 才开） | 不启用；自有 UI 本身就是净化 |
+| 深色主题 | CookieManager 写 `theme_style=dark` cookie + PreferredColorScheme；其他站反色兜底 | 自有 UI 读同一 cookie 跟随 B站原生深色 |
+| 登录态 | WebView2 共享用户数据目录，B站 cookie（SESSDATA/bili_jct）在页面上下文可直接用 | 评论写接口带 `csrf=bili_jct` 即可，无需壳参与 |
 
-1. **位置与覆盖**：标签栏正下方一条横贯窗口宽度的工具栏（约 34 逻辑 px 高），属于窗口
-   原生 chrome —— **所有标签页都有**（信息流首页、任意内置浏览器页），网页内容区整体
-   下移（= 标签栏高 + 工具栏高），零遮挡。
-2. **按钮区**（左侧）：`←` 后退、`→` 前进、`⟳` 刷新三个图标按钮，约 32 逻辑 px 见方；
-   - 可用态/禁用态跟随**当前激活标签页**的 `CanGoBack` / `CanGoForward`（禁用=灰、不可点）；
-   - 悬停高亮（同标签栏 hover 色）；点击立即执行对应动作。
-3. **地址栏**（占剩余宽度）：深色圆角输入框，显示当前激活标签页的完整 URL；
-   - **实时性**：标签内跳转（含 B 站站内导航）后自动更新；切换标签立即切到该标签的 URL；
-   - **可编辑**：点击聚焦自动全选；回车导航 —— 无协议头自动补 `https://`；非 http(s)
-     输入（如 `file://`、乱敲文字）不导航并还原显示；Esc 还原；失焦未回车还原；
-   - 导航即"在当前标签页内跳转"（不新开标签，与浏览器一致）。
-4. **首页标签同规则**：信息流首页 `← →` 按首页自身的 WebView2 历史工作（首页没有
-   历史时禁用，**不**沿用鼠标侧键"关标签"的语义）；`⟳` = 重载信息流页面。
-   **首页地址栏不显示网址**（v1 反馈补充：本地服务的 `127.0.0.1` 网址没有意义，
-   首页标签地址栏留空；内置浏览器标签照常显示完整网址）。
-5. **刷新**：`⟳` = 当前标签页 `CoreWebView2.Reload()`（P2 可做加载中变 `✕` 停止）。
-6. **主题跟随**：工具栏底色、文字色、悬停色、分隔线与标签栏共用同一套
-   `ui_bg_scheme` 配色推送（深浅切换实时生效）；地址栏输入框底色/文字色同步，
-   不得出现白底闪块。
-7. **交互零回归**：
-   - 拖动窗口仍只能从标签栏空白区（工具栏/地址栏按下不触发窗口拖动）；
-   - 边缘缩放热区、窗口化全屏、`─ □ ✕` 窗口按钮不受影响；
-   - 鼠标侧键行为完全不变（侧键仍是"标签内回退，到头关标签"）;
-   - 工具栏不主动抢键盘焦点（切标签后焦点仍落 WebView2 控件）。
-8. **每标签独立**：地址栏内容与按钮可用态是"激活标签"的视图，任何时刻只反映激活标签。
+## 3. 设计（方案 A 落地）
 
-## 3. 技术设计（对照现有架构，落到文件）
+### 3.1 注入通道与开关
 
-现状架构（v0.3.0）：`shell_tabstrip.py` 在 `form` 顶部放 `Dock=Top` 自绘 Panel（标签栏，
-高 `bar_h`），并把主 WebView2 控件定位到 `y=bar_h`；`shell_pages.py` 控件池为每个标签页
-建独立 WebView2 控件（`create()` 按主控件 `Location` 摆放 → 自动跟随）；`app_window.py`
-的 `ShellApi` 管标签表，`navigate_history(key, back)` 已存在（侧键在用）。
+- 新文件 **`extensions/bilibili-ownui.user.js`**，由 `shell_pages._build_inject_script()`
+  按现有模式拼入（与 sponsorblock/enhance 同通道，document-start，MAIN 上下文）。
+- 开关：服务端设置键 **`ui_ownui`**（默认 `"1"` 开）。注入时以
+  `window.__MSX_OWNUI__ = 0/1` 传给页面脚本，脚本入口直接退出实现关断。
+  设置页新增「播放页自有UI」行（关/开，紧跟画质增强设置之后），走
+  `/api/settings` 白名单（app.py 三处：GET /api/settings、POST 白名单、
+  /api/ui_settings 轮询键组）。
+- 生效范围：仅 `www.bilibili.com/video/*`（BV 视频页）。其他页/番剧/直播一律不激活。
 
-```
-┌─ shell_tabstrip.py (标签栏, bar_h) ──────────────────────┐
-├─ shell_navbar.py (新 · 导航工具栏, nav_h) ───────────────┤
-│  [←] [→] [⟳]   [ 🔒 https://www.bilibili.com/...    ]   │
-├─ WebView2 内容区 (y = bar_h + nav_h, 各标签页控件) ──────┤
-└──────────────────────────────────────────────────────────┘
-```
+### 3.2 页面改造点（选择器宽匹配，全部有降级）
 
-### 3.1 新文件 `shell_navbar.py`
+| 区域 | 原生 DOM | 处置 | 自有 UI 挂载 |
+|---|---|---|---|
+| 右侧栏 | `.right-container`（内含相关推荐/更多推荐/广告卡） | 内层 `.right-container-inner, .video-info-container` 等子块 display:none（容器保留 → 宽度/位置自动继承） | 同容器内 append `msx-ownui-related` host → Shadow DOM：UP主卡片 + 相关视频列表 |
+| 评论区 | `#comment` / `.comment-container`（懒加载） | display:none + MutationObserver 防复活 | 同父级 append `msx-ownui-comments` host → Shadow DOM：完整评论区 |
+| 不动 | `.left-container` 里的播放器、视频信息标题栏、三连工具条、顶栏 | 原样 | — |
 
-- `install_navbar(win, api, top, height_scale, theme=None)`：在 `form` 上放一个
-  **手动定位**的 Panel（`Location=(0, top)`，`Anchor=Top|Left|Right`，不用 Dock ——
-  规避 WinForms 多个 Dock=Top 的 z 序陷阱），返回 `update(url, can_back, can_fwd,
-  loading=False)`（跨线程安全，内部 BeginInvoke）。
-- 布局：左端 3 个自绘按钮（Paint 事件画字形 `← → ⟳`，悬停高亮/禁用灰，命中测试
-  MouseClick），剩余宽度放**原生 TextBox**（输入法/光标/全选白送）：
-  `BorderStyle=None`、`BackColor`/`ForeColor` 随主题、`ShortcutKeys` 无、Enter/Esc
-  走 `KeyDown`。左端小锁字形 🔒 仅装饰（P0）。
-- 按钮点击/地址栏回车 → 调 `api` 桥方法（见 3.3），**不直接碰控件池**。
-- 提供 `set_scheme(raw_json)`：复用标签栏 `ui_bg_scheme` 的解析规则（bar/active/hover/
-  fgon/fgoff/sep），同步 Panel、按钮、TextBox 配色。
-- 事件订阅纪律（踩坑记录约束）：全部走事件订阅（Paint/MouseClick/MouseMove/KeyDown），
-  不重写虚方法；Pen/Brush 等在文件顶部 import；`pythonnet` 回调里不得假设控件仍存活。
+- 失败降级：任一选择器 15s 内找不到 → 静默放弃该区域（原生页面照旧），绝不让页面白屏。
+- 整个脚本 try/catch 包裹；`__MSX_OWNUI__=0` 或非视频页 → 入口即 return。
 
-### 3.2 `shell_pages.py`（控件池）
+### 3.3 数据 API（页面上下文 fetch，cookie 自动携带）
 
-- `create()` 的 `on_ready` 里给每个控件（含 0 号主控件补挂）订阅：
-  - `core.HistoryChanged` + `core.SourceChanged`（`NavigationStarting` 兜底）→ 组装
-    `(tab_key, str(c.Source), core.CanGoBack, core.CanGoForward)` 调 `on_nav` 回调；
-  - 回调里判 `tab_key in _dead` / 标签表已无 → 直接丢弃（迟到事件防脏推）。
-- 池新增公开方法（均 UI 线程安全，内部 `_ui` marshal）：
-  - `get_nav(key) -> (url, can_back, can_fwd)`：同步读当前控件状态（切标签时补推用；
-    控件未就绪返回 `(None, False, False)`）；
-  - `reload(key)`：`core.Reload()`；
-  - `goto(key, url)`：`c.Source = Uri(url)`（在当前标签内导航）；
-  - `navigate_history(key, back)`：已有，复用。
-- **顺手修存量 bug**：`_dbg_log` 引用了未定义的 `NL`（第 152 行）→ `NameError` 被
-  `except` 吞掉，`shell_debug.log` 从未写入过。模块顶部补 `NL = "\n"`。
-- 0 号主控件（信息流）在 `init_ui` 补挂同一套导航事件订阅（主控件不是 create 建的）。
+| 用途 | 接口 | 备注 |
+|---|---|---|
+| 视频元信息 | `window.__INITIAL_STATE__`（aid/bvid/videoData.owner/desc） | 缺失时兜底 `/x/web-interface/view?bvid=` |
+| 相关推荐 | GET `/x/web-interface/archive/related?bvid=` | 列表：标题/封面@200w_112h/时长/播放/UP主 |
+| UP主粉丝 | GET `/x/relation/stat?vmid=<mid>` | UP卡展示 |
+| 评论列表 | GET `/x/v2/reply?type=1&oid=<aid>&pn=&ps=20&sort=` | sort: 2=时间 3=热度；页码分页 |
+| 子回复 | GET `/x/v2/reply/reply?type=1&oid=&root=<rpid>&pn=` | 懒展开，>3条折叠 |
+| 发表评论 | POST `/x/v2/reply/add`（oid/type=1/message/csrf=bili_jct/plat=1） | 登录态校验：cookie SESSDATA |
+| 回复 | POST `/x/v2/reply/add`（+root/parent=rpid） | 同上 |
+| 评论点赞 | POST `/x/v2/reply/action`（oid/rpid/type=1/action=1|0/csrf） | 乐观更新+失败回滚 |
 
-### 3.3 `app_window.py`（ShellApi 接线）
+- 风控约束：写操作节流（连点防抖）、失败把 `code/message` 原样显示在面板内；
+  接口若升级要求 wbi 签名（返回 -403 等）→ 面板顶部给出"接口受限，已降级只读"提示，
+  绝不反复重试轰炸。
 
-- 新桥方法（JS 桥不可达也行 —— 主要给 navbar 回调用，但保持可测的纯逻辑）：
-  - `nav_back()` / `nav_forward()`：当前**激活**标签 `navigate_history`；首页标签同样
-    按历史走（无历史无事发生 —— 与侧键语义不同，侧键路径不动）；
-  - `nav_reload()`：激活标签 `reload`；
-  - `nav_goto(url)`：激活标签 `goto`；只接受补协议后匹配 `^https?://` 的 URL
-    （安全约束与 `open_in_app` 相同），拒绝时返回 `"bad-url"`。
-- 导航状态 → 工具栏：`ShellApi._on_nav(tab_key, url, can_back, can_fwd)`：
-  - `tab_key != self._active` → 忽略（后台标签的导航不刷地址栏）；
-  - 否则 `navbar_update(url, can_back, can_fwd)`。
-- 切换标签（`_activate` / `tab_switch` / `tab_close` 后的激活路径）末尾调
-  `pages.get_nav(active)` 强制推一次 —— 解决"切标签地址栏显示旧 URL"。
-- `bind_navbar(update_fn)` 注入重绘回调（与 `bind_strip` 同构）。
-- `shell_main` 的 `gui_ready`：先 `install_strip`（返回内容区高度），再
-  `install_navbar(top=strip高, ...)`，控件池 `init()` 在两者之后（内容区 y 偏移已定）。
-  顺序约束：**内容区下移量 = 标签栏高 + 工具栏高，必须唯一来源** —— 从
-  `install_strip` / `install_navbar` 的返回值取，不得在两处各写一份常量。
+### 3.4 自有 UI 设计（Shadow DOM，样式隔离）
 
-### 3.4 `shell_tabstrip.py`（内容区下移）
+- 主题：读 `document.cookie` 的 `theme_style=dark` → 深色调色板（跟随壳内 B站原生
+  深色）；否则浅色。若检测到页面被壳的反色兜底接管（html filter: invert），
+  不做额外处理（反色会连带作用于本面板，视觉一致）。
+- 结构（两面板均 Shadow DOM）：
+  - **UP主卡 + 相关推荐**（右栏）：头像/名字/粉丝数、投稿数徽标；视频条目 =
+    封面+时长角标+标题两行+UP主+播放/弹幕数；点击 → `location.href=/video/<bvid>`
+    （整页导航，document-start 脚本自动重跑，与现有点卡片路径一致）。
+  - **评论区**（左栏底部）：顶栏（评论数 + 排序切换 热度/时间）+ 发表框（登录时：
+    头像+textarea+发表按钮；未登录：提示"登录后可评论"）+ 评论列表（头像/名字/
+    内容/时间/点赞/回复按钮，UP主徽标，置顶评论，折叠子回复"共N条 回复"展开）。
+- 文案安全：所有插入内容经 escapeHTML；表情 emote 走 API 返回的 emote 表替换为图。
+- 交互反馈：发表/点赞按钮防抖 + 失败 toast（面板内条，不用 alert）。
+- SPA 路由：B站视频页是 SPA —— 轮询 `location.pathname`（800ms）检测 BV 变化，
+  teardown（移除自有 host、恢复原生显隐）后重建；原生相关推荐点击产生的路由变化同样覆盖。
+- 尺寸自适应：面板 100% 宽、随窗口缩放；右栏宽度继承原生容器。
 
-- `_install` 里主控件 `Location.Y` 从 `bar_h` 改为 `bar_h + nav_h`；`nav_h` 由
-  `install_strip` 的调用方（app_window）传入或由 `shell_navbar.NAV_H(scale)` 计算，
-  保证只算一次。
-- 标签栏自身绘制/命中/拖动逻辑零改动。
+### 3.5 明确不碰
 
-### 3.5 测试
-
-- `test_shell.py` 新增（逻辑层，不起 GUI）：
-  - `nav_goto` URL 白名单：`https://x` ✓、`x.com`（补协议后）✓、`file:///C:/` ✗、
-    `javascript:...` ✗、空串 ✗；
-  - `_on_nav`：非激活标签事件被忽略、激活标签事件转发给 update 回调；
-  - 切换标签强制推一次 nav 状态（fake pool 记录调用）。
-- 回归：`test_smoke.py`、既有 `test_shell.py` 全绿；`python app.py` 行为不变。
+- 播放器/弹幕/清晰度/三连工具条 DOM —— 超分管线红线；
+- `android/`（安卓端不动）；
+- 顶栏/首页/搜索页（非视频页一律不激活）；
+- 直播/番剧/课程页。
 
 ## 4. 任务分解
 
 ### P0 · 本次必须
-- [x] 备份：git 备份点 26639b8 + `desktop/backups/*.tar.gz` 快照
+- [x] 方案讨论与用户确认（本文 §1）
 - [x] GOAL 文档（本文）
-- [x] `shell_pages.py`：修 `NL` 未定义；HistoryChanged/SourceChanged 订阅；
-      `get_nav` / `push_nav` / `reload` / `goto`；0 号主控件补挂事件
-- [x] `shell_navbar.py`：工具栏 UI（按钮三连 + 地址栏 + 主题配色 + 悬停/禁用态）
-- [x] `shell_tabstrip.py`：内容区下移（唯一高度来源）
-- [x] `app_window.py`：`nav_back/forward/reload/goto` 桥 + `_on_nav` 接线 +
-      切标签强制推状态 + `bind_navbar`
-- [x] `test_shell.py`：新增导航逻辑用例 + 全量回归（60 checks ALL_PASS）
-- [x] 版本号 → v0.3.1.0dsk（app.py `APP_VER` / web/index.html 页脚 / spec 文件）
+- [x] `extensions/bilibili-ownui.user.js`：入口门控 + 主题检测 + API 层 +
+      右栏（UP卡+相关推荐）+ 评论区（列表/子回复/发评/回复/点赞）+ SPA 路由 watcher
+- [x] `shell_pages.py`：`_build_inject_script` 接线（`ui_ownui` 门控 → `__MSX_OWNUI__`）
+- [x] `app.py`：`ui_ownui` 进三个设置白名单（GET settings / POST 白名单 / ui_settings 轮询）
+- [x] `web/index.html` + `web/app.js`：设置页「播放页自有UI」关/开行 + 回显 + 保存
+- [x] `test_shell.py`：静态接线用例（文件存在/API 关键字/白名单/设置行）+ 全量回归
+- [x] 版本号 → v0.3.2.0dsk（app.py / index.html 页脚 / spec）
 
 ### P1 · 交付形态
-- [x] E2E 验证（`_e2e_shell.py`）：主窗口出现/唯一窗口/结构断言 ALL_PASS；
-      控件几何 dump 确认 标签栏(48px)→工具栏(Y=48,h=51)→内容区(Y=99) 150%DPI 正确。
-      截图因用户正使用电脑被脚本自动跳过（设计如此，不抢焦点）
-- [ ] 实测回归：无边框拖动/缩放/窗口化全屏/鼠标侧键/主题切换/标签页零重载（用户实际使用确认）
-- [x] `desktop/README.md` 增补导航工具栏一节
-- [x] git 提交（功能完成点）
+- [ ] 实测：壳内打开 B站视频页 —— 播放器正常、超分正常（切标签回来续播不受影响）、
+      评论区/右栏为自有 UI、深浅主题跟随
+- [ ] 实测写操作：发表评论/回复/点赞在已登录账号下成功
+- [ ] 降级实测：`ui_ownui=0` 时页面恢复原生
+- [ ] `desktop/README.md` 增补一节；git 提交
 
-### P2 · 打磨（时间允许，可顺延）
-- [ ] 加载中 `⟳ → ✕`（停止按钮，`NavigationCompleted` 驱动）
-- [ ] 地址栏下拉历史建议
-- [ ] 站点图标（favicon）显示在地址栏左端
+### P2 · 打磨（可顺延）
+- [ ] 评论图片/表情完整渲染、评论区分享链接识别
+- [ ] 相关推荐"换一换"/无限滚动
+- [ ] UP主卡片"关注/已关注"状态（relation API）
+- [ ] 自有 UI 的设置项下放（每标签开关按钮）
 
 ## 5. 风险与降级
 
 | 风险 | 缓解 |
 |---|---|
-| pythonnet 订阅 `HistoryChanged` 事件签名异常 | 退路：池内 0.5s 轮询激活控件的 Source/CanGoBack（逻辑等价，代价可忽略） |
-| 内容区 y 偏移只改了一处（create 按主控件 Location 摆放子控件会自动跟随，但主控件 y 必须一次改对） | 高度唯一来源（3.3 顺序约束），改后 dump_controls 验证 |
-| 多个 Dock=Top 控件 z 序不可控 | 工具栏不用 Dock，手动定位 + Anchor 四向（Top|Left|Right） |
-| TextBox 白底刺眼/深色下闪白 | BackColor/ForeColor 随主题即时设置；Parent.BackColor 同步 |
-| 工具栏抢键盘焦点（切标签后焦点落在地址栏） | navbar 不调 Focus()；切标签路径维持现有 `c.Focus()` |
-| 切标签后地址栏显示旧标签 URL | 激活路径强制 `get_nav` 补推一次 |
-| 迟到的导航事件（标签已关）推脏状态 | `_dead` 集合 + 标签表双重校验后丢弃 |
-| 地址栏输入非 http(s)（file:/javascript:） | 补协议后正则白名单，拒绝即还原显示值（安全约束同 open_in_app） |
-| 替换静默失败（踩坑三次的教训） | 每轮改动后 grep 验证 + `py_compile` + 运行验证 |
+| B站改版选择器失效 | 宽匹配多候选选择器 + 15s 找不到即静默放弃（原生页面兜底）+ 失败落 shell_debug.log |
+| Vue 复活被隐藏的节点（评论懒加载组件重挂） | MutationObserver 维持 display:none（幂等，不删节点不跟 Vue 打架） |
+| 评论/写接口升级要求 wbi 签名 | 检测 -403/负码 → 面板一次性提示"接口受限已降级"，不重试轰炸；后续再接 wbi |
+| 写操作触发风控 | 防抖节流、错误原样透出、无自动重试 |
+| 与超分/画质增强脚本冲突 | 本脚本只在播放器以外的容器操作；全部 try/catch；注入顺序互不依赖 |
+| 反色兜底站点配色错乱 | B站走原生深色 cookie（本就如此），面板读 cookie 配色；反色模式下接受连带反色 |
+| SPA 路由切换面板残留/重复挂载 | 路由 watcher 统一 teardown→rebuild；host 带 id 幂等去重 |
+| 替换静默失败（踩坑教训） | 每轮改动 grep 验证 + py_compile + test_shell 全绿 |
 
-## 6. 验收标准（全部满足才算完成）
+## 6. 验收标准
 
-1. 首页与任意内置浏览器标签页的标签栏下方都有导航工具栏，网页内容零遮挡。
-2. 地址栏实时反映激活标签 URL：标签内跳转、切标签、站内弹页（转同标签导航）均正确。
-3. `← →` 按钮按 CanGoBack/CanGoForward 启停，点击执行；`⟳` 重载当前页。
-4. 地址栏输入 `bilibili.com` 回车 → 当前标签导航到 `https://bilibili.com`；
-   输入 `file:///C:/` 回车 → 不导航、显示值还原。
-5. 主题/强调色实时跟随设置；悬停高亮；禁用灰不可点。
-6. 拖动窗口只能从标签栏；边缘缩放/窗口化全屏/侧键/标签页零重载全部不回归。
-7. `test_smoke.py` + `test_shell.py` 全绿；`python app.py` 与降级路径行为不变。
-8. `构建exe.bat` 构建成功，exe 实测验收 1-6。
+1. 壳内打开任意 BV 视频页：播放器/弹幕/三连工具条为原生，评论区与右侧栏为自有 UI，
+   原生评论区/右栏内容（含其中广告）不可见。
+2. 相关推荐列表可点击跳转（新 BV 生效、自有 UI 重建）。
+3. 已登录：发评论/回复/点赞成功且面板即时反映；未登录：只读+登录提示。
+4. 深浅主题跟随 B站原生深色；样式与页面不互相污染（Shadow DOM）。
+5. 超分管线回归：`ui_sr` 开启时画面重建正常、弹幕层在画布之上、切标签续播不受影响。
+6. `ui_ownui=0`（设置页关闭）→ 新标签页恢复原生页面。
+7. `test_smoke.py` + `test_shell.py` 全绿；`python app.py` 行为不变。
 
 ## 7. 明确不做（范围外）
 
-- 安卓端（`android/` 不动）；
-- 书签/下载管理/多标签地址栏历史下拉；
-- 地址栏搜索fallback（输入非 URL 文字当搜索词）——P2 后再议。
+- 安卓端、直播/番剧/首页改造、原生三连工具条替换、播放器换皮。

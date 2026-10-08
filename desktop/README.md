@@ -58,6 +58,14 @@ that used to open your system browser — now opens as a **tab in the app window
   edge of the tab bar) resize it.
 - The tab bar is part of the window chrome (WinForms-drawn) — it never overlaps or
   blocks any website's own UI.
+- **Own-UI video pages (v0.3.2+)**: on Bilibili video pages the comment section and
+  the right-hand recommendation column are **fully replaced by the app's own UI**
+  (Shadow DOM panels fed by Bilibili's official web APIs + your login session) —
+  no ads, no sponsored junk, no engagement bait in those areas. The player,
+  danmaku and the like/coin/fav toolbar stay native, so the AI super-resolution
+  pipeline is untouched. You can browse related videos, sort comments, like,
+  post and reply right in the new panels; toggle it in 设置 → 播放页自有UI
+  (off = stock Bilibili page).
 - **Browser-style navigation toolbar (v0.3.1+)**: right below the tab bar, every
   tab (the home feed and embedded browser pages alike) gets the toolbar all
   browsers have — `←` back, `→` forward, `⟳` reload and an **editable address bar**

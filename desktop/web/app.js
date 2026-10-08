@@ -454,6 +454,12 @@ document.addEventListener("click", (e) => {
       ? "画质增强已关闭"
       : "增强强度已设为「" + bl.dataset.level + "」，新打开的B站标签页生效");
   }
+  const ou = e.target.closest("#ownuiRow .seg");
+  if (ou) {
+    document.querySelectorAll("#ownuiRow .seg").forEach((x) => x.classList.toggle("on", x === ou));
+    api("/api/settings", { method: "POST", body: { ui_ownui: ou.dataset.ownui } }).catch(() => {});
+    toast("播放页自有UI已" + (ou.dataset.ownui === "1" ? "开启" : "关闭") + "，新打开的B站标签页生效");
+  }
   if (e.target.closest("#bgResetBtn")) {
     localStorage.removeItem("bgHex");
     localStorage.removeItem("bgDepth");
@@ -1671,6 +1677,10 @@ async function loadSettings() {
   const bqLvl = (s.ui_bq !== "0") ? (s.ui_bq_level || "中") : "关闭";
   document.querySelectorAll("#bqLevelRow .seg").forEach((b) =>
     b.classList.toggle("on", b.dataset.level === bqLvl));
+  /* 播放页自有UI(B站视频页评论区/右栏替换): 开=ui_ownui 1(默认), 关=0 */
+  const ouOn = s.ui_ownui !== "0";
+  document.querySelectorAll("#ownuiRow .seg").forEach((b) =>
+    b.classList.toggle("on", (b.dataset.ownui === "1") === ouOn));
   const srOn = s.ui_sr === "1";
   const srLvl = srOn ? (s.ui_sr_level || "高") : "关";
   document.querySelectorAll("#srLevelRow .seg").forEach((b) =>

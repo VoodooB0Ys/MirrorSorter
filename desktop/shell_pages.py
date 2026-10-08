@@ -337,6 +337,14 @@ def _build_inject_script(port):
             bq_level = "中"   # 白名单化: 该值会被拼进页面脚本
         parts.append('window.__MSX_BQ__ = %s; window.__MSX_BQ_LEVEL__ = "%s";\ntry {\n'
                      % (bq_on, bq_level) + bq + '\n} catch (e) { console.warn("[msx] quality", e); }')
+    # 播放页自有UI(评论区/右侧推荐替换为自建面板): 开关 ui_ownui(默认开), 环境变量
+    # MSX_NO_OWNUI=1 可整体停用。脚本自身按 hostname+路径门控, 只在 /video/ 激活;
+    # 播放器 DOM 一律不碰 —— 超分管线红线。
+    ownui = "" if os.environ.get("MSX_NO_OWNUI") else _read_ext_file("bilibili-ownui.user.js")
+    if ownui:
+        ownui_on = "0" if app.sget("ui_ownui") == "0" else "1"
+        parts.append('window.__MSX_OWNUI__ = %s;\ntry {\n' % ownui_on + ownui
+                     + '\n} catch (e) { console.warn("[msx] ownui", e); }')
     # 内置「最高画质」脚本已下线: 用户明确说"让播放器用上账号本就有权的最高档没有意义"
     # (extensions/bilibili-quality.user.js 保留备查, 不再注入)
     # ACNet(Anime4KCPP f8b4) WebGL2 多趟超分: 上游 GLSL 原文当字符串注入, 运行器在

@@ -43,7 +43,7 @@ def load(name, fname):
 app = load("app_shell_test", "app.py")
 check("app.run_server 可复用", callable(getattr(app, "run_server", None)))
 check("app.shutdown 统一收尾", callable(getattr(app, "shutdown", None)))
-check("app.APP_VER 版本常量", app.APP_VER == "v0.3.1.0dsk", app.APP_VER)
+check("app.APP_VER 版本常量", app.APP_VER == "v0.3.2.0dsk", app.APP_VER)
 
 # ---------- 2. app_window 标签页管理与降级探测 ----------
 aw = load("app_window_shell_test", "app_window.py")
@@ -192,6 +192,25 @@ check("内容区下移含工具栏高度(唯一来源)",
 check("NL 未定义 bug 已修(shell_debug.log 落盘恢复)",
       re.search(r"^NL = ", io.open(os.path.join(PROJECT, "shell_pages.py"), encoding="utf-8").read(), re.M) is not None)
 
+# ---------- 3c. 播放页自有UI(bilibili-ownui): 注入接线 + 设置白名单 + 设置行 ----------
+_ownui = io.open(os.path.join(PROJECT, "extensions", "bilibili-ownui.user.js"), encoding="utf-8").read()
+check("播放页自有UI脚本: 存在且关键API齐备",
+      len(_ownui) > 8000 and "x/v2/reply/add" in _ownui and "x/v2/reply/action" in _ownui
+      and "x/v2/reply/reply" in _ownui and "archive/related" in _ownui
+      and "attachShadow" in _ownui and "__MSX_OWNUI__" in _ownui
+      and "/video/" in _ownui and "bili_jct" in _ownui and "SESSDATA" not in _ownui)
+_sp = io.open(os.path.join(PROJECT, "shell_pages.py"), encoding="utf-8").read()
+check("自有UI注入接线(ui_ownui门控→__MSX_OWNUI__)",
+      "bilibili-ownui.user.js" in _sp and "__MSX_OWNUI__" in _sp and "ui_ownui" in _sp)
+check("自有UI不碰播放器DOM(脚本无播放器选择器)",
+      "bilibili-player" not in _ownui and "bpx-player" not in _ownui)
+check("自有UI设置白名单(app.py三处)",
+      io.open(os.path.join(PROJECT, "app.py"), encoding="utf-8").read().count('"ui_ownui"') >= 3)
+_idx = io.open(os.path.join(PROJECT, "web", "index.html"), encoding="utf-8").read()
+_appj = io.open(os.path.join(PROJECT, "web", "app.js"), encoding="utf-8").read()
+check("自有UI设置行(开/关+回显+保存)",
+      'id="ownuiRow"' in _idx and "ownuiRow" in _appj and "ui_ownui" in _appj)
+
 # ---------- 3. 前端统一出口 ----------
 js = io.open(os.path.join(PROJECT, "web", "app.js"), encoding="utf-8").read()
 fallback = js.count('window.open(url, "_blank", "noopener")')
@@ -200,7 +219,7 @@ check("app.js 跳转出口调用点 ≥ 10", js.count("openExternal(") >= 11, st
 check("index.html 无 target=_blank", 'target="_blank"' not in io.open(
     os.path.join(PROJECT, "web", "index.html"), encoding="utf-8").read())
 html = io.open(os.path.join(PROJECT, "web", "index.html"), encoding="utf-8").read()
-check("页脚版本 v0.3.1.0dsk", "洞鉴虚明 v0.3.1.0dsk" in html)
+check("页脚版本 v0.3.2.0dsk", "洞鉴虚明 v0.3.2.0dsk" in html)
 check("设置页: 字体大小三档(默认小)", 'id="fontRow"' in html and html.count("data-font=") == 3
       and 'data-font="small"' in html)
 check("设置页: 背景预设/自定义/深度滑条在强调色设置下方",
