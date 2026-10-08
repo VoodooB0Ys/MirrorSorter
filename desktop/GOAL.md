@@ -1,7 +1,7 @@
 # GOAL · 洞鉴虚明桌面版 v0.3.2 —— B站播放页自有 UI（评论/推荐全替换）
 
 > 分支：`desktop-embedded-browser`（延续） · 起始版本 v0.3.1.0dsk（git 87aa37f）
-> 目标版本 **v0.3.2.0dsk**。上一任务（导航工具栏）见 `GOAL_v0.3.1.md`。
+> 目标版本 **v0.3.1.1dsk**。上一任务（导航工具栏）见 `GOAL_v0.3.1.md`。
 > 用户已选定：**方案 A · 注入重排**（真页面 + Shadow DOM 自建 UI）+ **可写完整版**（可点赞/评论/回复）。
 
 ---
@@ -112,7 +112,7 @@ B站直接获取到的api，但是评论、右侧视频推荐、全改为我们�
 - [x] `app.py`：`ui_ownui` 进三个设置白名单（GET settings / POST 白名单 / ui_settings 轮询）
 - [x] `web/index.html` + `web/app.js`：设置页「播放页自有UI」关/开行 + 回显 + 保存
 - [x] `test_shell.py`：静态接线用例（文件存在/API 关键字/白名单/设置行）+ 全量回归
-- [x] 版本号 → v0.3.2.0dsk（app.py / index.html 页脚 / spec）
+- [x] 版本号 → v0.3.1.1dsk（app.py / index.html 页脚 / spec）
 
 ### P1 · 交付形态
 - [ ] 实测：壳内打开 B站视频页 —— 播放器正常、超分正常（切标签回来续播不受影响）、
