@@ -32,6 +32,18 @@ import app  # noqa: E402  本地服务(纯标准库)
 
 APP_NAME = "洞鉴虚明"
 APP_VER = app.APP_VER
+
+# ── 整屏截屏黑屏根治(浏览器级, v0.3.1.7dsk) ──────────────────────────────────
+# 症状: 微信/QQ/PrntScr 等 GDI BitBlt 截屏, 播放器区域黑屏(偶发)。
+# 根因: Chromium 会把视频(以及不透明轴对齐无滤镜的简单四边形, 如超分画布)提升为
+# DirectComposition 硬件 overlay 平面——屏幕上可见, 但 GDI 截屏取不到 overlay,
+# 截到的就是下面的黑色播放器背景。v0.3.1.6 已在页内给画布加 0.5px 圆角破坏资格,
+# 但 SR 拆管窗口期"可见的原视频"仍会被提升(v0.3.1.6 把视频改回可见后新开的口子)。
+# 这里从引擎层面禁掉视频 overlay 提升——所有 WebView2 控件(主控件+标签页)一并生效。
+# 代价: 视频合成多走一点 GPU 主通道, 省电收益略降, 桌面应用可接受。
+# setdefault: 用户若自己设了该环境变量则以用户的为准。
+os.environ.setdefault("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+                      "--disable-direct-composition-video-overlays")
 MAIN_W, MAIN_H = 1440, 920
 MAIN_MIN = (1080, 700)
 BG_DARK = "#0f1115"   # 与 web/style.css 暗色 --bg 一致, 避免窗口加载瞬间白闪

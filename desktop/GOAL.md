@@ -1,35 +1,32 @@
-# GOAL · v0.3.1.6dsk —— 播放页推荐筛选 + 顶栏精简
+# GOAL · v0.3.1.7dsk —— 整屏截屏黑屏根治（残留概率归零）
 
-> 目标版本 **v0.3.1.6dsk**。上一任务（播放页自有UI）见 `GOAL_v0.3.1.1.md`。
+> 目标版本 **v0.3.1.7dsk**。上一任务（SR截屏黑屏首修/原生UI闪现/夜间白闪）为 v0.3.1.6dsk（commit 5e7918a）。
 
 ## 一句话目标
-在「机器筛选 → B站」里新增开关「是否将播放页推荐视频进行筛选」（默认开）：开启后，播放页右栏推荐列表按本应用的机器筛选规则过滤，并按 **相关:探索 = 7:3** 混排（探索=与当前内容无关的泛热门视频）；同时播放页顶栏**只去掉左侧频道导航**（首页/番剧/直播/游戏中心/会员购/漫画/赛事/下载客户端），搜索框与右侧用户区保留。
+v0.3.1.6 的双保险（视频保持可见 + 画布 0.5px 圆角）把「微信/QQ/PrntScr 整屏截屏视频区域黑屏」的概率**大幅压低但没归零**——用户实测仍偶发。本任务把剩下的提升路径全部堵死。
 
-## 体验设计（逐条可验收）
-1. **设置入口**：机器筛选弹窗 → B站 标签页，新增复选框「是否将播放页推荐视频进行筛选」，默认勾选，随「保存 B站筛选设置」持久化（键 `m_play_related`，"1"/"0"）。
-2. **关闭开关时**：播放页右栏维持现状 —— 直接展示 `archive/related` 原始列表，不过滤、不混排。
-3. **开启时（默认）**：相关推荐与探索池都过一遍与信息流同源的机器筛选规则（页面端 1:1 移植，规则由壳注入 `window.__MSX_MF__`）：
-   - 播放量上下限（`m_min_views` / `m_max_views`）
-   - 时长上下限（`m_max_duration` / `m_min_duration`）
-   - 时间窗（`m_max_age_months`，0=不限）
-   - 相似标题去重（归一化后相同或互相包含，保留播放量最高的一条）
-   - 情绪过滤器（`m_emotion`）：感叹号/问号轰炸、叠词轰炸、引战黑话（FLAME_SLURS）、标题党词表（CLICKBAIT_KWS）+ 句式正则（CLICKBAIT_RE）—— 与 app.py `_emo_bad` 同规则
-   - 厌恶备注关键词（`dislike_keywords()`，查标题+简介）
-   - 拉黑名单作者（`ablock` 表，`m_blocklist_sync` 开启时）
-4. **7:3 混排**：探索池来自 `x/web-interface/popular`（同样过滤 + 去掉与当前视频/相关列表重复的条目），按「每 7 条相关后插 3 条探索」交错排列；探索条目带「探索」小标；相关区标题下注明「已按机器筛选 · 相关:探索=7:3」。
-5. **顶栏精简**：视频页（ownui 激活范围）`.bili-header .left-entry` 隐藏 —— 左侧频道导航消失，**搜索框、头像/消息/动态/收藏/历史/创作中心/投稿全部保留**；只动 CSS，不碰播放器 DOM（超分管线红线不变）。
-6. **降级**：popular 接口失败 → 只显示过滤后的相关列表（不空屏）；规则对象缺失/异常 → 回退现状。
-7. **超分管线**：本任务零接触播放器/三连/弹幕 DOM（test_shell 继续硬检查 ownui 脚本不含播放器选择器）。
+## 根因分析（为什么还剩黑屏）
+- **路径①（已堵）**：SR 画布 = 不透明+轴对齐+无滤镜简单四边形 → Chromium 提升为 DC overlay → GDI 取不到。v0.3.1.6 用 0.5px 圆角破坏资格。
+- **路径②（本次主堵）**：SR **未激活/拆管窗口期**（激活前首帧前、管线停滞 teardown 后、换 video 元素间隙），原视频**可见** → 可见视频本身就是 DC 视频 overlay 的提升候选 → GDI 截屏恰好取不到 overlay 平面 → 黑。v0.3.1.6 把视频从 opacity:0 改为可见，恰好把这扇门打开了。
+- **路径③（兜底）**：画布 radius CSS 无 `!important`，理论上可被站点 CSS 覆盖。
+
+## 修复设计（三层）
+1. **浏览器级（决定性）**：WebView2 启动参数 `--disable-direct-composition-video-overlays`——从引擎层面禁止视频 overlay 平面，GDI 截屏必取到合成画面。
+   - `app_window.py`：进程早期 `os.environ.setdefault("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", ...)`（覆盖 pywebview 创建的主控件；setdefault 允许用户环境变量覆盖）。
+   - `shell_pages.py`：新标签页 `CoreWebView2CreationProperties.AdditionalBrowserArguments` 显式追加同一开关（防止属性值覆盖环境变量的语义差异踩坑）。
+   - 代价：视频合成多走一点 GPU 主通道，省电收益略降——桌面应用可接受。
+2. **页内视频（兜底）**：`bilibili-sr.user.js` 给 `video:has(+ canvas.msx-sr-canvas)` 也加 `border-radius:0.5px!important`——即使开关失效（旧运行时等），拆管窗口期视频也不具备 overlay 资格；画布 radius 补 `!important`。
+3. **取证强化**：`_probe_header.js` 探针加 `videoRadius`；`_sr_cap.py` 从 2 发改为**连发多帧 + 黑屏自动判读**（统计截屏播放器区域近黑像素占比），量化"偶发"。
 
 ## 技术落点（按文件）
-- `app.py`：`DEFAULT_SETTINGS` 加 `m_play_related="1"`；`/api/machine` GET keys 与 POST keys 各加一个键。
-- `shell_pages.py`：ownui 注入段前拼 `window.__MSX_MF__ = {...}`（JSON，ensure_ascii），字段 on/min_views/max_views/max_dur/min_dur/max_age/dedup/emotion/flame/cb/cbre/dkws/ablock；任何读取异常时注入 `null`（页面端回退）。
-- `extensions/bilibili-ownui.user.js`：①脚本激活即注入隐藏 `.left-entry` 的 `<style>`；②`mfFilter()` 移植规则；③`buildRelated()` 走 过滤+popular+7:3 交错；④探索条目「探索」标。
-- `web/index.html`：B站筛选组加 `mPlayRel` 复选框行 + tip。
-- `web/app.js`：`loadMachine` 回显 + `mSave` 提交 `m_play_related`。
-- `test_shell.py`：版本断言 → v0.3.1.6dsk；新增静态检查（设置键入 API 白名单、userscript 含 left-entry 隐藏/popular/7:3 逻辑、index.html 有 mPlayRel、app.js 接线）。
-- 版本号 → **v0.3.1.6dsk**（app.py `APP_VER` / web/index.html 页脚 / spec 复制改名）。
+- `app_window.py`：导入后立即 setdefault 环境变量（注释：为何、setdefault 语义）。
+- `shell_pages.py`：`create()` 里 props.AdditionalBrowserArguments 追加开关。
+- `extensions/bilibili-sr.user.js`：`ensureStyle()` 两条 radius 规则（都 !important）+ 注释更新（路径②）。
+- `extensions/_probe_header.js`：sr 段加 `videoRadius`、`videoDisp`。
+- `_sr_cap.py`：默认连发 8 帧、每帧间隔 5s；对每帧按探针回传的画布矩形裁剪判黑（粗映射：窗口宽/视口宽比例），打印 per-frame 黑占比表；帧图全部落盘。
+- 版本号 → **v0.3.1.7dsk**（app.py `APP_VER` / web/index.html 页脚 / test_shell.py 断言）。
 
 ## 验收标准
 - py_compile + node --check 全过；test_shell 全过；test_smoke 无新增 FAIL。
-- 实测：开关关闭 → 原始相关列表；开启 → 列表出现「探索」条目且比例约 7:3；顶栏左导航消失、搜索和用户区完好；超分画面无任何变化。
+- 实机 `_sr_cap.py`：探针报 SR 激活 + canvas radius/videoRadius = 0.5px；≥8 帧 BitBlt 截屏播放器区域全部非黑。
+- 不动超分管线渲染路径（画面、帧率零变化）；ownui/主题胶水零接触。

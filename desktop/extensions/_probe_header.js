@@ -95,6 +95,8 @@
                            disp: getComputedStyle(sc).display, radius: getComputedStyle(sc).borderRadius } : null,
             videoOp: svcs ? svcs.opacity : "none",
             videoVis: svcs ? svcs.visibility : "none",
+            videoDisp: svcs ? svcs.display : "none",
+            videoRadius: svcs ? svcs.borderRadius : "none",
             paused: sv ? !!sv.paused : null
           };
         }

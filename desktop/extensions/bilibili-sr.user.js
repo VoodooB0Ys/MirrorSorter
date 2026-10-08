@@ -317,12 +317,18 @@
     st.id = "msx-sr-style";
     st.textContent =
       "canvas.msx-sr-canvas{position:absolute!important;pointer-events:none!important;" +
-      "z-index:0!important;border-radius:0.5px}" +
-      /* ⚠️ border-radius(0.5px, 视觉无感)是故意的: 不加它, 超分画布 = 不透明+轴对齐+
-         无滤镜的简单四边形, 会被 Chromium 提升为 DirectComposition 硬件 overlay 平面
-         (省电启发式, 间歇性触发)。overlay 平面屏幕上可见但 GDI 系截屏(微信/QQ/PrntScr
-         等 BitBlt 屏幕DC)取不到 → 用户实测"超分下整屏截屏, 视频区域黑屏"。
-         圆角裁剪强制走渲染通道, 画布留在主合成面里, 截屏即超分画面。 */
+      "z-index:0!important;border-radius:0.5px!important}" +
+      "video:has(+ canvas.msx-sr-canvas){border-radius:0.5px!important}" +
+      /* ⚠️ 两条 border-radius(0.5px, 视觉无感)都是故意的, 各堵一条 GDI 截屏黑屏路径:
+         不加圆角, ①超分画布 = 不透明+轴对齐+无滤镜的简单四边形、②可见的 <video> 本身,
+         都会被 Chromium 提升为 DirectComposition 硬件 overlay 平面(省电启发式, 间歇性
+         触发)。overlay 平面屏幕上可见但 GDI 系截屏(微信/QQ/PrntScr 等 BitBlt 屏幕DC)
+         取不到 → 用户实测"超分下整屏截屏, 视频区域黑屏"。圆角裁剪强制走渲染通道,
+         留在主合成面里, 截屏即画面。①画布本体现在已覆盖; ②堵的是 SR 拆管窗口期
+         (激活前/管线停滞/换 video 元素)画布不在、视频可见的那一刻(v0.3.1.6 把视频
+         改回可见后新开的口子); 画布 teardown 只是 display:none 不移除, 所以这条
+         :has 规则在该视频的全部生命周期持续生效。引擎级兜底:
+         --disable-direct-composition-video-overlays(app_window.py), 三层互为冗余。 */
       /* 不写 display: 未激活时要能被内联 display:none 藏起来 */
     (document.head || document.documentElement).appendChild(st);
   }

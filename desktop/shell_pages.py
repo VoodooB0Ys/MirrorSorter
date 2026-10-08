@@ -18,6 +18,12 @@ import app   # DATA_DIR(日志/用户脚本目录); 由 app_window 一并加载,
 
 NL = "\n"   # _dbg_log 落盘换行(历史上曾漏定义 → NameError 被吞, shell_debug.log 一直是空的)
 
+# 截屏黑屏根治(v0.3.1.7dsk): 新标签页控件的浏览器参数在 home 控件的基础上
+# 显式追加"禁用 DC 视频 overlay"开关。环境变量 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+# (app_window.py 设置)已覆盖主控件路; 这里显式带上是为了不依赖"属性值与环境变量
+# 谁覆盖谁"的实现语义——两条路都给到, 重复开关无害。
+MSX_WV2_CAPTURE_FLAG = "--disable-direct-composition-video-overlays"
+
 
 # 自愈式智能深色: 脚本在页面内常驻定时器, 每1.2s重测背景亮度 ——
 # 页面已深色(原生夜间/PreferredColorScheme生效) → 保持不动;
@@ -789,7 +795,9 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                     cp = home.CreationProperties
                     props = CoreWebView2CreationProperties()
                     props.UserDataFolder = cp.UserDataFolder
-                    props.AdditionalBrowserArguments = cp.AdditionalBrowserArguments
+                    props.AdditionalBrowserArguments = (
+                        ((cp.AdditionalBrowserArguments or "").strip() + " " +
+                         MSX_WV2_CAPTURE_FLAG).strip())
                     c = WebView2()
                     c.CreationProperties = props
                     try:
