@@ -177,7 +177,14 @@ flags = 0x08000000 if os.name == "nt" else 0
 # ★ MIRRORSORTER_NO_OPEN=1 是必须的: frozen exe 的 --server 模式默认 auto_open=True,
 #   会**真的在用户桌面上弹一个浏览器页**; 而那个页面一关就 sendBeacon("/api/shutdown")
 #   把测试服务杀掉 —— 表现为跑到一半突然 RemoteDisconnected(踩过), 还会骚扰用户。
-env = dict(os.environ, MIRRORSORTER_PORT=str(PORT), MIRRORSORTER_NO_OPEN="1")
+# ★ v0.3.1.46dsk 起再加 MIRRORSORTER_DATA_DIR 指向临时目录: 本脚本会写 ft_on / ft_labels
+#   这类设置, 直接跑会把**用户的**配置改掉(实测把 ft_labels 从五个标签改成四个)。
+#   模型在 _MEIPASS 里, 跟 DATA_DIR 无关, 所以隔离库不影响模型相关的断言。
+_DATA = os.path.join(tempfile.gettempdir(), "msx_verify_exe_%d" % PORT)
+os.makedirs(_DATA, exist_ok=True)
+env = dict(os.environ, MIRRORSORTER_PORT=str(PORT), MIRRORSORTER_NO_OPEN="1",
+           MIRRORSORTER_DATA_DIR=_DATA)
+print("  隔离数据目录: %s" % _DATA)
 proc = subprocess.Popen([EXE, "--server"], creationflags=flags, env=env,
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 try:
@@ -282,6 +289,11 @@ finally:
             proc.kill()
         except Exception:
             pass
+    try:
+        import shutil
+        shutil.rmtree(_DATA, ignore_errors=True)
+    except Exception:
+        pass
 
 print()
 print("=" * 76)

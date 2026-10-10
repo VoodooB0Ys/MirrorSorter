@@ -63,7 +63,7 @@ if _PORT_ENV:
         PORTS = (int(_PORT_ENV),)
     except Exception:
         pass
-APP_VER = "v0.3.1.44dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.3.1.46dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -340,8 +340,11 @@ DEFAULTS = {
     "m_block_empty_space": "0",  # 评论筛选(B站): 屏蔽空首页账号(个人空间一条动态都没有)的评论(默认关; 需登录B站)
     "m_dm_multicand": "1",    # 弹幕筛选: 一个哈希对上多个账号时怎么办(0=放行 1=全部候选都命中才拦(零误杀, 默认) 2=任一命中即拦)
     "m_filter_speed": "2",    # 筛选加速档位: 后台补画像/逆推哈希的并发与速率(0=兼容 1=标准 2=快速(默认) 3=极速)
-    # v0.3.1.32 弹幕屏蔽总开关: 0=完全不筛弹幕(原样播放, 不查发送者资料, 注入端连哈希表都不建)。
+    # v0.3.1.32 弹幕屏蔽总开关: 0=不筛**按发送者身份**的弹幕(不查发送者资料, 注入端连哈希表都不建)。
     # 只影响弹幕; 评论筛选(mystery/lottery/empty/level/黑名单)照常。
+    # ★ v0.3.1.46dsk: 它**管不到**「快速文本分析」的弹幕通道(ft_dm) —— 那是"发了什么",
+    #   与"谁发的"是两条独立通道, 设置页也是这么对用户承诺的。旧代码在注入脚本里
+    #   写成 NEED_TEXT = DM_ON && ft_dm, 导致"关总开关 + 开 fastText"静默失效。
     "m_dm_on": "1",
     # ---- v0.3.1.43dsk 快速文本分析(fastText 本地小模型) ----
     # 与 m_dm_on / cf_* 相互独立的总开关: 上面那两组管"谁发的"(账号身份),
@@ -6454,12 +6457,24 @@ LOTTERY_CUE = ("转发", "关注", "参与", "转赞评", "点赞", "评论", "�
 _author_meta = {}                  # "mid" -> {"sign","mystery","lottery","ts"}
 _author_meta_lock = threading.Lock()
 _AUTHOR_META_TTL = 24 * 3600       # 作者画像缓存 24h(内存 + DB 双层)
-_AUTHOR_WARM_MAX = 400             # 后台补图队列上限(防无界增长)
-_AUTHOR_WARM_GAP = 0.6             # 两次作者查询之间的最小间隔(秒): 限速, 免触发风控
-_AUTHOR_WARM_CAP = 60              # 单次请求最多认领的未知作者数
+# v0.3.1.45dsk: 队列/单次认领上限放宽 —— 旧值 400/60 面对"一个播放页上千个候选"
+# 会当场丢掉大部分 mid(实测 73 个候选就丢了 13 个), 而丢掉的既不进 seen 也不重试。
+_AUTHOR_WARM_MAX = 3000            # 后台补图队列上限(防无界增长)
+_AUTHOR_WARM_GAP = 0.6             # 保留: 兼容旧配置读取(实际限速由令牌桶给)
+_AUTHOR_WARM_CAP = 400             # 单次请求最多认领的未知作者数
+_AM_RETRY_MAX = 6                  # 同一个 mid 最多补图尝试次数(超了就不再排队, 免得死循环)
+_AM_RETRY_DELAY = 45.0             # 失败后至少隔这么久才允许重入队(秒); 第 n 次退避 = n × 它
+_AM_RETRY_TICK = 3.0               # 重试调度线程的巡检间隔(秒)
 _am_warm_q = []                    # 待补图的 mid(有序 + 去重)
 _am_warm_seen = set()
 _am_warm_lock = threading.Lock()
+# v0.3.1.45dsk: 失败重试状态。两张表分工 —— 计数与到期时间分开存,
+# 否则"重入队时把条目从 _am_retry 删掉"会把尝试次数一起清零, 退避永远回到第 1 档
+# (实测: 8 个 mid 在 14 秒里被打了 192 次, 封顶形同虚设)。
+#   _am_tries: mid -> 已失败次数(成功/确认不存在时清除)
+#   _am_retry: mid -> 最早可重试时间戳
+_am_tries = {}
+_am_retry = {}
 # v0.3.1.30: 单线程 _am_warm_thread 已换成 _am_pool 线程池(见下方「筛选加速」段)
 _am_conn_tls = threading.local()    # /api/bili/flags 专用连接(短 busy_timeout)
 _AM_DB_BUSY_MS = 200                # 上述连接 busy_timeout(ms): DB 被写锁占住就立刻放弃读取
@@ -6473,21 +6488,35 @@ _AM_DB_BUSY_MS = 200                # 上述连接 busy_timeout(ms): DB 被写�
 #     → 0.86 账号/秒; 200 个账号要 231 秒。
 # 改法: 两个队列都改**有界线程池**; 网络侧再叠一层**令牌桶** ——
 #   并发只用来掩盖延迟, **速率才是风控闸门**(并发开大不会提高请求速率)。
-#   撞上风控(-352 之类)自动降速, 5 分钟后恢复, 不拿用户的账号冒险。
+#
+# ★★ v0.3.1.45dsk 重做速率口径(2026-10-10 实测, 隔离库副本 + 真实接口):
+#   旧口径是「每**账号**一个令牌」, 而一个账号要打 **2 次** B站接口
+#   (acc/info + 动态), 于是标称 7/s 实际是 **14 请求/秒**, 且动态那次完全不受闸门管。
+#   A/B 实测(各 50 个候选 mid): 档位0(并发1) 92% 被 -352 拒、档位1 96%、
+#   档位2 100%、档位3 100%; 而**顺序单发 16 次(6.7 请求/秒) 是 0%**。
+#   ⇒ 触发风控的是"总请求速率 + 并发突发", 不是"账号数"。
+#   现在: 速率口径改为 **B站请求/秒**(每个画像消耗 2 个令牌), 并**取消突发额度**
+#   (burst=1, 不再让 6 个线程在入队瞬间同时打同一 cookie)。
 _FILTER_GEARS = {
-    # 档位 -> (画像并发, 画像速率/秒, 逆推并发, 逆推速率/秒)
+    # 档位 -> (画像并发, 画像请求速率/秒, 逆推并发, 逆推速率/秒)
+    # 画像速率是 **B站请求/秒**(一个画像 = acc/info + 动态 = 2 个请求)
     # 逆推速率 0 = 不限速(纯本地 CPU, 单线程上限 ~66/s)
-    "0": (1, 1.0 / 0.6, 1, 1.0 / 0.25),    # 兼容: 与 v0.3.1.29 行为一致
-    "1": (3, 4.0, 2, 20.0),                # 标准
-    "2": (6, 7.0, 3, 45.0),                # 快速(默认)
-    "3": (12, 14.0, 4, 0.0),               # 极速
+    "0": (1, 3.3, 1, 4.0),                 # 兼容: 约 1.7 个画像/秒(≈ v0.3.1.29 的 0.6s/个)
+    "1": (2, 6.0, 2, 20.0),                # 标准: 约 3 个画像/秒
+    "2": (3, 8.0, 3, 45.0),                # 快速(默认): 约 4 个画像/秒
+    "3": (4, 14.0, 4, 0.0),                # 极速: 约 7 个画像/秒(请求量约默认 1.75 倍, 风险自评)
 }
 _gear_cache = {"v": None, "ts": 0.0}
 
 
 class _TokenBucket(object):
-    """令牌桶限速: 突发额度让短页面「一瞬间」过完, 之后按 rate 匀速。
-    线程安全; rate <= 0 表示不限速。"""
+    """令牌桶限速: 按 rate 匀速放行; 线程安全; rate <= 0 表示不限速。
+
+    ★ v0.3.1.45dsk: 网络闸门**取消突发额度**(burst=1)。
+      旧实现 burst = 并发数, 入队瞬间 N 个线程同时打同一 cookie —— 实测正是这种
+      "同账号并发突发"最容易被 B站判成脚本行为并回 -352。宁可慢一点。
+      短页面(条目数少)不再"一瞬间过完", 改为按 1/rate 逐条放行(8/s → 125ms/条), 可接受。
+    """
     __slots__ = ("rate", "cap", "_t", "_last", "_lk")
 
     def __init__(self, rate, burst):
@@ -6498,12 +6527,11 @@ class _TokenBucket(object):
         self._last = time.time()
         self.set(rate, burst)
         with self._lk:
-            self._t = self.cap     # 起始灌满: 短页面(条目数 ≤ 并发数)要能「一瞬间」过完
+            self._t = self.cap
 
     def set(self, rate, burst):
         """改速率/额度。会先把「距上次结算这段时间」的令牌结息记上, 再按新额度调整 ——
-        否则每次入队都调 set() 会把攒下的令牌悄悄清零(短页面就享受不到突发额度了)。
-        额度变大时补足差额(用户从「兼容」调到「快速」应当立刻拿到新额度)。"""
+        否则每次入队都调 set() 会把攒下的令牌悄悄清零。"""
         with self._lk:
             now = time.time()
             if self.rate > 0:
@@ -6547,40 +6575,63 @@ def _filter_gear():
     return v
 
 
-_am_gate = _TokenBucket(0, 1)          # 画像请求闸门
+_am_gate = _TokenBucket(0, 1)          # 画像请求闸门(每个 B站请求取 1 个令牌)
 _dmrev_gate = _TokenBucket(0, 1)       # 逆推闸门(纯本地, 控的是 CPU 占空比)
 _am_pool = []                          # 画像池的活线程
 _dmrev_pool = []                       # 逆推池的活线程
-# 风控退避: 连续撞到非 0/非 -404 的返回就把画像速率减半, 冷却 5 分钟后恢复
-_am_risk = {"n": 0, "until": 0.0, "factor": 1.0}
+# ★ v0.3.1.45dsk 风控硬退避。旧实现是"连续 3 次才把速率砍半, 5 分钟恢复", 后果很糟:
+#   -352 一旦出现就是**全有全无**(账号/IP 已被标记), 继续按原速率打只会把标记打得更深;
+#   而砍半后的速率面对"一页上千个候选"仍等于持续撞击。实测 73 个候选入队 → 7.5 秒排空
+#   → 只落库 26 个, 剩下全部丢弃, 端到端 60 秒只筛出 2 条。
+# 现在: 撞一次就**暂停整个画像队列**并指数退避(60→180→600→1800s), 期间不重试不写缓存;
+#   任何一次成功立刻清零。队列条目留在队里, 恢复后继续, 不再丢。
+_AM_RISK_COOLDOWN = (60.0, 180.0, 600.0, 1800.0)
+_am_risk = {"streak": 0, "pause_until": 0.0, "hits": 0}
+
+
+def _am_note_ok():
+    """一次成功的 B站画像请求 → 退避清零(说明风控已解除)。
+
+    同时把失败计数整表清零: 之前那些"重试次数用尽"的 mid 是在风控期间耗掉的,
+    接口既然已经恢复, 它们就该重新获得一次机会(否则会一直死到重启)。
+    """
+    with _am_warm_lock:
+        if _am_risk["streak"]:
+            print("[filter] 画像请求已恢复, 风控退避清零")
+        _am_risk["streak"] = 0
+        _am_risk["pause_until"] = 0.0
+        if _am_tries:
+            _am_tries.clear()
 
 
 def _am_note_risk(code):
-    """acc/info 返回风控码(-352 等) → 记一笔; 连续 3 次就把速率砍半。"""
+    """acc/info 返回风控码(-352 等) → 立刻暂停画像队列并指数退避。"""
     if code is None or code == 0 or code in _BILI_NO_SUCH_MID:
-        _am_risk["n"] = 0
         return
     now = time.time()
-    if now < _am_risk["until"]:
-        return                      # 已在冷却期, 不重复降速
-    _am_risk["n"] += 1
-    if _am_risk["n"] >= 3:
-        _am_risk["n"] = 0
-        _am_risk["factor"] = max(0.125, _am_risk["factor"] * 0.5)
-        _am_risk["until"] = now + 300.0
-        print("[filter] 检测到 B站风控, 画像速率降到 %.0f%%, 5 分钟后自动恢复"
-              % (_am_risk["factor"] * 100))
+    if now < _am_risk["pause_until"]:
+        return                      # 已在退避窗口内, 不重复加码
+    idx = min(_am_risk["streak"], len(_AM_RISK_COOLDOWN) - 1)
+    cool = _AM_RISK_COOLDOWN[idx]
+    _am_risk["streak"] = min(_am_risk["streak"] + 1, len(_AM_RISK_COOLDOWN) - 1)
+    _am_risk["hits"] += 1
+    _am_risk["pause_until"] = now + cool
+    print("[filter] 撞到 B站风控(返回码 %s): 画像队列暂停 %.0f 秒后重试(第 %d 次)"
+          % (code, cool, _am_risk["hits"]))
+
+
+def _am_paused():
+    """撞风控后是否处于退避窗口内。"""
+    return time.time() < _am_risk["pause_until"]
 
 
 def _am_apply_gear():
-    """把档位写进画像闸门, 返回并发数。"""
+    """把档位写进画像闸门, 返回并发数。速率口径 = B站请求/秒(每个画像 2 个请求)。"""
     conc, rate, _rc, _rr = _filter_gear()
-    if _am_risk["factor"] < 1.0 and time.time() > _am_risk["until"]:
-        _am_risk["factor"] = 1.0        # 冷却结束 → 速率恢复
-        _am_risk["n"] = 0
-    # 突发额度 = 并发数: 短页面(条目数 ≤ 并发数)一瞬间过完, 但**绝不突破并发上限**。
-    # 兼容档 conc=1 → 额度 1 → 与 v0.3.1.29 的「每个间隔 0.6s」逐条等价。
-    _am_gate.set(rate * _am_risk["factor"], max(1.0, conc))
+    if _am_risk["streak"] and not _am_paused():
+        _am_risk["streak"] = 0          # 退避窗口过完 → 从最小档重新开始(而非直接满速)
+    # burst 恒为 1: 不允许入队瞬间并发突发(见 _TokenBucket 注释)。
+    _am_gate.set(rate, 1.0)
     return int(conc)
 
 
@@ -6778,8 +6829,15 @@ def bili_author_meta(mid, want_bio=True, want_lottery=True):
     if not account_cookie():
         return None
     try:
+        # ★ v0.3.1.45dsk: 每个 B站请求各取一个令牌(速率口径 = 请求/秒)。
+        #   旧实现只给"账号"发令牌, 动态那次请求完全不受闸门管 —— 标称 7/s 实际 14 请求/秒,
+        #   正是撞 -352 的直接原因。
+        _am_gate.acquire()
         acc, _code = _bili_acc_probe(m)
-        _am_note_risk(_code)        # v0.3.1.30: 撞风控自动降速
+        if _code == 0:
+            _am_note_ok()           # 有一次成功 → 说明风控已解除, 退避清零
+        else:
+            _am_note_risk(_code)    # 撞风控 → 暂停整个画像队列并指数退避
         if not acc:
             # v0.3.1.27: 接口返回空(风控/失败)时**绝不写缓存** —— 旧实现会让 acc={}
             # 一路走到 sign="" → mystery=True, 把"查不到"记成"无简介"(误杀源)。
@@ -6805,6 +6863,7 @@ def bili_author_meta(mid, want_bio=True, want_lottery=True):
             except Exception:
                 level = None
         mystery = (not sign) or (re.sub(r"\s+", "", sign) == MYSTERY_SIGN)
+        _am_gate.acquire()          # 动态接口也过同一个闸门(旧实现这里完全不限速)
         items = _bili_recent_dynamics(m)
         if items is None:
             return None     # 动态接口失败 → 不写缓存(否则会把"不知道"记成"没有动态")
@@ -6829,42 +6888,99 @@ def bili_author_meta(mid, want_bio=True, want_lottery=True):
     return c
 
 
-# ── v0.3.1.27 一次性数据修复 ────────────────────────────────────────────────
-# `level` 列是后加的: 列上线前写入的画像行 level 全为 NULL(用户库实测 567 行),
-# 抽查 10 条真实等级是 6/4/2/6/5/5/5/6/5/4 —— 一条 LV0 都没有, 全是"没记上"。
-# 把这类行标脏(nodyn=NULL → _am_row_get 视为过期)让它们按需重取; 重取会写入真实
-# 等级。只跑一次(设置键打标记), 重取走原有后台限速队列, 不会造成请求风暴。
-try:
-    if sget("_mig_am_level27") != "1":
-        _n27 = db().execute(
-            "UPDATE author_meta SET nodyn=NULL WHERE nodyn IS NOT NULL AND level IS NULL"
-        ).rowcount
-        db().commit()
-        sset("_mig_am_level27", "1")
-        if _n27:
-            print("[mig] author_meta: %d 行(level 列上线前写入)已标脏, 将按需重取真实等级" % _n27)
-except Exception:
-    pass
+# ── v0.3.1.27 一次性数据修复 —— v0.3.1.45dsk 已**停用** ─────────────────────
+# 原来做的事: `level` 列后加, 老行 level 全为 NULL(用户库实测 567 行), 于是把
+# `nodyn` 置 NULL 让 `_am_row_get` 视为过期、按需重取, 好把真实等级补上。
+# 为什么删掉: 弹幕侧等级筛选已移除(见 _am_bad), `level` 列不再被任何规则使用 ——
+# 而这个迁移会让**几百行画像同时过期**, 页面一打开就触发成百上千次 B站请求,
+# 正是把账号打进 -352 风控的推手之一。现在它只花钱不办事, 所以整块拿掉。
+# `level` 列本身保留(不再写入/读取), 免得为删列做一次表重建。
 
 
 def _am_warm_worker():
     """画像池 worker: 取一个 mid → 过令牌桶 → 取画像。
     队列空就退出(下次入队 _pool_fill 再补线程) —— 不再空转占资源。
     v0.3.1.30: 旧实现是**单线程 + 每账号 sleep 0.6s**(0.86 账号/秒); 现在并发
-    由池给、速率由令牌桶给 —— 两者解耦, 才能既快又不失控。"""
+    由池给、速率由令牌桶给 —— 两者解耦, 才能既快又不失控。
+    ★ v0.3.1.45dsk: 失败**不再丢弃** —— 记进 _am_retry 由 _am_retry_ticker 按退避重排;
+    撞风控(_am_paused)期间原地等, 不 pop 队列(条目留在队里, 恢复后接着跑)。"""
     while True:
+        if _am_paused():
+            time.sleep(1.0)
+            with _am_warm_lock:
+                if not _am_warm_q:
+                    return
+            continue
         with _am_warm_lock:
             if not _am_warm_q:
                 return
             m = _am_warm_q.pop(0)
-        _am_gate.acquire()          # 闸门在锁外: 等待时不占锁
         try:
-            if bili_author_meta(m) is None:
-                with _am_warm_lock:
-                    _am_warm_seen.discard(m)
+            ok = bili_author_meta(m) is not None
         except Exception:
+            ok = False
+        if ok:
             with _am_warm_lock:
-                _am_warm_seen.discard(m)
+                _am_retry.pop(m, None)
+                _am_tries.pop(m, None)
+            continue
+        # 失败: 放回 seen 之外, 记一次尝试; 未超上限的交由 ticker 退避重排
+        with _am_warm_lock:
+            _am_warm_seen.discard(m)
+            if len(_am_tries) > 20000:
+                _am_tries.clear()
+                _am_retry.clear()       # 防长期驻留膨胀
+            n = _am_tries.get(m, 0) + 1
+            _am_tries[m] = n
+            if n <= _AM_RETRY_MAX:
+                _am_retry[m] = time.time() + _AM_RETRY_DELAY * n
+            else:
+                _am_retry.pop(m, None)  # 超上限 → 不再排队(等下次页面重新问)
+
+
+def _am_retry_ticker():
+    """退避重试调度(常驻 daemon, 3 秒一轮): 把到期的失败 mid 放回队列并唤醒线程池。
+
+    ★ 为什么必须有: 旧实现失败即丢弃(只从 seen 里删掉), 队列一空 worker 就退出 ——
+      实测 73 个候选 7.5 秒排空、只落库 26 个, 剩下 47 个**再也不会被重试**,
+      端到端 60 秒只筛出 2 条。撞风控时 100% 的请求都会失败, 于是"永远筛不出来"。
+    """
+    while True:
+        time.sleep(_AM_RETRY_TICK)
+        try:
+            if _am_paused():
+                continue
+            now = time.time()
+            with _am_warm_lock:
+                due = [m for m, ts in _am_retry.items() if ts <= now]
+            if not due:
+                continue
+            added = False
+            for m in due:
+                if _am_is_absent(m):
+                    with _am_warm_lock:
+                        _am_retry.pop(m, None)
+                        _am_tries.pop(m, None)
+                    continue
+                with _am_warm_lock:
+                    if m in _am_warm_seen:
+                        continue
+                    if len(_am_warm_q) >= _AUTHOR_WARM_MAX:
+                        _am_retry[m] = now + _AM_RETRY_DELAY   # 队满, 下轮再来
+                        continue
+                    del _am_retry[m]
+                    _am_warm_seen.add(m)
+                    _am_warm_q.append(m)
+                    added = True
+            if added:
+                conc = _am_apply_gear()
+                with _am_warm_lock:
+                    _pool_fill(_am_pool, conc, _am_warm_worker)
+        except Exception:
+            pass
+
+
+_am_ticker_on = [False]
 
 
 def _am_enqueue(mids):
@@ -6879,6 +6995,8 @@ def _am_enqueue(mids):
                 break
             if not m.isdigit() or int(m) <= 0 or m in _am_warm_seen:
                 continue
+            if m in _am_retry:
+                continue        # 已在退避队列里等着, 不打断它的退避节奏
             if _am_is_absent(m):
                 continue        # 已确认不存在 → 别再白跑接口
             if len(_am_warm_q) >= _AUTHOR_WARM_MAX:
@@ -6888,6 +7006,13 @@ def _am_enqueue(mids):
             add.append(m)
         if add:
             _pool_fill(_am_pool, conc, _am_warm_worker)
+    if add and not _am_ticker_on[0]:
+        _am_ticker_on[0] = True     # 退避重试调度线程: 只在真有补图需求时才起
+        try:
+            threading.Thread(target=_am_retry_ticker, daemon=True,
+                             name="am-retry-ticker").start()
+        except Exception:
+            _am_ticker_on[0] = False
     return add
 
 
@@ -6940,6 +7065,9 @@ def bili_author_flags(mids, want_bio=True, want_lottery=True, want_empty=True):
     走 _am_rows_get(fast=True): 短 busy_timeout, DB 被写锁占住时立刻返回未知(放行)。
     v0.3.1.31: 批量 IN, 不再逐 mid 一条 SQL。"""
     flags, pending, unknown = {}, [], []
+    if not (want_bio or want_lottery or want_empty):
+        # 同 bili_dm_flags: 规则全关就别把作者塞进联网补图队列(见那边的注释)。
+        return {"flags": flags, "pending": pending, "cookie": bool(account_cookie())}
     valid, seen = [], set()
     for m in (mids or []):
         m = str(m or "")
@@ -7216,23 +7344,29 @@ def _dmrev_enqueue(hashes):
     return add
 
 
-def _am_bad(c, want_bio=False, want_lottery=False, want_empty=False, lvl=0):
-    """一条账号画像是否命中「弹幕评论筛选」的账号级规则。"""
+def _am_bad(c, want_bio=False, want_lottery=False, want_empty=False):
+    """一条账号画像是否命中「弹幕评论筛选」的账号级规则。
+
+    v0.3.1.45dsk: **等级条件已删除** —— 弹幕接口不带等级, 判等级只能靠
+    「哈希逆推 → 候选 mid → 联网查账号资料」, 一个 8 位哈希平均撞 6 个候选
+    (实测最大 36), 一个播放页上千次 B站请求, 直接把账号打进 -352 风控;
+    而风控期间这条规则 100% 失效(请求全被拒), 得不偿失。
+    等级筛选只保留评论侧(bilibili-cfilter, 评论接口自带 level_info, 零请求)。
+    """
     if not c:
         return False
     return bool((want_bio and c.get("mystery")) or (want_lottery and c.get("lottery"))
-                or (want_empty and c.get("nodyn"))
-                or (lvl > 0 and c.get("level") is not None and c["level"] <= lvl))
+                or (want_empty and c.get("nodyn")))
 
 
 def _dm_flag_of(c, multi):
     """回给页面端的标记。multi = 这个哈希对上了几个账号(>1 时页面端标注「N候选」)。"""
     return {"mystery": bool(c.get("mystery")), "lottery": bool(c.get("lottery")),
-            "nodyn": bool(c.get("nodyn")), "level": c.get("level"),
+            "nodyn": bool(c.get("nodyn")),
             "multi": int(multi)}
 
 
-def bili_dm_flags(hashes, want_bio=False, want_lottery=False, want_empty=False, lvl=0, multi=1):
+def bili_dm_flags(hashes, want_bio=False, want_lottery=False, want_empty=False, multi=1):
     """弹幕版 bili_author_flags: 按 midHash 查(先逆推出 mid, 再查账号画像)。
     只读本地缓存, 绝不联网等待; 没逆过的 hash 进后台队列慢慢算。
 
@@ -7245,6 +7379,20 @@ def bili_dm_flags(hashes, want_bio=False, want_lottery=False, want_empty=False, 
     候选永远没有画像, 规则永远等不到数据(死循环)。
     """
     flags, pending = {}, []
+    if sget("m_dm_on") == "0":
+        # ★ v0.3.1.46dsk: 「弹幕屏蔽总开关」。它管的是**按发送者身份**的弹幕规则
+        #   (黑名单 / 抽奖 / 空首页 / 无简介) —— 关掉时这条链路整条停摆: 不逆推、
+        #   不查画像、不入队。页面脚本自己也会 gating(bilibili-dmfilter 的 NEED_FLAGS),
+        #   但正如下面那句"不能指望它", 这里必须再设一道 —— 逆推 300 个哈希 ≈ 3 秒
+        #   纯 Python CPU, 多候选分支还会把上千个 mid 塞进**联网**补图队列(风控源头)。
+        #   注意: 「快速文本分析」的弹幕通道走 /api/textfilter, 不经过这里, 不受本开关影响。
+        return {"flags": flags, "pending": pending, "cookie": bool(account_cookie())}
+    if not (want_bio or want_lottery or want_empty):
+        # ★ v0.3.1.45dsk: 三个账号级规则全关 → 弹幕侧没有任何要判的东西。
+        #   直接返回, **连哈希逆推都不做** —— 300 个哈希 ≈ 3 秒纯 Python CPU,
+        #   而且多候选分支会 `_am_enqueue(unknown)` 把上千个候选 mid 塞进**联网**补图队列,
+        #   那正是把账号打进 -352 风控的源头(页面脚本虽然会先自行 gating, 但不能指望它)。
+        return {"flags": flags, "pending": pending, "cookie": bool(account_cookie())}
     for h in (hashes or [])[:300]:
         h = str(h or "").lower()
         if not re.fullmatch(r"[0-9a-f]{8}", h):
@@ -7262,7 +7410,7 @@ def bili_dm_flags(hashes, want_bio=False, want_lottery=False, want_empty=False, 
             if c is None:
                 _am_enqueue([m])
                 continue
-            if _am_bad(c, want_bio, want_lottery, want_empty, lvl):
+            if _am_bad(c, want_bio, want_lottery, want_empty):
                 flags[h] = _dm_flag_of(c, 1)
             continue
         if not mids or multi == 0:
@@ -7280,9 +7428,9 @@ def bili_dm_flags(hashes, want_bio=False, want_lottery=False, want_empty=False, 
                 unknown.append(x)
         if unknown:
             _am_enqueue(unknown)   # ← 关键修复: 多候选也要补画像, 否则规则永远不生效
-        bad = [c for c in prof if _am_bad(c, want_bio, want_lottery, want_empty, lvl)]
+        bad = [c for c in prof if _am_bad(c, want_bio, want_lottery, want_empty)]
         if bad:
-            # 展示用原因与页面端 blkWhy 的优先级保持一致(无简介 > 抽奖 > 空首页 > 等级低)
+            # 展示用原因与页面端 blkWhy 的优先级保持一致(无简介 > 抽奖 > 空首页)
             bad.sort(key=lambda c: (not (want_bio and c.get("mystery")),
                                     not (want_lottery and c.get("lottery")),
                                     not (want_empty and c.get("nodyn"))))
@@ -10633,18 +10781,15 @@ class Handler(BaseHTTPRequestHandler):
             # 弹幕加载的关键路径上不能有网络查询/长计算。只回布尔标记, 不含任何凭据。
             hs = [x.strip().lower() for x in (qs.get("hashes", [""])[0] or "").split(",") if x.strip()]
             try:
-                _lvl = int(qs.get("lvl", ["0"])[0] or 0)
-            except Exception:
-                _lvl = 0
-            try:
                 _mc = int(sget("m_dm_multicand") or 1)
             except Exception:
                 _mc = 1
+            # v0.3.1.45dsk: 不再收 lvl —— 弹幕侧等级筛选已移除(判等级必须联网查资料,
+            # 候选爆炸会把账号打进 -352 风控)。等级只保留评论侧, 见 bilibili-cfilter。
             r = bili_dm_flags(hs,
                               want_bio=qs.get("bio", ["0"])[0] != "0",
                               want_lottery=qs.get("lot", ["0"])[0] != "0",
                               want_empty=qs.get("nodyn", ["0"])[0] != "0",
-                              lvl=max(0, min(5, _lvl)),
                               multi=max(0, min(2, _mc)))
             return self.send_json({"ok": True} | r)
         if path == "/api/textfilter/status":

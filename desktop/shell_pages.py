@@ -817,6 +817,10 @@ def _build_inject_script(port):
             _cf_lvl = int(app.sget("cf_min_level") or 2)
         except Exception:
             _cf_lvl = 2
+        # ★ v0.3.1.45dsk: lvl 现在**只作用于评论**(cfilter + ownui 的自建评论区) ——
+        #   评论接口响应自带 member.level_info, 纯本地零请求。
+        #   弹幕侧已不再读它: 弹幕接口不带等级, 判等级必须「逆推哈希 → 联网查资料」,
+        #   候选爆炸会把账号打进 -352 风控(详见 bilibili-dmfilter.user.js 文件头)。
         # 弹幕侧黑名单: 已知 mid(B站拉黑名单接口自带 mid / 评论区见过的 name→mid 索引)
         # 正算 crc32 得到 midHash 集合, 页面端 O(1) 查表就地摘弹幕。
         # v0.3.1.32: 弹幕总开关关掉时连这张表都不算(省一次全名单 crc32), 页面端也拿不到。

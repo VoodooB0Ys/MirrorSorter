@@ -723,6 +723,10 @@ check("评论翻页1 屏蔽后补泵翻页(哨兵还在视口就替组件 getLis
 #          ③ 「快速文本分析」是独立于弹幕/评论总开关的**另一个**总开关。
 _dm_src = io.open(os.path.join(PROJECT, "extensions", "bilibili-dmfilter.user.js"),
                   encoding="utf-8").read()
+# NEED_TEXT 的**赋值行**单独摘出来判 —— 文件头/正文注释里会引用旧写法做对照,
+# 直接对整个文件做 `not in` 会被注释里的引用误伤(踩过)。
+_dm_need_text = [ln.strip() for ln in _dm_src.splitlines()
+                 if ln.strip().startswith("var NEED_TEXT")]
 
 check("文本分析1 后端: 模型随包分发 + 纯 stdlib 推理(打包走 3.14, 官方 fasttext 无 wheel)",
       "def _ft_path()" in _app_src
@@ -749,7 +753,9 @@ check("文本分析4 壳侧注入三个开关, ft_dm/ft_cf 都必须先过总开
       and 'app.sget("ft_on") == "1" and app.sget("ft_cf") == "1"' in _sp_src)
 
 check("文本分析5 弹幕链路: 文本判定必须在改写字节流之前完成 + 关掉时零请求原样放行",
-      "var NEED_TEXT = DM_ON && !!CF.ft_dm;" in _dm_src
+      # ★ v0.3.1.46dsk: 这里**必须**是裸的 !!CF.ft_dm —— 不能再 `DM_ON &&`。
+      #   总开关管的是"按发送者身份"的规则, 管不到"这条说了什么"。
+      _dm_need_text == ["var NEED_TEXT = !!CF.ft_dm;"]
       and "Promise.all([askFlags(hashes, true), askText(textsOf(top), true)])" in _dm_src
       and "function blkWhy(o)" in _dm_src and "TXTWHY[t]" in _dm_src
       and "text/plain" in _dm_src and "targetAddressSpace" in _dm_src)
@@ -774,6 +780,134 @@ check("文本分析8 训练/评测脚本随源码留在 _vis(可复现), 但**�
       and os.path.isfile(os.path.join(PROJECT, "_vis", "fasttext_demo", "train_big.py"))
       and "_vis" not in io.open(os.path.join(PROJECT, "洞鉴虚明%s.spec" % app.APP_VER),
                                 encoding="utf-8").read())
+
+# ---------- 3b-2. 弹幕侧 fastText 与「弹幕屏蔽总开关」解耦(v0.3.1.46dsk) ----------
+# 背景(2026-10-10 实测): 用户实际配置 m_dm_on=0 + ft_on=1 + ft_dm=1, 期望"总开关关着、
+# fastText 照常拦弹幕" —— 而设置页对用户写的正是"与弹幕屏蔽总开关完全独立"。
+# 但注入脚本里写的是 `NEED_TEXT = DM_ON && !!CF.ft_dm`, 于是 askText() 第一行就返回,
+# 弹幕侧**一个文本请求都不发**, fastText 100% 失效。评论侧一直是 !!CF.ft_cf, 无此耦合。
+# 另一处独立缺陷: 播放器实际走 XHR(不是 fetch), 而 XHR 钩子只 askFlags 不 askText ——
+# 文本通道在播放器路径上从来没被喂过数据, 唯一来源是 fetchMissing 自取分段时的预热。
+check("文本解耦1 弹幕侧 NEED_TEXT 不再被弹幕总开关短路(与评论侧口径一致)",
+      _dm_need_text == ["var NEED_TEXT = !!CF.ft_dm;"]
+      and all("DM_ON" not in ln for ln in _dm_need_text)
+      and "var NEED_TEXT = !!CF.ft_cf;" in _cf_src)
+
+check("文本解耦2 弹幕总开关仍管着按身份的规则(黑名单/抽奖/空首页/无简介), 不能一起放开",
+      "var MYSTERY = DM_ON && !!CF.mystery;" in _dm_src
+      and "var LOT = DM_ON && !!CF.lottery;" in _dm_src
+      and "var EMPTY = DM_ON && !!CF.empty;" in _dm_src
+      and "if (DM_ON && CF.blk_on && CF.dmhash && CF.dmhash.length)" in _dm_src
+      # ★ 后端也必须设防: 注释自己写着"不能指望页面脚本 gating", 而且不设防的话
+      #   逆推 300 哈希 ≈ 3 秒纯 CPU + 上千候选塞进**联网**补图队列(风控源头)。
+      and 'if sget("m_dm_on") == "0":' in _app_src)
+
+check("文本解耦3 XHR 路径(播放器实际走这条)也要给文本通道预热",
+      "askText(r.texts, false);" in _dm_src
+      and "return { out: out, hashes: hashes, texts: texts, rows: rows, hrows: hrows, raw: raw };" in _dm_src
+      and "texts: [], rows: [], hrows: [], raw: [] };" in _dm_src)
+
+check("文本解耦4 设置页/后端文案必须说清「总开关管身份、管不到文本」",
+      "「快速文本分析」的弹幕通道不受本开关影响" in _idx_src
+      and "管不到" in _app_src)
+
+# 这次 bug 的形态是"一行完全合法的赋值把两条通道焊死了" —— 静态断言(文本解耦1)
+# 只能证明字符串写对了, 证明不了**行为**。所以另有一份 node 沙盒回归: 造真实
+# wire-format 的 seg.so 字节流喂给 XHR 钩子, 看它到底往 127.0.0.1 发了哪些请求。
+# 实测判别力: 把 NEED_TEXT 改回 `DM_ON && !!CF.ft_dm` → T1/T5 立刻 FAIL。
+# 不塞进本脚本(要 node 且跑真异步), 与 止损13 同样的处理方式。
+check("文本解耦5 有可重跑的行为级回归(不能只靠字符串断言)",
+      os.path.isfile(os.path.join(PROJECT, "_test_dm_ft_gate.js"))
+      and "总开关关 + fastText 开" in io.open(
+          os.path.join(PROJECT, "_test_dm_ft_gate.js"), encoding="utf-8").read())
+
+# ---------- 3c. 弹幕等级筛选移除 + 画像补图止损(v0.3.1.45dsk) ----------
+# 背景(2026-10-10 实测, 隔离库副本 + 真实接口): 弹幕等级筛选是三条筛选链路里
+# **唯一必须联网**的一条 —— 弹幕接口只给 8 位 midHash, 判等级要「本地逆推 → 候选 mid
+# → 联网查 acc/info」。而一个 8 位哈希平均撞 6.17 个候选(最大 36, 89% 多候选),
+# 一页上千次 B站请求; 档位 A/B 实测 -352 风控占比 92%/96%/100%/100%,
+# 且风控一旦触发就是"全有全无"(隔 1 分钟单发 1 个请求仍 -352)。
+# 更糟的是旧实现把失败的 mid **直接丢弃**: 实测 73 个候选 7.5 秒排空、只落库 26 个,
+# 端到端 60 秒只筛出 2 条 —— 正是用户看到的"一两分钟筛不了三四条"。
+# 处置: 弹幕侧等级筛选删除(等级只保留评论侧, 评论接口自带 level_info, 零请求);
+# 画像链路补上 硬退避 + 失败重入队 + 全请求过闸门 + 前端回问窗口放宽。
+_app_src = io.open(os.path.join(PROJECT, "app.py"), encoding="utf-8").read()
+_sp_src = io.open(os.path.join(PROJECT, "shell_pages.py"), encoding="utf-8").read()
+
+check("止损1 弹幕侧等级筛选已删除(JS 无「等级低」/&lvl=, 且不进 NEED_FLAGS)",
+      "等级低" not in _dm_src and "&lvl=" not in _dm_src
+      and "var NEED_FLAGS = MYSTERY || LOT || EMPTY;" in _dm_src)
+
+check("止损2 后端同步删除(无 lvl 参数 / 不再解析 ?lvl= / 不再回 level 标记)",
+      "def _am_bad(c, want_bio=False, want_lottery=False, want_empty=False):" in _app_src
+      and "def bili_dm_flags(hashes, want_bio=False, want_lottery=False, want_empty=False, multi=1):"
+      in _app_src
+      and 'qs.get("lvl"' not in _app_src
+      and '"level": c.get("level")' not in _app_src)
+
+check("止损3 评论侧等级筛选保留(本地判定, 零请求) —— 不能连坐删掉",
+      "var LV = Number(CF.lvl) || 0;" in _cf_src
+      and "cur <= LV" in _cf_src
+      and '"lvl": min(5, max(0, _cf_lvl))' in _sp_src)
+
+check("止损4 删掉 _mig_am_level27 迁移(它把几百行画像标脏 → 成百上千次 B站请求)",
+      "_mig_am_level27" not in _app_src)
+
+check("止损5 两个 B站请求都过同一个闸门(旧实现只给账号发令牌, 动态那次不限速 → 实测 14 请求/秒)",
+      "_am_gate.acquire()\n        acc, _code = _bili_acc_probe(m)" in _app_src
+      and "_am_gate.acquire()          # 动态接口也过同一个闸门" in _app_src)
+
+check("止损6 风控硬退避档位递增(60→180→600→1800)",
+      app._AM_RISK_COOLDOWN[0] >= 60
+      and all(app._AM_RISK_COOLDOWN[i] < app._AM_RISK_COOLDOWN[i + 1]
+              for i in range(len(app._AM_RISK_COOLDOWN) - 1)))
+
+# 行为: 撞 -352 → 立刻暂停(≈60s); 一次成功 → 清零
+app._am_risk["streak"] = 0
+app._am_risk["pause_until"] = 0.0
+app._am_note_risk(-352)
+_paused = app._am_paused()
+_first = app._am_risk["pause_until"] - time.time()
+app._am_note_ok()
+check("止损7 -352 立刻暂停队列(≈60s), 一次成功即清零",
+      _paused and 55 <= _first <= 65 and not app._am_paused(),
+      "paused=%s first=%.1f" % (_paused, _first))
+
+# 行为: 退避逐次加码并封顶(手动清窗口模拟"窗口过去又撞一次")
+_seen = []
+for _ in range(len(app._AM_RISK_COOLDOWN) + 1):
+    app._am_risk["pause_until"] = 0.0
+    app._am_note_risk(-352)
+    _seen.append(int(round(app._am_risk["pause_until"] - time.time())))
+app._am_note_ok()
+check("止损8 退避逐次加码且封顶在最后一档", _seen[:4] == [60, 180, 600, 1800]
+      and _seen[4] == 1800, _seen)
+
+check("止损9 失败不再丢弃: worker 记入重试表, 由 ticker 退避重排(计数与到期时间分开存)",
+      "def _am_retry_ticker()" in _app_src
+      and "_am_tries[m] = n" in _app_src
+      and "_am_retry[m] = time.time() + _AM_RETRY_DELAY * n" in _app_src
+      and "m in _am_retry:" in _app_src
+      and "am-retry-ticker" in _app_src)
+
+check("止损10 取消网络突发(burst=1) + 队列/单次认领上限放宽",
+      app._am_gate.cap == 1.0
+      and app._AUTHOR_WARM_MAX >= 1000 and app._AUTHOR_WARM_CAP >= 200,
+      "cap=%s max=%s cap_n=%s" % (app._am_gate.cap, app._AUTHOR_WARM_MAX, app._AUTHOR_WARM_CAP))
+
+check("止损11 前端回问窗口 60 秒 → ~10 分钟(否则后台补好了也没人再问)",
+      "RETRY_MAX = 300" in _dm_src
+      and "function retryPending()" in _cf_src
+      and "PEND[String(p[i])] = 1;" in _cf_src)
+
+check("止损12 设置页文案已同步(等级只作用于评论)",
+      "只作用于评论" in _idx_src and "弹幕侧不再提供等级筛选" in _idx_src)
+
+check("止损13 重试链路有可重跑的行为回归(多线程 + 定时, 不塞进本脚本)",
+      os.path.isfile(os.path.join(PROJECT, "_test_am_retry.py")))
+
+check("止损14 三个账号级规则全关时后端直接返回(不逆推、不把候选塞进联网补图队列)",
+      _app_src.count("if not (want_bio or want_lottery or want_empty):") == 2)
 
 # ---------- 4. 启动/打包脚本指向窗口壳 ----------
 gbk = lambda f: io.open(os.path.join(PROJECT, f), encoding="gbk").read()  # noqa: E731
@@ -812,6 +946,49 @@ check("NSIS脚本: 卸载器与添加/删除程序登记",
       "WriteUninstaller" in _nsi and "CurrentVersion\\Uninstall\\${UNKEY}" in _nsi)
 check("NSIS脚本: 数据目录策略(卸载不删用户数据)",
       not re.search(r'RMDir[^\n]*LocalLow', _nsi) and 'RMDir /r "$INSTDIR"' in _nsi)
+
+# ★ v0.3.1.46dsk: 构建安装包.bat 曾依赖 installer-app.spec, 而 .gitignore 第 80 行把
+#   desktop/*.spec 当"每次构建自动生成"的产物忽略掉 —— 那个 spec **从来不在库里**,
+#   一次清理/换机器就没了, 脚本随即在 [1/3] 报 "Spec file not found" 直接失败。
+#   规矩: 构建脚本不许依赖任何未入库的文件; 两条打包路径的参数必须等价。
+_bat_pkg = io.open(os.path.join(PROJECT, "installer", "构建安装包.bat"),
+                   encoding="gbk").read()
+_bat_exe = io.open(os.path.join(PROJECT, "构建exe.bat"), encoding="gbk").read()
+# 只看**命令行**, 不看注释 —— 注释里引用旧写法是解释原因, 不该被判成依赖。
+_bat_pkg_cmds = [ln.strip() for ln in _bat_pkg.splitlines()
+                 if ln.strip() and not ln.strip().lower().startswith("rem")]
+
+
+def _adddata(s):
+    return set(re.findall(r'--add-data "([^"]+)"', s))
+
+
+check("安装包构建1 命令行不许依赖 .spec(它被 .gitignore 忽略, 换机器/清理后就没有)",
+      not any(".spec" in ln for ln in _bat_pkg_cmds)
+      and "--onedir" in _bat_pkg and "--onefile" not in _bat_pkg)
+
+check("安装包构建2 不能裸用 python(机器上的 python 可能解析到没装 PyInstaller 的那个)",
+      'set "PYCMD="' in _bat_pkg and "C:\\Python314\\python.exe" in _bat_pkg
+      and "where py >nul 2>nul" in _bat_pkg
+      # 版本号那步也要走同一个解释器, 否则又会踩到裸 python
+      and "%PYCMD% -c \"import re,io;t=io.open(r'web/index.html'" in _bat_pkg)
+
+check("安装包构建3 PyInstaller 先查再用(已装就别硬联网升级 —— 断网时也能构建)",
+      '%PYCMD% -c "import PyInstaller" >nul 2>nul' in _bat_pkg
+      and "pip install --upgrade pyinstaller" in _bat_pkg)
+
+check("安装包构建4 两条打包路径参数必须等价(不同步会产出坏包)",
+      _adddata(_bat_pkg) == _adddata(_bat_exe) == {
+          "web;web", "extensions;extensions", "WebView2Runtime;WebView2Runtime", "model;model"}
+      and "--hidden-import ftrt" in _bat_pkg and "--hidden-import ftrt" in _bat_exe
+      and "--noconsole" in _bat_pkg and "--noconsole" in _bat_exe
+      and "djxm_icon_128x128.ico" in _bat_pkg and "djxm_icon_128x128.ico" in _bat_exe
+      # 58MB 的模型不该被 UPX 反复尝试压缩(与 spec 的 upx_exclude 一致)
+      and "--upx-exclude ft_model.bin" in _bat_pkg
+      and "--upx-exclude ft_model.bin" in _bat_exe
+      # 载荷形态必须各就各位: 安装包要目录载荷(NSIS File /r), 单文件包要 onefile
+      and "--onedir" in _bat_pkg and "--onefile" in _bat_exe)
+
 import glob
 _exes = [p for p in glob.glob(os.path.join(PROJECT, "dist", "*.exe")) if os.path.isfile(p)]
 _pkgs = [p for p in _exes if "安装包" in os.path.basename(p)]

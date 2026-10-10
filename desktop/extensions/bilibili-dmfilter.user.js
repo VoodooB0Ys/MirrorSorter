@@ -11,9 +11,21 @@
  * 弹幕接口只给 midHash(= crc32(十进制mid) 的8位hex, 2026-10-09 实证), 没有昵称/等级/简介。
  * 所以「弹幕评论筛选」各规则在弹幕侧的落地方式:
  *   · 黑名单  → 壳注入 __MSX_CF__.dmhash(已知 mid 正算出的 hash 集合), O(1) 查表 —— 精确;
- *   · 抽奖/空首页/无简介/等级 → midHash 由壳后台 CRC32 逆推出 mid(/api/bili/dmflags,
+ *   · 抽奖/空首页/无简介 → midHash 由壳后台 CRC32 逆推出 mid(/api/bili/dmflags,
  *     只读本地缓存), 缓存补上后生效; 没逆出来的一律放行 —— 宁可漏杀不误杀。
- *   · 等级用的是壳缓存的账号资料(author_meta.level), 弹幕接口本身不带等级。
+ * ★ 弹幕侧**没有等级筛选**(v0.3.1.45dsk 移除): 弹幕接口不带等级, 要判等级只能靠
+ *   「哈希逆推 → 候选 mid → 联网查账号资料」, 而一个 8 位哈希平均撞出 6 个候选
+ *   (最多 36), 一个播放页就是上千次 B站请求 —— 实测直接把账号打进 -352 风控,
+ *   风控期间该规则反而 100% 失效。等级筛选只保留**评论侧**(评论接口自带
+ *   member.level_info, 纯本地零请求), 见 bilibili-cfilter.user.js。
+ *
+ * ★ v0.3.1.46dsk: 「弹幕屏蔽总开关」(dm_on) 只关**按发送者身份**的规则(黑名单/
+ *   抽奖/空首页/无简介 —— 这些都要认人, 都要查资料)。「快速文本分析」(ft_dm) 判的是
+ *   「这条说了什么」, 跟谁发的一点关系没有, 是**另一条独立通道**, 不受该开关影响。
+ *   设置页对用户就是这么承诺的("与上面的弹幕屏蔽总开关完全独立")。旧代码写成
+ *   `NEED_TEXT = DM_ON && !!CF.ft_dm`, 把两条通道焊死在一起 —— 总开关一关, 文本通道
+ *   连一个请求都不发, fastText 在弹幕侧直接 100% 失效(实测用户 m_dm_on=0 + ft_on=1
+ *   正是这个组合)。评论侧 cfilter 一直是 `!!CF.ft_cf`, 没有这个耦合。
  *
  * 同时承担「弹幕列表」面板的数据源: 解析出的(时间/内容/发送时间/midHash)发布到
  * window.__msxDanmaku, 由 bilibili-ownui 的右栏面板订阅渲染; 面板点某行 →
@@ -54,19 +66,24 @@
   if (!CF || typeof CF !== "object") CF = {};
 
   /* v0.3.1.32: 「弹幕屏蔽总开关」(__MSX_CF__.dm_on, 缺省视为开)。
-     关掉后所有弹幕侧规则一次性失效 —— 不建黑名单表、不问壳要画像(零请求)、
-     blkWhy 恒返回空 → 播放器里的弹幕**原样保留**; 「弹幕列表」面板照旧可用(只是不过滤)。
-     评论筛选走的是 cfilter / ownui, 与这里无关, 不受影响。 */
+     关掉后**按发送者身份**的弹幕规则一次性失效 —— 不建黑名单表、不问壳要画像(零请求)、
+     那几条规则在 blkWhy 里恒不命中 → 播放器里的弹幕**按身份规则看是原样保留**;
+     「弹幕列表」面板照旧可用(只是不过滤)。评论筛选走的是 cfilter / ownui, 与这里无关。
+     ★ v0.3.1.46dsk: 它**管不到**「快速文本分析」(见下面 NEED_TEXT) —— 那是"说了什么",
+       不是"谁发的"。旧注释写的"所有弹幕侧规则一次性失效"正是这个误解的源头。 */
   var DM_ON = CF.dm_on !== false;
 
-  var LV = DM_ON ? (Number(CF.lvl) || 0) : 0;
   var MYSTERY = DM_ON && !!CF.mystery;
   var LOT = DM_ON && !!CF.lottery;
   var EMPTY = DM_ON && !!CF.empty;
-  var NEED_FLAGS = MYSTERY || LOT || EMPTY || LV > 0;
+  /* 账号级规则只剩这三项(都默认关) —— 等级不再进这条链路, 于是默认配置下
+     弹幕侧**一个画像请求都不发**, 纯本地(黑名单查表 + fastText)判定。 */
+  var NEED_FLAGS = MYSTERY || LOT || EMPTY;
   /* v0.3.1.43dsk: 「快速文本分析」对弹幕生效(CF.ft_dm, 由壳在总开关+作用范围都开时注入 true)。
-     与账号画像完全独立 —— 那是"谁发的", 这是"说了什么"。两者可以各自单独开。 */
-  var NEED_TEXT = DM_ON && !!CF.ft_dm;
+     与账号画像完全独立 —— 那是"谁发的", 这是"说了什么"。两者可以各自单独开。
+     ★ v0.3.1.46dsk: 去掉 `DM_ON &&`。总开关管的是"认人"那几条规则, 管不到文本通道;
+       焊在一起会让「关掉弹幕屏蔽总开关但开着 fastText」变成静默失效(见文件头)。 */
+  var NEED_TEXT = !!CF.ft_dm;
   var BLKH = null;                       // 黑名单用户的 midHash 集合(O(1) 查表, 不是逐条扫描)
   if (DM_ON && CF.blk_on && CF.dmhash && CF.dmhash.length) {
     BLKH = Object.create(null);
@@ -165,12 +182,16 @@
   }
 
   /* ---------------- 帐号画像(按 midHash): 只读壳的缓存 ---------------- */
-  var HASHFLAGS = Object.create(null);   // hash -> {mid, mystery, lottery, nodyn, level}
+  var HASHFLAGS = Object.create(null);   // hash -> {mystery, lottery, nodyn, multi}
   var ASKED = Object.create(null);
   var ASK_OFF = 0, ASK_FAST = 1, ASK_WAIT = 100;
   var ASK_N = 0, ASK_OID = "", ASK_TOTAL = 900;   // 每视频最多问 900 个 hash(防画像请求风暴)
-  /* 画像回填后的有限次回问(v0.3.1.28): 见 maybeRetry() */
-  var RETRY = 0, RETRY_MAX = 40, RETRY_GAP = 1500, RETRY_TIMER = 0;
+  /* 画像回填后的回问(v0.3.1.28): 见 maybeRetry()。
+     ★ v0.3.1.45dsk: 窗口从 40×1.5s(60 秒) 放宽到 300×2s(约 10 分钟)。
+     原因: 壳侧的补图是**限速 + 撞风控硬退避**的(退避最长 30 分钟), 60 秒窗口
+     根本等不到画像 —— 后台补好了, 页面却已经停止回问, 用户看到的就是"永远筛不出来"。
+     每轮只是一次本地 HTTP(实测 7~60ms), 代价可忽略。 */
+  var RETRY = 0, RETRY_MAX = 300, RETRY_GAP = 2000, RETRY_TIMER = 0;
 
   function applyFlags(j) {
     if (!j || j.ok !== true) return;
@@ -183,7 +204,7 @@
   function flagsURL(need) {
     var port = String(window.__MSX_PORT__ || "8000");
     return "http://127.0.0.1:" + port + "/api/bili/dmflags?bio=" + (MYSTERY ? 1 : 0)
-      + "&lot=" + (LOT ? 1 : 0) + "&nodyn=" + (EMPTY ? 1 : 0) + "&lvl=" + LV
+      + "&lot=" + (LOT ? 1 : 0) + "&nodyn=" + (EMPTY ? 1 : 0)
       + "&hashes=" + need.join(",");
   }
   function askFlags(hashes, wait) {
@@ -345,7 +366,7 @@
       if (MYSTERY && f.mystery) w = "无简介";
       else if (LOT && f.lottery) w = "抽奖";
       else if (EMPTY && f.nodyn) w = "空首页";
-      else if (LV > 0 && f.level != null && Number(f.level) <= LV) w = "等级低";
+      /* 等级不在这里判: 弹幕接口不带等级, 判它必须联网查账号资料(见文件头)。 */
       if (w) {
         /* v0.3.1.27: 8 位哈希对上多个账号时, 这条是按"候选策略"判的, 不是铁证 —— 标注出来,
            否则用户会以为我们认定了发送者(用户反馈: 一个哈希对上一个空首页账号, 却看不出歧义)。 */
@@ -527,15 +548,23 @@
     if (added) refilter();
   }
 
-  /* 解析 + 按当前已知标记过滤; 返回改写后的字节(null=未改动)与保留的行 */
+  /* 解析 + 按当前已知标记过滤; 返回改写后的字节(null=未改动)与保留的行。
+     ★ v0.3.1.46dsk: 顺带回**本段去重后的文本清单**(texts)。XHR 路径必须拿到它才能
+       给文本通道预热 —— 以前 XHR 只 askFlags, 播放器那条路径压根没喂过文本。 */
   function process(u8) {
     var top = pbTop(u8);
-    if (!top) return { out: null, hashes: [], rows: [], hrows: [], raw: [] };
+    if (!top) return { out: null, hashes: [], texts: [], rows: [], hrows: [], raw: [] };
     var hashes = [], hseen = {}, keep = [], rows = [], hrows = [], raw = [], cut = 0, i;
+    var texts = [], tseen = {};
     for (i = 0; i < top.elems.length; i++) {
       var e = top.elems[i];
       var h = e.o.h ? String(e.o.h).toLowerCase() : "";
       if (h && !hseen[h]) { hseen[h] = 1; hashes.push(h); }
+      var tt = e.o.text;
+      if (tt) {                                    // 与 textsOf() 同一口径: 截 64 字 + 去重
+        if (tt.length > 64) tt = tt.slice(0, 64);
+        if (!tseen[tt]) { tseen[tt] = 1; texts.push(tt); }
+      }
       raw.push(e.o);            // 全部留下(保留的 + 被摘的): 画像回填后要重算分类
       var why = blkWhy(e.o);
       if (why) { cut++; hrows.push({ o: e.o, why: why }); continue; }
@@ -559,7 +588,7 @@
       var off = 0;
       for (j = 0; j < parts.length; j++) { out.set(parts[j], off); off += parts[j].length; }
     }
-    return { out: out, hashes: hashes, rows: rows, hrows: hrows, raw: raw };
+    return { out: out, hashes: hashes, texts: texts, rows: rows, hrows: hrows, raw: raw };
   }
 
   /* fetch 路径: 先问壳要标记(最多等 ASK_WAIT/TXT_WAIT, 超时过就 0 等待), 再同步过滤改写 */
@@ -576,7 +605,7 @@
   }
   function processAsync(u8) {
     var top = pbTop(u8);
-    if (!top) return Promise.resolve({ out: null, hashes: [], rows: [], hrows: [], raw: [] });
+    if (!top) return Promise.resolve({ out: null, hashes: [], texts: [], rows: [], hrows: [], raw: [] });
     var hashes = [], hseen = {};
     for (var i = 0; i < top.elems.length; i++) {
       var h = top.elems[i].o.h;
@@ -751,6 +780,13 @@
                 /* 同样不记账 —— 播放器那次是 ps/pe 窗口, 只覆盖分段的一部分
                    (理由见 fetch 钩子里那段说明)。只有自取的完整分段才记账。 */
                 askFlags(r.hashes, false);
+                /* ★ v0.3.1.46dsk: 文本也要预热。XHR 的 response 必须**同步**给出, 等不了
+                   壳, 所以播放器当次那一段永远用不上"这一轮"的文本判定 —— 但预热出去之后:
+                   ①拖进度条/重看时同一段会再问一次, 那时命中;
+                   ②「弹幕列表」靠 applyText → refilter() 把标记补上。
+                   以前这里只 askFlags 不 askText, 播放器路径等于从没给文本通道喂过数据
+                   (唯一的数据来源是 fetchMissing 自取分段时的预热)。 */
+                askText(r.texts, false);
                 this.__msxDmB = r.out;                    // Uint8Array 或 null(未改动)
                 if (FEED.oid) fetchMissing();             // 播放器在拉弹幕了 → 补齐所有分段
               }

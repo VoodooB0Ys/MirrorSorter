@@ -281,15 +281,47 @@
     return out;
   }
 
+  /* 画像回问(v0.3.1.45dsk): 壳侧补图是限速 + 撞风控硬退避的(退避最长 30 分钟),
+   * 而 ASKED_MIDS 是永久去重 —— 一个 mid 问过一次就再也不问, 于是"补上即生效"
+   * 在同一个页面里其实永远等不到(实测: 60 秒只落库 26/73 个候选, 其余全部丢弃)。
+   * 这里把壳回给我们的 pending 记下来, 按 RETRY_GAP 重问, 直到拿到或超出轮数。
+   * 每轮只是一次本地 HTTP(实测 3~45ms), 代价可忽略。 */
+  var PEND = Object.create(null);
+  var RETRY = 0, RETRY_MAX = 300, RETRY_GAP = 2000, RETRY_TIMER = 0;
+
   function applyFlags(j) {
     if (!j || j.ok !== true) return;
     if (!j.cookie) ASK_OFF = 1;                 // 没登录 B站 → 以后不再问
-    var f = j.flags || {};
-    for (var k in f) {
+    var f = j.flags || {}, k;
+    for (k in f) {
       if (!f[k]) continue;
+      delete PEND[k];                           // 已拿到画像 → 退出回问队列
       if (f[k].lottery) FLAGGED[k] = 1;
       if (f[k].nodyn) EMPTYD[k] = 1;
     }
+    var p = j.pending || [];
+    for (var i = 0; i < p.length; i++) PEND[String(p[i])] = 1;
+    if (Object.keys(f).length) { try { kick(); } catch (e) {} }   // 画像变了 → 立刻重算 DOM
+    retryPending();
+  }
+
+  function retryPending() {
+    if (RETRY_TIMER || RETRY >= RETRY_MAX || ASK_OFF || (!LOT && !EMPTY)) return;
+    var need = [], k;
+    for (k in PEND) need.push(k);
+    if (!need.length) return;
+    RETRY++;
+    RETRY_TIMER = setTimeout(function () {
+      RETRY_TIMER = 0;
+      if (!active()) return;
+      try {
+        fetch(flagsURL(need.slice(0, 60)),
+              { cache: "no-store", credentials: "omit", targetAddressSpace: "loopback" })
+          .then(function (r) { return r.json(); })
+          .then(applyFlags)
+          .catch(function () { retryPending(); });   // 失败也要续上, 否则重问链断掉
+      } catch (e) { retryPending(); }
+    }, RETRY_GAP);
   }
 
   function flagsURL(need) {

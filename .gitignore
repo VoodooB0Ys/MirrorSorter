@@ -97,3 +97,14 @@ desktop/_vis/fasttext_demo/*.json
 !desktop/_ft_ui_test.js
 !desktop/_test_tabstrip_drag_gui.py
 !desktop/_verify_exe.py
+!desktop/_test_am_retry.py
+!desktop/_bench_gear.py
+!desktop/_bench_q.py
+# v0.3.1.46dsk: 弹幕侧 fastText 门控的**行为级**回归(node 沙盒 + 真实 seg.so 字节流)。
+# 静态断言抓不住这次这个 bug —— 出错的是一行完全合法的赋值, 只有真跑钩子看它发没发
+# 请求才能守住。node 是打包链之外的工具, 所以不塞进 test_shell.py, 单独可重跑。
+!desktop/_test_dm_ft_gate.js
+# v0.3.1.46dsk: 打包产物三层验收(归档内容 → 跑沙盒 → 隔离库起 exe)。
+# 版本无关(从 exe 文件名反推), 每版都能跑; 里面"打包内 userscript 与源码字节一致"
+# 这条对**任何**改过 extensions/ 的版本都成立, 是通用回归。
+!desktop/_verify_dmft_gate.py

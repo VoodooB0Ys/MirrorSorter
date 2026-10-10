@@ -241,7 +241,7 @@
         </div>
       </details>
 
-      <footer>洞鉴虚明 v0.3.1.44dsk<br>数据只存本机</footer>
+      <footer>洞鉴虚明 v0.3.1.46dsk<br>数据只存本机</footer>
     </div>
   </aside>
 
@@ -584,7 +584,7 @@
 <div id="commentFilterModal" class="modal hidden">
   <div class="modal-card">
     <header>
-      <span>其他设置 · 弹幕评论筛选 <small>作用于 B站播放页的评论区与弹幕；黑名单/等级/简介为本地规则，抽奖号需登录 B站查动态</small></span>
+      <span>其他设置 · 弹幕评论筛选 <small>作用于 B站播放页的评论区与弹幕；黑名单为本地规则，抽奖 / 空首页号需登录 B站查动态</small></span>
       <button id="cfClose" class="x">✕</button>
     </header>
     <div class="acct-tabs">
@@ -603,11 +603,11 @@
       <div id="cfBili" class="hidden">
         <div class="m-group">
           <label class="m-row"><input type="checkbox" id="cfDmOn" checked><span><b>弹幕屏蔽总开关</b></span></label>
-          <p class="tip">关掉后弹幕原样播放、不再查发送者资料。「弹幕列表」面板仍在（不过滤）。评论筛选不受影响。</p>
+          <p class="tip">关掉后，<b>按发送者身份</b>的弹幕规则（黑名单 / 抽奖账号 / 空首页 / 无简介）全部停止，不再查发送者资料；「弹幕列表」面板仍在（不过滤）。评论筛选不受影响。<br><b>「快速文本分析」的弹幕通道不受本开关影响</b> —— 它管「这条说了什么」，不管「谁发的」，在「快速文本分析」页单独开关。</p>
         </div>
         <div class="m-group">
           <label class="m-row"><input type="checkbox" id="cfBlkOn" checked><span>屏蔽黑名单内用户评论 / 弹幕</span></label>
-          <p class="tip">名单 = 「黑白名单 → 作者」+ 已同步的 B站拉黑。评论、楼中楼、弹幕一并生效。</p>
+          <p class="tip">名单 = 「黑白名单 → 作者」+ 已同步的 B站拉黑。评论、楼中楼、弹幕一并生效。<b>弹幕侧需要「弹幕屏蔽总开关」开着</b>（黑名单属于「按身份」的规则）；评论侧不受该开关影响。</p>
         </div>
         <div class="m-group">
           <label class="m-row"><input type="checkbox" id="cfBlkMystery"><span>屏蔽无简介账号的评论 / 弹幕（空简介，多为机器人）</span></label>
@@ -625,7 +625,7 @@
             </div>
             <span>级的用户评论（默认 2）</span>
           </div>
-          <p class="tip">默认 2 级 = 隐藏 1、2 级评论；选「关」= 不按等级。对打开 / 刷新的播放页生效。弹幕侧只对已缓存资料的发送者生效。</p>
+          <p class="tip">默认 2 级 = 隐藏 1、2 级评论；选「关」= 不按等级。对打开 / 刷新的播放页生效。<b>只作用于评论</b> —— 评论接口自带等级，本地即时判定；弹幕接口不带等级，要判等级只能靠「哈希逆推 → 联网查发送者资料」，而一个 8 位哈希平均撞 6 个候选（最多 36），实测会把账号打进 B站风控、规则反而 100% 失效，因此弹幕侧不再提供等级筛选。</p>
           <div id="cfDmBody">
           <div class="m-row"><span>哈希对上多个账号时</span>
             <div class="row" id="cfMultiRow">
