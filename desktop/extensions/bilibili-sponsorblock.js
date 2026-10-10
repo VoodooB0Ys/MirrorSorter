@@ -123,7 +123,9 @@
     if (!/\/video\//.test(location.pathname)) return;
     load(); paint(); ui();
   }, 1000);
-  setInterval(onTime, 250);
+  /* 250ms 轮询只在播放页跑 —— 之前 onTime() 无条件查 DOM(每 250ms 一次
+     document.querySelector), 在个人空间/首页等非播放页是纯开销。 */
+  setInterval(function () { if (/\/video\//.test(location.pathname)) onTime(); }, 250);
   document.addEventListener("DOMContentLoaded", load);
   window.addEventListener("load", load);
 })();

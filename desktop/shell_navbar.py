@@ -42,6 +42,7 @@ def install_navbar(win, api, top=0, bg_getter=None):
         "url": "", "back": False, "fwd": False, "loading": False,
         "hover": None,        # "back" / "fwd" / "reload"
         "edit": False,        # 地址栏正在编辑(聚焦) —— 期间不覆盖显示值
+        "tb_hover": False,    # 指针在地址栏文字上(未悬停时文字降为 70% 不透明度)
         # 配色: 与标签栏同一套 ui_bg_scheme(watcher 轮询推送)
         "bar": Color.FromArgb(10, 12, 16),
         "hover_bg": Color.FromArgb(30, 34, 44),
@@ -103,6 +104,30 @@ def install_navbar(win, api, top=0, bg_getter=None):
 
     _place_tb()
 
+    # ---- bug7: 地址栏文字不对视 ----
+    # 未悬停/未聚焦时, 地址栏文字不再用满对比的纯白(深色)/纯黑(浅色), 而是把它按
+    # 70% 不透明度混到地址栏底色上; 悬停或聚焦才回到完整对比度。底色/前景跟随配色
+    # 方案变化, 所以这里每次都按当前 st 重算(见 set_scheme)。
+    def _blend(c, bg, k):
+        return Color.FromArgb(int(bg.R + (c.R - bg.R) * k),
+                              int(bg.G + (c.G - bg.G) * k),
+                              int(bg.B + (c.B - bg.B) * k))
+
+    def _apply_tb_fg():
+        try:
+            tb.ForeColor = (st["fg"] if (st["edit"] or st["tb_hover"])
+                            else _blend(st["fg"], st["tb_bg"], 0.7))
+        except Exception:
+            pass
+
+    def _set_tb_hover(v):
+        v = bool(v)
+        if v != st["tb_hover"]:
+            st["tb_hover"] = v
+            _apply_tb_fg()
+
+    _apply_tb_fg()
+
     sf = StringFormat()
     sf.Alignment = StringAlignment.Center
     sf.LineAlignment = StringAlignment.Center
@@ -160,6 +185,11 @@ def install_navbar(win, api, top=0, bg_getter=None):
         if name != st["hover"]:
             st["hover"] = name
             bar.Invalidate()
+        # 地址栏文字的悬停态: 注意指针落到子控件 TextBox 上时本 Panel 会收到
+        # MouseLeave, 所以这里不据 MouseLeave 收尾, 只看坐标(以及 tb 自己的进出)。
+        r = _tb_rect()
+        _set_tb_hover(r[0] <= args.X <= r[0] + r[2] and
+                      r[1] <= args.Y <= r[1] + r[3])
 
     def on_mouse_leave(_sender, _args):
         if st["hover"] is not None:
@@ -178,6 +208,7 @@ def install_navbar(win, api, top=0, bg_getter=None):
     # ---- 地址栏: 回车导航 / Esc 还原 / 失焦还原 / 聚焦全选 ----
     def on_tb_focus(_s=None, _a=None):
         st["edit"] = True
+        _apply_tb_fg()
         try:
             tb.SelectAll()
         except Exception:
@@ -189,6 +220,7 @@ def install_navbar(win, api, top=0, bg_getter=None):
             tb.Text = st["url"]
         except Exception:
             pass
+        _apply_tb_fg()
 
     def on_tb_key(_s, e):
         code = int(e.KeyCode)
@@ -213,6 +245,8 @@ def install_navbar(win, api, top=0, bg_getter=None):
     tb.GotFocus += on_tb_focus
     tb.LostFocus += on_tb_blur
     tb.KeyDown += on_tb_key
+    tb.MouseEnter += lambda _s, _e: _set_tb_hover(True)
+    tb.MouseLeave += lambda _s, _e: _set_tb_hover(False)
     # 编辑期间点击地址栏不再下传按钮命中; 工具栏 Panel 上按下不拖动窗口(与标签栏不同)
 
     bar.Paint += on_paint
@@ -280,7 +314,7 @@ def install_navbar(win, api, top=0, bg_getter=None):
                 try:
                     bar.BackColor = st["bar"]
                     tb.BackColor = st["tb_bg"]
-                    tb.ForeColor = st["fg"]
+                    _apply_tb_fg()      # 未悬停时按新底色重算 70% 混色
                 except Exception:
                     pass
                 bar.Invalidate()
@@ -309,4 +343,24 @@ def install_navbar(win, api, top=0, bg_getter=None):
     if bg_getter:
         threading.Thread(target=scheme_watch, daemon=True, name="msx-navbar-scheme").start()
 
+    def set_fullscreen(on):
+        """bug6: 网页/视频全屏 → 整条导航栏(按钮+地址栏)让位, 整窗只剩视频画面。
+        内容区铺满由 shell_pages 负责; 退出时把本栏重新提到最前。可从任意线程调用。"""
+        def _apply():
+            try:
+                bar.Visible = not bool(on)
+                if not on:
+                    bar.BringToFront()
+            except Exception:
+                pass
+        try:
+            if bar.InvokeRequired:
+                bar.BeginInvoke(WinForms.MethodInvoker(_apply))
+            else:
+                _apply()
+        except Exception:
+            pass
+
+    update.bar = bar      # bug6: 网页全屏时窗口壳要整条隐藏导航栏(按钮+地址栏)
+    update.set_fullscreen = set_fullscreen   # bug6: 窗口壳按网页全屏状态显隐导航栏
     return update

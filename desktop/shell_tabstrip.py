@@ -38,6 +38,7 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
     FG_ON = Color.White
     FG_OFF = Color.FromArgb(150, 158, 172)
     st = {"tabs": [], "active": 0, "hover_btn": None, "hover_tab": None,
+          "drop_hi": False,   # 悬浮窗被拖到标签栏上方 → 整条高亮(提示"松手即合并成标签页")
           "accent": Color.FromArgb(251, 114, 153),   # 默认主题粉; accent_watch 会用设置文件的强调色覆盖
           "bar": Color.FromArgb(10, 12, 16), "tab_active": Color.FromArgb(22, 25, 32),
           "tab_hover": Color.FromArgb(30, 34, 44), "fg_on": Color.FromArgb(226, 230, 238),
@@ -149,6 +150,16 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
             else:
                 g.DrawString(sym, btn_font, SolidBrush(st["fg_on"]),
                              RectangleF(float(bx), 0.0, float(bw), float(bar_h)), sf_c)
+        # 悬浮窗拖到标签栏上方 → 整条染色 + 强调色描边(松手即合并成标签页)
+        if st.get("drop_hi"):
+            try:
+                ac = st["accent"]
+                g.FillRectangle(SolidBrush(Color.FromArgb(40, ac.R, ac.G, ac.B)),
+                                0.0, 0.0, float(strip.Width), float(bar_h))
+                g.DrawRectangle(Pen(ac, max(1.0, 2.0 * scale)),
+                                1.0, 1.0, float(strip.Width - 2), float(bar_h - 2))
+            except Exception:
+                pass
 
     BTN_W = lambda: int(36 * scale)   # ─ □ ✕ 窗口按钮宽
 
@@ -166,6 +177,12 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
     # 普通窗口永远不会被 shell 判成"独占全屏", 自动隐藏任务栏照常呼出。
     # 矩形向下多出2px(屏幕外不可见), 与屏幕矩形错开双保险; 常驻任务栏机器铺工作区。
     fill_state = {"saved": None}   # 非None = 处于拉伸全屏态, 存还原位置
+    # bug6: 网页(视频)全屏中 —— 标签栏/贴边热区隐藏, 画面铺满整窗
+    fs_state = {"on": False}
+    # bug10: 贴边热区面板固定用窗体底色(不再是标签栏底色)。它们压在页面边缘 4px 上,
+    # 白天/浅色主题下原先会跟着标签栏变浅 → 播放页四周一圈浅色边框(用户报"白色边框,
+    # 窗口好像可被选中")。取窗体 BackColor(init_ui: 15,17,21), 与控件缝隙同色不可见。
+    EDGE_COLOR = Color.FromArgb(15, 17, 21)
 
     def _fill_bounds():
         scr = WinForms.Screen.FromControl(form)
@@ -183,7 +200,8 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
     def sync_edges():
         try:
             vis = (form.WindowState != WinForms.FormWindowState.Maximized
-                   and fill_state["saved"] is None)
+                   and fill_state["saved"] is None
+                   and not fs_state["on"])   # bug6: 视频全屏时热区也要让开(否则左缘显缩放光标)
             for p in edge_panels:
                 p.Visible = vis
         except Exception:
@@ -237,10 +255,23 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
         except Exception:
             pass
 
+    # 拖出成悬浮窗(v0.3.1.34): 在可关闭标签上按下并拖动超过阈值 → api.tab_detach。
+    # fired 标记用于吞掉随后的 MouseClick, 避免"拖出后顺手把标签切了/关了"。
+    drag = {"tid": None, "x": 0, "y": 0, "armed": False, "fired": False}
+
     def on_mouse_down(_sender, args):
         if args.Button != WinForms.MouseButtons.Left:
             return
-        if _btn_at(args.X) is not None or _hit_tab(args.X, args.Y) is not None:
+        if _btn_at(args.X) is not None:
+            return
+        t = _hit_tab(args.X, args.Y)
+        if t is not None:
+            if t.get("closable"):
+                drag["tid"] = t["id"]
+                drag["x"] = args.X
+                drag["y"] = args.Y
+                drag["armed"] = True
+                drag["fired"] = False
             return
         if (args.Y <= int(4 * scale) and
                 form.WindowState != WinForms.FormWindowState.Maximized):
@@ -249,6 +280,19 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
         _nc_drag(2)   # HTCAPTION: 空白区拖动窗口
 
     def on_mouse_move(_sender, args):
+        if drag["armed"]:
+            if WinForms.Control.MouseButtons & WinForms.MouseButtons.Left:
+                if abs(args.X - drag["x"]) + abs(args.Y - drag["y"]) > int(22 * scale):
+                    drag["armed"] = False
+                    drag["fired"] = True
+                    tid = drag["tid"]
+                    if tid is not None:
+                        try:
+                            api.tab_detach(tid)   # 标签 → 独立悬浮窗(控件实例不变)
+                        except Exception:
+                            pass
+            else:
+                drag["armed"] = False
         name = _btn_at(args.X)
         if name != st["hover_btn"]:
             st["hover_btn"] = name
@@ -260,6 +304,7 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
             strip.Invalidate()
 
     def on_mouse_leave(_sender, _args):
+        drag["armed"] = False
         ch = False
         if st["hover_btn"]:
             st["hover_btn"] = None
@@ -283,6 +328,9 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
             pass
 
     def on_mouse_click(_sender, args):
+        if drag["fired"]:   # 刚拖出成悬浮窗 → 吞掉这次点击(不误切/误关)
+            drag["fired"] = False
+            return
         name = _btn_at(args.X)
         if name is not None:
             on_window_btn(name)
@@ -340,7 +388,7 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
                 try:
                     strip.BackColor = st["bar"]
                     for p in edge_panels:
-                        p.BackColor = st["bar"]
+                        p.BackColor = EDGE_COLOR   # bug10: 不再跟随标签栏底色
                 except Exception:
                     pass
                 strip.Invalidate()
@@ -398,7 +446,7 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
             #      缩放带永远收不到鼠标 → 自己贴边放热区, 按下进入系统缩放循环 ----
             def edge(name, loc, size, anchor, cursor):
                 p = WinForms.Panel()
-                p.BackColor = BG
+                p.BackColor = EDGE_COLOR
                 p.Location = loc
                 p.Size = size
                 p.Anchor = anchor
@@ -461,6 +509,45 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
         else:
             _repaint()
 
+    def highlight(on):
+        """拖拽悬浮窗经过标签栏时整条高亮 —— "松手即合并成标签页"的落点提示
+        (shell_float._hint 调用; 可从任意线程调用, 内部 marshal 到 UI 线程重绘)。"""
+        def _apply():
+            try:
+                st["drop_hi"] = bool(on)
+                strip.Invalidate()
+            except Exception:
+                pass
+        try:
+            if strip.InvokeRequired:
+                strip.BeginInvoke(WinForms.MethodInvoker(_apply))
+            else:
+                _apply()
+        except Exception:
+            pass
+
+    def set_fullscreen(on):
+        """bug6: 网页/视频全屏 → 隐藏标签栏与贴边热区, 内容区交给 shell_pages 铺满客户区
+        (整窗只剩画面); 退出时按当前窗口状态还原。可从任意线程调用。"""
+        def _apply():
+            try:
+                fs_state["on"] = bool(on)
+                strip.Visible = not fs_state["on"]
+                if not fs_state["on"]:
+                    strip.BringToFront()
+                sync_edges()
+            except Exception:
+                pass
+        try:
+            if strip.InvokeRequired:
+                strip.BeginInvoke(WinForms.MethodInvoker(_apply))
+            else:
+                _apply()
+        except Exception:
+            pass
+
+    update.set_fullscreen = set_fullscreen   # bug6: 窗口壳按网页全屏状态显隐标签栏
+    update.highlight = highlight      # 悬浮窗拖拽落点提示(shell_float 拖拽期间调用)
     update.fill_toggle = _toggle_max   # 窗口化全屏开关(测试可直调; app_window 只用调用签名)
     update.bar_h = bar_h               # 标签栏逻辑高度(app_window 定位导航工具栏用)
     return update

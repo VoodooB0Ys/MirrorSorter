@@ -33,26 +33,34 @@ import app  # noqa: E402  本地服务(纯标准库)
 APP_NAME = "洞鉴虚明"
 APP_VER = app.APP_VER
 
-# ── 整屏截屏黑屏根治(浏览器级, v0.3.1.8dsk) ──────────────────────────────────
+# ── 整屏截屏黑屏根治 ─────────────────────────────────────────────────────────
 # 症状: 微信/QQ/PrntScr 等 GDI BitBlt 截屏, 播放器区域整块黑(概率性; 开不开超分都黑)。
 # 根因(实证定位): Chromium 经 **DirectComposition** 把视频层当独立平面呈现到屏幕,
 #   GDI 系截屏读不到该平面 → 截到黑色播放器背景; 窗口/全屏都会犯, 全屏更频繁。
 # 关键实证(本机 2560x1600, `_fs_cap.py` 连发 BitBlt 判黑):
-#   · 只带 --disable-direct-composition-video-overlays → 8/8、5/8 黑(现网配置, 无效)
-#     —— 该开关在 Chromium 154 上已挡不住视频层; 页内 border-radius 也只是启发式。
-#   · 加 --disable-direct-composition → 窗口 0/10、全屏 0/10, 黑帧清零。
-#   · 该开关只把浏览器"呈现到窗口"这一步从 DComp 换回普通路径, **GPU 渲染照旧**:
-#     带它跑超分, 探针仍报 mode=acnet/高/2x、canvas 1724x969 已建, 管线正常。
-#   · 反例: --disable-gpu 也能清零, 但整条渲染退回软件(视频/弹幕极卡、超分 WebGL 报废),
-#     故不采用; --disable-gpu-compositing 会把全屏窗口截成空白, 亦不采用。
-# 代价: 合成多一次拷贝, 桌面场景可忽略。所有 WebView2 控件(主控件+标签页)一并生效。
-# setdefault: 用户若自己设了该环境变量则以用户的为准。
+#   · 只带 --disable-direct-composition-video-overlays → 8/8、5/8 黑(无效; Chromium 154
+#     上这条开关已挡不住视频层, 页内 CSS 圆角才是真正的硬条件)。
+#   · 加 --disable-direct-composition → 黑帧清零, 但它把"呈现到窗口"整条从 DComp 换回
+#     传统路径: 大窗口 + 弹幕(大量 DOM 动画)时合成代价暴涨, 用户实测"特别特别卡"
+#     → **v0.3.1.9dsk 已回退**, 见下。
+#   · --disable-gpu 也清零, 但渲染全退软件(极卡、超分 WebGL 报废); --disable-gpu-
+#     compositing 会把全屏窗口截成空白 —— 均不采用。
+# ★ v0.3.1.9dsk 改为**页内根治**(零性能代价): 给播放器 <video> 一个视觉无感的
+#   0.5px 圆角, 使其在 Chromium 的 overlay 候选判定里**失去独立平面资格**
+#   (带圆角裁剪的 quad 一律不提升为 overlay), 视频帧并入主合成面 → 既能被 GDI
+#   截屏取到, 又完全保留 DComp/GPU 合成。实现见 shell_pages.py 的无条件样式注入
+#   (与 ui_sr/ui_ownui 开关无关: 用户实证"不开超分也黑")。
+#   这里保留旧开关作冗余声明(无害); setdefault: 用户自设该环境变量则以用户的为准。
 os.environ.setdefault("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-                      "--disable-direct-composition-video-overlays "
-                      "--disable-direct-composition")
+                      "" if os.environ.get("MSX_BASIC") == "1"
+                      else "--disable-direct-composition-video-overlays")
 MAIN_W, MAIN_H = 1440, 920
 MAIN_MIN = (1080, 700)
 BG_DARK = "#0f1115"   # 与 web/style.css 暗色 --bg 一致, 避免窗口加载瞬间白闪
+# 窗体(控件底衬)背景色: 外部页签左侧留白露出来的就是它。取 B站播放页夜间背景色,
+# 这样播放页左边那条留白与页面自身底色连成一片(用户本轮要求: 不要再出现另一种底色)。
+# 数值取自用户实机截图采样: 页面底色 rgb(23,24,26)。
+BG_PAGE = "#17181a"
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
@@ -261,9 +269,11 @@ class ShellApi:
         self._visible_id = self.HOME_ID
         self._strip_update = None  # 原生标签栏重绘回调, bind_strip() 注入
         self._navbar_update = None  # 导航工具栏重绘回调, bind_navbar() 注入
+        self._floats = None       # 独立悬浮窗管理器(shell_float), bind_floats() 注入
         self._lock = threading.Lock()
+        # float=True 的标签不在主窗口标签栏显示, 而由独立悬浮窗承载(见 shell_float.py)
         self._tabs = [{"id": self.HOME_ID, "url": None, "title": "信息流",
-                       "pinned": True, "opened": True}]
+                       "pinned": True, "opened": True, "float": False}]
         self._active = self.HOME_ID
         self._next_id = 1
 
@@ -276,28 +286,131 @@ class ShellApi:
     # ---- 桥: 前端探测(存在即说明跑在桌面壳里) ----
     def shell_info(self):
         return {"name": "desktop-shell", "version": APP_VER.lstrip("v"),
-                "embedded_browser": True, "tabs": True}
+                "embedded_browser": True, "tabs": True,
+                "windows": True, "new_window": self._new_window_enabled()}
+
+    def _new_window_enabled(self):
+        """「信息以新窗口形式打开」开关(设置键 ui_new_window, 默认开)。"""
+        try:
+            return app.sget("ui_new_window") != "0"
+        except Exception:
+            return True
+
+    # ---- 桥: 另存为(导出设置用) ----
+    def save_text(self, filename, text):
+        """把文本写到用户选定的路径(原生「另存为」对话框)。
+
+        壳里没接 WebView2 的 DownloadStarting, 页面里 `<a download>` + Blob 点了
+        没反应(用户 2026-10-09 反馈「下载json文件怎么不生效啊」), 所以桌面壳改走
+        原生对话框。返回 "ok:<路径>" / "cancel" / "err:<原因>"。"""
+        name = (filename or "").strip() or "导出.json"
+        try:
+            body = text if isinstance(text, str) else str(text or "")
+        except Exception:
+            return "err:bad-text"
+        win = self._win
+        if win is None:
+            return "err:no-window"
+        try:
+            import System.Windows.Forms as WinForms
+            form = win.native
+        except Exception as e:
+            return "err:no-ui(%r)" % (e,)
+        box = {}
+
+        def _ask():
+            try:
+                dlg = WinForms.SaveFileDialog()
+                dlg.Title = "保存导出文件"
+                dlg.FileName = name
+                dlg.Filter = "JSON 文件 (*.json)|*.json|所有文件 (*.*)|*.*"
+                dlg.RestoreDirectory = True
+                # 默认目录: 用户「下载」夹(没有就桌面/文档), 别让对话框落在程序自己的目录里
+                _home = os.path.expanduser("~")
+                for _d in ("Downloads", "Desktop", "Documents"):
+                    _p = os.path.join(_home, _d)
+                    if os.path.isdir(_p):
+                        try:
+                            dlg.InitialDirectory = _p
+                        except Exception:
+                            pass
+                        break
+                res = dlg.ShowDialog(form)
+                box["res"] = res
+                try:
+                    box["ok"] = int(res) == 1     # DialogResult.OK == 1
+                except Exception:
+                    box["ok"] = str(res).upper().endswith("OK")
+                box["path"] = dlg.FileName
+            except Exception as e:
+                box["err"] = repr(e)
+
+        try:
+            if getattr(form, "InvokeRequired", False):
+                form.Invoke(WinForms.MethodInvoker(_ask))   # marshal 到 UI 线程(弹模态框)
+            else:
+                _ask()
+        except Exception as e:
+            return "err:invoke(%r)" % (e,)
+        if box.get("err"):
+            return "err:" + str(box["err"])
+        if not box.get("ok"):
+            return "cancel"
+        path = box.get("path") or ""
+        if not path:
+            return "cancel"
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(body)
+        except Exception as e:
+            return "err:" + repr(e)
+        return "ok:" + path
 
     # ---- 桥: 打开/切换/关闭标签页(app.js openExternal 走 open_in_app) ----
-    def open_in_app(self, url, title=""):
+    def open_in_app(self, url, title="", mode=None):
+        """打开链接。mode=None → 按设置(默认「新窗口」); "tab"/"window" 强制指定。
+        新窗口模式: 建独立悬浮窗承载页面; 标签模式: 老行为(主窗口内新标签)。"""
         url = (url or "").strip()
         if not _URL_RE.match(url):
             return "bad-url"
+        if mode not in ("tab", "window"):
+            mode = "window" if self._new_window_enabled() else "tab"
+        want_float = (mode == "window")
+        if _DIAG["trace_open"]:   # 仅 e2e 自测时落盘, 免得平时刷日志
+            _log_line("open_in_app mode=%r want_float=%s pages=%s mgr=%s url=%s" % (
+                mode, want_float, self._pages is not None, self._floats is not None, url))
         with self._lock:
-            for t in self._tabs:
-                if t["url"] == url:   # 同一链接只占一个标签, 重复点=切过去(不重载)
-                    self._active = t["id"]
-                    tab = t
-                    break
-            else:
+            tab = next((t for t in self._tabs if t["url"] == url), None)   # 同链接去重
+            if tab is None:
                 tab = {"id": self._next_id, "url": url,
-                       "title": (title or url)[:24], "pinned": False, "opened": False}
+                       "title": (title or url)[:24], "pinned": False,
+                       "opened": False, "float": want_float}
                 self._tabs.append(tab)
-                self._active = self._next_id
                 self._next_id += 1
-        self._activate(tab)
+                if not want_float:
+                    self._active = tab["id"]
+        if tab.get("float"):
+            self._open_float(tab)
+        else:
+            self._activate(tab)
         self._render()   # 即时反馈: 标签栏立刻高亮新标签(不等页面加载完)
         return "ok"
+
+    def _open_float(self, tab):
+        """把标签的页面放进一个独立悬浮窗(控件池缺失时退化为主窗口标签)。"""
+        pages, mgr = self._pages, self._floats
+        if pages is None or mgr is None:
+            _log_line("open-float 降级为标签: pages=%s mgr=%s" % (pages is not None,
+                                                                mgr is not None))
+            tab["float"] = False
+            with self._lock:
+                self._active = tab["id"]
+            self._activate(tab)
+            return
+        if not tab["opened"]:
+            tab["opened"] = True
+            pages.create(tab["url"], tab["id"])
+        mgr.open(tab, pages)
 
     def tab_switch(self, tid=None):
         try:
@@ -324,16 +437,95 @@ class ShellApi:
                 return "gone"
             if self._tabs[idx]["pinned"]:
                 return "pinned"
-            dead = self._tabs.pop(idx)
-            if self._active == tid:   # 关的是当前页 → 激活前一个, 没有则回信息流
-                self._active = self._tabs[max(0, idx - 1)]["id"]
-            nxt = next(x for x in self._tabs if x["id"] == self._active)
-        self._activate(nxt)          # 先显示邻居, 再销毁旧控件(避免黑屏)
+            is_float = bool(self._tabs[idx].get("float"))
+            self._tabs.pop(idx)
+            if not is_float and self._active == tid:   # 关的是主窗口当前页 → 激活前一个
+                prev = next((x for x in reversed(self._tabs[:idx])
+                             if not x.get("float")), None)
+                self._active = prev["id"] if prev else self.HOME_ID
+            nxt = next((x for x in self._tabs
+                        if x["id"] == self._active and not x.get("float")), None)
+            if nxt is None:   # 激活项是悬浮标签/已消失 → 兜底回信息流
+                self._active = self.HOME_ID
+                nxt = next((x for x in self._tabs if x["id"] == self.HOME_ID), None)
+        if is_float and self._floats is not None:
+            self._floats.close(tid)   # 摘出控件并销毁悬浮窗(控件随后由控件池销毁)
+        if nxt is not None:
+            self._activate(nxt)       # 先显示邻居, 再销毁旧控件(避免黑屏)
         if self._pages is not None:
             self._pages.dispose(tid)
-            # 销毁兜底: WebView2(DirectComposition)销毁偶发打断窗口合成层, 内容区整块
-            # 变黑而标签栏正常(用户截图) —— 强制再补一次邻居可见+焦点, 让其重新present。
-            self._pages.show(self._active)
+            if nxt is not None:
+                # 销毁兜底: WebView2(DirectComposition)销毁偶发打断窗口合成层, 内容区整块
+                # 变黑而标签栏正常(用户截图) —— 强制再补一次邻居可见+焦点, 让其重新present。
+                self._pages.show(self._active)
+        self._render()
+        return "ok"
+
+    def tab_detach(self, tid=None):
+        """把主窗口里的标签页拽出成独立悬浮窗(标签栏拖拽 → 这里)。
+        控件实例不变(不重载); 被拖出的标签不再出现在标签栏。"""
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            return "bad-id"
+        with self._lock:
+            t = next((x for x in self._tabs if x["id"] == tid), None)
+            if t is None:
+                return "gone"
+            if t["pinned"]:
+                return "pinned"
+            if t.get("float"):
+                return "already"
+        # ⚠️ bug2: 这里曾用 _new_window_enabled() 把拖出一并挡掉(返回 "off")。
+        # 「信息以新窗口形式打开」只决定"点开信息"默认怎么打开(见 open_in_app), 不该把
+        # "把已有标签页拽成悬浮窗"这条入口一起关掉 —— 该开关关掉后依然要能拖出。
+        pages, mgr = self._pages, self._floats
+        if pages is None or mgr is None:
+            return "no-pages"
+        with self._lock:
+            was_active = (self._active == tid)
+            t["float"] = True
+            if was_active:   # 主窗口切到相邻标签(没有则回信息流)
+                nxt = next((x for x in self._tabs
+                            if x["id"] != tid and not x.get("float")), None)
+                self._active = nxt["id"] if nxt else self.HOME_ID
+            active_tab = next((x for x in self._tabs
+                               if x["id"] == self._active and not x.get("float")), None)
+        # 顺序关键: 先把主窗口切走(隐藏该控件) → 再把它迁进悬浮窗, 否则 hide 会把
+        # 悬浮窗里的控件一起隐藏。
+        if active_tab is not None:
+            self._activate(active_tab)
+        if not t["opened"]:
+            t["opened"] = True
+            pages.create(t["url"], tid)
+        try:
+            mgr.open(t, pages)
+        except Exception:   # 悬浮窗创建失败时别把 pywebview 的 'Uncaught' 丢给用户: 记栈并回因
+            import traceback as _tb
+            _tb.print_exc()
+            _log_exc("tab_detach/float-open")
+            return "float-open-failed: " + (_tb.format_exc().strip().splitlines() or [""])[-1]
+        self._render()
+        return "ok"
+
+    def window_dock(self, tid=None):
+        """把悬浮窗塞回主窗口变成一个标签页(悬浮窗迷你标题栏 ⤓)。"""
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            return "bad-id"
+        with self._lock:
+            t = next((x for x in self._tabs if x["id"] == tid), None)
+            if t is None:
+                return "gone"
+            if not t.get("float"):
+                return "not-float"
+        if self._floats is not None:
+            self._floats.dock(tid)    # 控件迁回主窗口(隐藏), 销毁悬浮窗
+        with self._lock:
+            t["float"] = False
+            self._active = tid
+        self._activate(t)             # 显示到主窗口内容区 + 补推导航状态
         self._render()
         return "ok"
 
@@ -405,8 +597,8 @@ class ShellApi:
     def _activate(self, tab):
         """显示 tab(无控件则异步创建), 隐藏当前控件 —— 纯可见性切换, 页面零重载。"""
         pages = self._pages
-        if pages is None:
-            return
+        if pages is None or tab.get("float"):
+            return   # 悬浮标签不在主窗口显示(由 shell_float 承载)
         with self._lock:
             prev_id = self._visible_id
             self._visible_id = tab["id"]
@@ -419,14 +611,18 @@ class ShellApi:
         pages.push_nav(tab["id"])   # 切标签后补推导航状态(防地址栏显示旧 URL)
 
     def update_title(self, tab_key, title):
-        """站点控件的 DocumentTitleChanged 回调 → 刷新标签标题。"""
+        """站点控件的 DocumentTitleChanged 回调 → 刷新标签标题(悬浮窗同步迷你标题栏)。"""
         title = str(title or "").strip()[:24]
         if not title:
             return
+        is_float = False
         with self._lock:
             t = next((x for x in self._tabs if x["id"] == tab_key), None)
             if t is not None and not t["pinned"]:
                 t["title"] = title
+                is_float = bool(t.get("float"))
+        if is_float and self._floats is not None:
+            self._floats.set_title(tab_key, title)
         self._render()
 
     def bind_pages(self, pages):
@@ -434,6 +630,10 @@ class ShellApi:
         self._pages = pages
         self._activate(self._tabs[0])
         self._render()
+
+    def bind_floats(self, mgr):
+        """注入悬浮窗管理器(shell_float.install_floats 的返回值)。"""
+        self._floats = mgr
 
     def bind_strip(self, update_fn):
         """注入原生标签栏重绘回调(shell_tabstrip.install_strip 的返回值)。"""
@@ -466,15 +666,19 @@ class ShellApi:
             pass
 
     def _render(self):
-        """把标签表同步到原生标签栏(跨线程安全, 由 strip 侧 marshal 到 UI 线程)。"""
+        """把标签表同步到原生标签栏(跨线程安全, 由 strip 侧 marshal 到 UI 线程)。
+        悬浮标签(float)不在标签栏显示 —— 它们由独立悬浮窗承载。"""
         fn = self._strip_update
         if fn is None:
             return
         try:
             with self._lock:
                 tabs = [{"id": t["id"], "title": t["title"] or "页面",
-                         "closable": not t["pinned"]} for t in self._tabs]
+                         "closable": not t["pinned"]}
+                        for t in self._tabs if not t.get("float")]
                 active = self._active
+            if not any(t["id"] == active for t in tabs):
+                active = self.HOME_ID
             fn(tabs, active)
         except Exception:
             pass
@@ -505,6 +709,12 @@ def main(argv=None):
             e2e_url = argv[argv.index("--e2e-open") + 1]
         except IndexError:
             e2e_url = None
+    e2e_float_url = None
+    if "--e2e-float" in argv:  # 测试钩子: 走一遍 新窗口→塞回标签页→拖出→关闭 全链路
+        try:
+            e2e_float_url = argv[argv.index("--e2e-float") + 1]
+        except IndexError:
+            e2e_float_url = None
     # 悬浮球模式: frozen exe 再入自身时走这里; 源码模式 float_ball_spawn 直接调 app.py
     if "--float-ball" in argv:
         try:
@@ -530,7 +740,7 @@ def main(argv=None):
             return 0 if port is not None else 1
         _serve_forever_cli(server)
         return 0
-    return shell_main(e2e_url=e2e_url)
+    return shell_main(e2e_url=e2e_url, e2e_float_url=e2e_float_url)
 
 
 def _install_mouse_side_buttons(api, win):
@@ -614,7 +824,203 @@ def _install_mouse_side_buttons(api, win):
                      name="msx-side-btn-hook").start()
 
 
-def shell_main(e2e_url=None):
+_DIAG = {"trace_open": False}   # e2e 自测打开它 → open_in_app 的决策落盘(平时不写)
+
+
+def _log_line(msg):
+    """诊断行落盘(打包 exe 无 stdout): 排查"某个部件没装上/走了降级分支"。"""
+    try:
+        with open(os.path.join(app.DATA_DIR, "shell_err.log"), "a",
+                  encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
+def _log_exc(tag):
+    """窗口壳里的异常落盘: 打包后的 exe 是 --noconsole(无 stdout), print 会丢,
+    排查"某个部件没装上"时看不到原因 —— 这里同时 print 与写 <数据目录>/shell_err.log。"""
+    import traceback
+    try:
+        traceback.print_exc()
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(app.DATA_DIR, "shell_err.log"), "a",
+                  encoding="utf-8") as f:
+            f.write("\n==== %s ====\n" % tag)
+            traceback.print_exc(file=f)
+    except Exception:
+        pass
+
+
+def _e2e_float_run(api, url):
+    """v0.3.1.34 自测: 新窗口 → 塞回标签页 → 拖出悬浮窗 → 关闭, 每步 dump 控件归属
+    (父窗体标题/可见性 + 悬浮窗存在性), 验证控件实例跨窗口迁移、页面不重载。
+
+    打包后的 exe 是 --noconsole(无 stdout), 所以除了 print 还落一份到
+    <数据目录>/float_e2e.log —— 打包产物也能被同一套断言验证。
+    """
+    log_path = os.path.join(app.DATA_DIR, "float_e2e.log")
+    _DIAG["trace_open"] = True   # 打开 open_in_app 决策落盘
+
+    def say(msg):
+        try:
+            print(msg, flush=True)
+        except Exception:
+            pass
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+
+    def dump(tag):
+        with api._lock:
+            tabs = [{"id": t["id"], "float": bool(t.get("float")),
+                     "opened": t["opened"]} for t in api._tabs]
+        ctrls = getattr(api._pages, "ctrls", None) or {}
+        info = []
+        for k, c in list(ctrls.items()):
+            if c is None:
+                continue
+            try:
+                par = c.Parent
+                info.append("%s->%s(vis=%s)" % (
+                    k, (par.Text if par is not None else "None"), c.Visible))
+            except Exception as e:
+                info.append("%s->err:%r" % (k, e))
+        mgr = api._floats
+        fex = [t["id"] for t in tabs if t["float"] and mgr is not None
+               and mgr.exists(t["id"])]
+        say("[float-e2e] %s tabs=%s ctrls=%s floats=%s" % (tag, tabs, info, fex))
+
+    time.sleep(8)   # 等主窗口与服务就绪
+    say("[float-e2e] init floats=%s new_window=%s tabs=%s" % (
+        api._floats is not None, api._new_window_enabled(),
+        [(t["id"], t.get("url")) for t in api._tabs]))
+    _su = getattr(api, "_strip_update", None)
+    say("[float-e2e] strip: bar_h=%s highlight=%s" % (
+        getattr(_su, "bar_h", None), callable(getattr(_su, "highlight", None))))
+    say("[float-e2e] open -> %s" % api.open_in_app(url, "E2E 悬浮窗", mode="window"))
+    time.sleep(6)
+    dump("after-open")
+    # 优先挑**我们自己开的**那个悬浮窗(信息流可能自动把别的链接也弹成了悬浮窗)
+    fid = next((t["id"] for t in api._tabs if t.get("float") and t.get("url") == url), None)
+    if fid is None:
+        fid = next((t["id"] for t in api._tabs if t.get("float")), None)
+    if fid is None:
+        say("[float-e2e] no float tab")
+        return
+
+    # ---- 拖到标签栏松手即合并(真实鼠标手势: 光标按下在迷你标题栏 → 移到标签栏 → 松手) ----
+    merged = _e2e_drag_to_tabbar(api, fid, say)
+    time.sleep(4)
+    dump("after-drag-merge")
+
+    def _is_float(tab_id):
+        """按 id 查标签(标签 id 不连续, 不能当列表下标用)。"""
+        with api._lock:
+            t = next((x for x in api._tabs if x["id"] == tab_id), None)
+        return None if t is None else bool(t.get("float"))
+
+    still_float = _is_float(fid)
+    say("[float-e2e] drag-merge -> merged=%s (still_float=%s)" % (merged, still_float))
+    if still_float:
+        # 输入注入在某些会话/无头环境不可用 → 退回按钮路径, 保证后续步骤仍被验证
+        say("[float-e2e] drag-merge 未生效, 回退 window_dock: %s" % api.window_dock(fid))
+        time.sleep(4)
+        dump("after-dock-fallback")
+    say("[float-e2e] detach -> %s" % api.tab_detach(fid))
+    time.sleep(4)
+    dump("after-detach")
+    say("[float-e2e] close -> %s" % api.tab_close(fid))
+    time.sleep(3)
+    dump("after-close")
+    say("[float-e2e] DONE")
+
+
+def _e2e_drag_to_tabbar(api, tid, say):
+    """模拟"拽着悬浮窗标题栏拖到主窗口标签栏松手"的完整鼠标手势。
+
+    做法: 把**真实光标**移到主窗口标签栏区域, 再用 SendMessage 往悬浮窗迷你标题栏投递
+    LEFTDOWN/MOUSEMOVE/LBUTTONUP —— shell_float 的拖动与落点判定读的是
+    `WinForms.Cursor.Position`(而不是消息坐标), 所以这样投递等价于真人拖拽。
+    返回 True 表示松手后确实合并成了标签页。
+    """
+    try:
+        import ctypes
+        import System.Windows.Forms as WinForms
+        from System.Drawing import Point as SPoint
+        u32 = ctypes.windll.user32
+        mgr = api._floats
+        c = api._pages.control(tid)
+        if mgr is None or c is None or c.Parent is None:
+            return False
+        form = c.Parent
+        bar = None
+        for i in range(form.Controls.Count):   # 迷你标题栏 = 第一个 Dock=Top 的 Panel
+            ctl = form.Controls[i]
+            try:
+                if ctl.Dock == WinForms.DockStyle.Top:
+                    bar = ctl
+                    break
+            except Exception:
+                pass
+        if bar is None:
+            return False
+        main = api._win.native
+        tabstrip_h = int(getattr(getattr(api, "_strip_update", None), "bar_h", 0) or 0)
+        if tabstrip_h <= 0:
+            say("[float-e2e] drag: tabstrip_h 未知, 放弃鼠标手势")
+            return False
+        # 1) 光标落点 = 主窗口标签栏中部(落点判定看的就是它)
+        dst = main.PointToScreen(SPoint(int(main.ClientSize.Width * 0.5),
+                                        int(tabstrip_h * 0.5)))
+        # 2) 按下点 = 悬浮窗迷你标题栏左侧空白(避开右侧两枚按钮)
+        src = form.PointToScreen(SPoint(int(60 * float(getattr(main, "_scale", 1.0) or 1.0)),
+                                        max(6, tabstrip_h // 2)))
+        # 3) 顺带用探针记录落点高亮(update.highlight)被调用的时序, 验证提示真的亮过
+        su = getattr(api, "_strip_update", None)
+        seen, orig = [], getattr(su, "highlight", None)
+        if orig is not None:
+            def spy(on):
+                seen.append(bool(on))
+                return orig(on)
+            su.highlight = spy
+        lp = (max(6, tabstrip_h // 2) << 16) | 60
+        merged, diag = False, None
+        for attempt in range(3):
+            # 光标可能被真人鼠标抢走(无人值守测试跑在用户桌面上), 所以:
+            # 每轮都重新按下 → **立刻**把光标钉到落点 → 紧接着投递 MOVE/UP, 中间不 sleep。
+            # 三个调用都是同步 SendMessage, 中间没有窗口让光标被改掉。
+            hwnd = bar.Handle.ToInt32()
+            u32.SetCursorPos(int(src.X), int(src.Y))
+            time.sleep(0.35)
+            u32.SendMessageW(hwnd, 0x0201, 1, lp)      # WM_LBUTTONDOWN → 开始拖动
+            u32.SetCursorPos(int(dst.X), int(dst.Y))   # 光标进入标签栏
+            cp = WinForms.Cursor.Position
+            back = main.PointToClient(cp)
+            diag = "dst=%s cursor=%s back=%s client=%s state=%s tabstrip_h=%s" % (
+                (dst.X, dst.Y), (cp.X, cp.Y), back, main.ClientSize,
+                main.WindowState, tabstrip_h)
+            u32.SendMessageW(hwnd, 0x0200, 1, lp)      # WM_MOUSEMOVE → 高亮提示
+            u32.SendMessageW(hwnd, 0x0202, 0, lp)      # WM_LBUTTONUP → 落点判定
+            time.sleep(0.5)
+            with api._lock:
+                t = next((x for x in api._tabs if x["id"] == tid), None)
+            merged = t is not None and not bool(t.get("float"))
+            if merged:
+                break
+        say("[float-e2e] drag: %s" % diag)
+        say("[float-e2e] drag: highlight 调用序列=%s" % (seen,))
+        return merged
+    except Exception:
+        _log_exc("e2e-drag-merge")
+        return False
+
+
+def shell_main(e2e_url=None, e2e_float_url=None):
     """窗口壳主流程: 起/复用服务 → WebView2 检测 → 主窗口(含标签页) → 全关后收尾。
 
     e2e_url 仅测试用(_e2e_shell.py): 主窗口就绪后自动走一次 open_in_app 桥调用,
@@ -657,12 +1063,13 @@ def shell_main(e2e_url=None):
     api = ShellApi()
     win = webview.create_window("%s %s" % (APP_NAME, APP_VER), url,
                                 width=MAIN_W, height=MAIN_H, min_size=MAIN_MIN,
-                                background_color=BG_DARK, js_api=api,
+                                background_color=BG_PAGE, js_api=api,
                                 frameless=True, easy_drag=False)   # easy_drag=False: 只允许标签栏拖动, 网页区域拖拽不再移动窗口
     api.attach(win, url)
 
     def gui_ready():
         # GUI 就绪(在 pywebview 的后台线程): 装控件池与标签栏, 再跑测试钩子
+        pages = None
         try:
             from shell_pages import create_pool
             # 站点页面深浅跟随主界面: 读正式设置键(applyTheme 每次切主题实时落库),
@@ -672,24 +1079,59 @@ def shell_main(e2e_url=None):
                 if v not in ("light", "dark"):
                     v = "light" if app.sget("float_ball_light") == "1" else "dark"
                 return v
+            # bug6: 网页(视频)全屏 → 隐藏标签栏与导航栏, 窗口内只剩画面(整窗纯播放);
+            # 退出全屏再显回来。strip/nav 实例的装配晚于 create_pool, 这里用字典迟绑定。
+            chrome = {"strip": None, "nav": None}
+
+            def on_fs(_key, on):
+                hidden = bool(on)
+                st = chrome["strip"]
+                if st is not None:
+                    try:
+                        st.set_fullscreen(hidden)
+                    except Exception:
+                        _log_exc("fullscreen/strip")
+                nb = chrome["nav"]
+                if nb is not None:
+                    try:
+                        # 优先走导航栏自己的全屏接口(内部 marshal 到 UI 线程 + 退出时 BringToFront)
+                        nbfs = getattr(nb, "set_fullscreen", None)
+                        if nbfs is not None:
+                            nbfs(hidden)
+                        else:
+                            nb.Visible = not hidden
+                    except Exception:
+                        _log_exc("fullscreen/navbar")
+
+            # 站点自身弹新页(target=_blank 等)一律进主窗口标签, 不弹悬浮窗(旧行为)
             pages = create_pool(
-                win, api.update_title, lambda _k, u: api.open_in_app(u),
-                theme_getter=_current_theme, port=port, on_nav=api._on_nav)
+                win, api.update_title, lambda _k, u: api.open_in_app(u, mode="tab"),
+                theme_getter=_current_theme, port=port, on_nav=api._on_nav, on_fs=on_fs)
             pages.init()          # 等窗体就绪 + WS_THICKFRAME 无边框缩放补丁
             api.bind_pages(pages)
         except Exception:
-            import traceback
-            traceback.print_exc()
+            _log_exc("shell_pages/init")
         try:
             from shell_tabstrip import install_strip
             strip_update = install_strip(
                 win, api, accent_getter=lambda: app.sget("float_ball_accent"),
                 bg_getter=lambda: app.sget("ui_bg_scheme"))
             api.bind_strip(strip_update)
+            chrome["strip"] = strip_update
         except Exception:
-            import traceback
-            traceback.print_exc()
+            _log_exc("shell_tabstrip/install")
             strip_update = None
+        try:
+            from shell_float import install_floats
+            # 悬浮窗管理器: 承载「新窗口形式打开」的页面。
+            # 必须在 install_strip 之后 —— 需要标签栏高度做「拖到标签栏松手即合并」的落点判定。
+            if pages is not None:
+                api.bind_floats(install_floats(
+                    win, api, pages, bg_getter=lambda: app.sget("ui_bg_scheme"),
+                    accent_getter=lambda: app.sget("float_ball_accent"),
+                    tabstrip_h=int(getattr(strip_update, "bar_h", 0) or 0)))
+        except Exception:
+            _log_exc("shell_float/install")
         try:
             from shell_navbar import install_navbar
             # top=标签栏高度(install_strip 暴露): 工具栏紧贴标签栏下沿
@@ -697,17 +1139,16 @@ def shell_main(e2e_url=None):
                 win, api, top=getattr(strip_update, "bar_h", 32) if strip_update else 32,
                 bg_getter=lambda: app.sget("ui_bg_scheme"))
             api.bind_navbar(nav_update)
+            chrome["nav"] = getattr(nav_update, "bar", None)
         except Exception:
-            import traceback
-            traceback.print_exc()
+            _log_exc("shell_navbar/install")
         try:
             _install_mouse_side_buttons(api, win)
         except Exception:
-            import traceback
-            traceback.print_exc()
+            _log_exc("mouse-side-buttons")
         if e2e_url:
             time.sleep(8)   # 等主窗口与服务就绪
-            api.open_in_app(e2e_url, "E2E 视频标签页")
+            api.open_in_app(e2e_url, "E2E 视频标签页", mode="tab")
 
             def dump_controls():
                 try:
@@ -728,11 +1169,41 @@ def shell_main(e2e_url=None):
             time.sleep(6)
             import threading as _th
             _th.Thread(target=dump_controls, daemon=True).start()
+            print("[float-e2e] DONE", flush=True)
+        if e2e_float_url:
+            # v0.3.1.34 测试钩子: 走一遍 新窗口 → 塞回标签页 → 拖出悬浮窗 → 关闭 全链路,
+            # 每步 dump 控件归属(父窗体/可见性), 验证控件实例跨窗口迁移、页面不重载。
+            try:
+                _e2e_float_run(api, e2e_float_url)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            finally:
+                # 自测是无人值守钩子: 关窗失败也强制退出, 绝不留悬挂进程/窗口
+                try:
+                    time.sleep(1)
+                    win.destroy()
+                except Exception:
+                    pass
+                try:
+                    app.shutdown(server)
+                except Exception:
+                    pass
+                os._exit(0)
 
     # 非无痕: 内置浏览器标签页里的登录态(B站等)跨重启保留, 数据落用户目录
+    # MIRRORSORTER_WV2_DATA: 把 WebView2 的用户数据目录也隔离开(默认共用一份)。
+    # 共用时第二个实例的 WebView2 初始化会失败(0x8007139F, 同一目录被占用),
+    # 于是第二个窗口是一片空白/无响应 —— 自测脚本靠它并行跑而不干扰正在用的窗口。
     webview.start(func=gui_ready, private_mode=False,
+                  storage_path=os.environ.get("MIRRORSORTER_WV2_DATA") or None,
                   debug=os.environ.get("MSX_DEBUG") == "1")
-    # start() 返回 = 窗口已关闭 → 收尾退出(收球/停线程池/关服务)
+    # start() 返回 = 主窗口已关闭 → 先收掉所有悬浮窗, 再收尾退出(收球/停线程池/关服务)
+    try:
+        if api._floats is not None:
+            api._floats.close_all()
+    except Exception:
+        pass
     app.shutdown(server)
     return 0
 

@@ -77,6 +77,24 @@ that used to open your system browser — now opens as a **tab in the app window
 - No WebView2 runtime on the machine? The app falls back to the old
   external-browser mode automatically (with a one-time notice) — never a blank window.
 
+### Open information in a new window (v0.3.1.34+, default ON)
+
+设置 → 主题设置 → **信息以新窗口形式打开**（默认开启）:
+
+- **On**: clicking a feed card / message / account link opens the page in its own
+  **floating window** (frameless, with a mini title bar: page title, `⤓` dock-back,
+  `✕` close; drag the bar to move, drag the edges to resize). To merge it back into
+  the main window, **drag the floating window by its title bar and drop it on the tab
+  bar** — exactly like dragging a browser window onto another window's tab strip (the
+  tab bar lights up with an accent outline while you hover over it). The `⤓` button on
+  the title bar does the same thing. Conversely, any tab in the main window can be
+  **dragged out of the tab bar** to become a floating window.
+- **Off**: the old behaviour — everything opens as a tab inside the main window.
+- The page is **moved, not reloaded**: the same WebView2 instance is re-parented
+  between the main window and the floating window, so playback position, scroll
+  position and form state survive the move. Floating windows are not listed in the
+  main tab bar (they are separate windows); the accent/bg theme still follows the app.
+
 ## UI Overview
 
 - **Left · settings rail**: AI config (OpenAI-compatible API, DeepSeek by default) / preference notes / black & white lists (keywords · authors) / data management; collapsible to a narrow rail
@@ -163,6 +181,7 @@ desktop/
 ├── app_window.py     # window shell (exe entry): frameless pywebview window + tabs
 ├── shell_tabstrip.py # native browser-style tab bar (also the borderless title bar)
 ├── shell_pages.py    # per-tab WebView2 control pool (switching never reloads)
+├── shell_float.py    # standalone floating windows (new-window mode; controls re-parented)
 ├── web/index.html    # UI skeleton
 ├── web/style.css     # styles
 ├── web/app.js        # frontend logic (openExternal routes links into shell tabs)

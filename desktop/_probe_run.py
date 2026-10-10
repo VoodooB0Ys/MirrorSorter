@@ -59,7 +59,7 @@ def main():
             if v is None:
                 print("  %-7s MISSING" % k)
             else:
-                print("  %-7s disp=%s vis=%s rect=%s" % (k, v["display"], v["vis"], v["rect"]))
+                print("  %-7s disp=%s vis=%s rect=%s top=%s" % (k, v["display"], v["vis"], v["rect"], v.get("top")))
                 for h in v["hiddenChain"][:4]:
                     print("        hidden-by: <%s id=%s cls=%s> %s" % (h["tag"], h["id"], h["cls"], h["why"]))
         lf = d.get("left")
@@ -67,6 +67,9 @@ def main():
             print("  firstLiHTML=%s" % lf.get("firstLiHTML"))
             print("  left-entry parent=%s disp=%s kids=%s" % (lf["parentCls"], lf["disp"],
                   json.dumps(lf["kids"], ensure_ascii=False)[:400]))
+        print("  scrollY=%s vh=%s" % (d.get("scrollY"), d.get("vh")))
+        print("  roots=%s" % json.dumps(d.get("roots"), ensure_ascii=False)[:500])
+        print("  hitAtHeader=%s" % json.dumps(d.get("hitAtHeader"), ensure_ascii=False))
         print("  body.kids=%s" % json.dumps(d.get("kids"), ensure_ascii=False)[:400])
     return 0
 

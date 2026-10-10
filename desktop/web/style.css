@@ -29,8 +29,10 @@ body {
   font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif; font-size:14px;
 }
 /* 100vh 在 body zoom 下会被乘以缩放系数(实测 Chromium), 应用会比视口高出 (Z-1)/Z,
-   侧栏底部(黑名单设置)永远滚不到 → 高度除以 --ui-zoom(app.js 随字体档位设置) */
-#app { display:flex; height:calc(100vh / var(--ui-zoom, 1)); }
+   侧栏底部(黑名单设置)永远滚不到 → 高度除以 --ui-zoom(app.js 随字体档位设置)。
+   2026-10 再修: 100vh 与实际可视高度在部分环境(窗口高于屏幕工作区 / DPI 缩放 / WebView2 壳)
+   不一致, 应用比视口高 → 仍然够不到底。改用 JS 实测的 --app-h(视口高度), 100vh 只作兜底。 */
+#app { display:flex; height:calc(var(--app-h, 100vh) / var(--ui-zoom, 1)); }
 /* 显式分层: 设置栏在下层, 内容区在上层(保证播放预览等浮层不被设置栏遮挡) */
 #rail { z-index:0; }
 #main { position:relative; z-index:1; }
@@ -38,7 +40,7 @@ body {
 /* ---------- 设置栏 ---------- */
 #rail { background:var(--panel); border-right:1px solid var(--line); width:230px;
         display:flex; flex-direction:column; transition:width .15s; flex-shrink:0;
-        min-width:46px; }
+        min-width:46px; min-height:0; }   /* min-height:0: flex 子项默认不小于内容高度, 会让设置栏顶出 #app */
 #rail.collapsed { width:46px !important; flex-basis:46px !important; }   /* !important: 防拖拽的inline宽度/基础宽度覆盖折叠 */
 #rail.collapsed + .splitter { display:none; }   /* 折叠时隐藏设置栏分割条 */
 #rail.dragging { transition:none; }             /* 拖拽中禁动画, 跟手 */
@@ -50,7 +52,9 @@ body {
 #railHide:hover { color:var(--txt); }
 #rail.hide-txt #railHide, #rail.hide-txt #railBody { display:none; }   /* 隐藏文字模式: 只保留⚙设置, 其余全空(宽度保留可拖) */
 #rail.collapsed #railToggle span, #rail.collapsed #railBody { display:none; }
-#railBody { flex:1; overflow-y:auto; padding:0 12px 12px; }
+/* min-height:0 必须留着: 折叠/展开子栏会改变内容高度, 没有它 #railBody 会按内容撑高,
+   把 footer(数据管理之后的版本行) 顶到 #rail 之外 → 滚到底也看不到(用户报的"拉不到最下方") */
+#railBody { flex:1; overflow-y:auto; padding:0 12px 24px; min-height:0; }
 #railBody .credit { font-size:11px; color:var(--sub); line-height:1.8; text-align:center;
                     margin:6px 0 8px; padding:8px; background:var(--card);
                     border:1px solid var(--line); border-radius:8px; }
@@ -150,15 +154,16 @@ select option { background:var(--card); color:var(--txt); }
 .message-badge { display:none; min-width:14px; height:14px; padding:0 3px; border-radius:7px;
                  background:#e5484d; color:#fff; font-size:9px; line-height:14px; text-align:center; }
 .message-badge:not(.hidden) { display:inline-block; }
-.plat-tag { font-style:normal; font-size:9px; line-height:1.3; color:#fff;
-            border-radius:4px; padding:0 3px; margin-bottom:2px; white-space:nowrap;
-            pointer-events:none; }
-.plat-bili { background:var(--accent); }
-.plat-tb { background:#5b8def; }
-.plat-xhh { background:#e5484d; }
+/* 封面左下角的平台角标(信息流缩略图上的小色块)同样去掉实底, 只留细边+品牌色字 */
+.plat-tag { font-style:normal; font-size:9px; line-height:1.3; color:var(--sub);
+            border:1px solid var(--line); border-radius:4px; padding:0 3px; margin-bottom:2px;
+            white-space:nowrap; background:transparent; pointer-events:none; }
+/* 来源标签(bug12 + 本轮): 一律跟随主题强调色 —— 之前三个平台的蓝/红品牌色
+   在顶栏和卡片里同时出现, 用户反馈像三块异色标注; 强调色跟着主题走, 也便于一眼统一。 */
+.plat-bili, .plat-tb, .plat-xhh { color:var(--accent); }
 /* 无头像时的字母占位圆形(同 .avatar 尺寸) */
 .avatar-ph { display:flex; align-items:center; justify-content:center;
-             width:26px; height:26px; border-radius:50%; background:#5b8def;
+             width:26px; height:26px; border-radius:50%; background:var(--accent);
              color:#fff; font-style:normal; font-size:13px; font-weight:700;
              border:2px solid var(--line); }
 .m-group { background:var(--card); border:1px solid var(--line); border-radius:8px;
@@ -293,8 +298,18 @@ select option { background:var(--card); color:var(--txt); }
 #feedList.big .thumb-wrap img { position:static; display:block; width:100%; height:auto; aspect-ratio:16/9; object-fit:cover; }   /* 统一按B站封面16:9裁切, 整列对齐 */
 #feedList.big .thumb-wrap .ph { position:absolute; top:0; left:0; right:0; bottom:0;
                                 display:flex; align-items:center; justify-content:center; }
-#feedList.big .thumb-wrap.multi { display:flex; }
-#feedList.big .thumb-wrap.multi img { width:50%; height:auto; }
+/* 大图模式·双图封面: 第一张为主(全宽 16:9 撑满画布, 兼定行高)、第二张为辅(右侧 1/3 通栏)。
+   原来两张各占 50% 宽、高度按 16:9 再砍半 ⇒ 封面只占画布一半高, 又小又空(用户实测截图)。
+   主图必须留在文档流: 大图模式行高是 max-content, 靠它的天然高度撑(见上面那条实测 bug)。 */
+#feedList.big .thumb-wrap.multi { display:block; }
+#feedList.big .thumb-wrap.multi img { width:100%; height:auto; position:relative; z-index:1; }   /* z-index: 盖住占位字母(.ph 是定位元素, 层级在文档流之上) */
+#feedList.big .thumb-wrap.multi img + img {
+  position:absolute; top:0; right:0; bottom:0; left:auto;   /* left:auto 必须写: 否则被基础规则
+                                                              的 left:0 拉回左侧(左右同时约束时 right 失效) */
+  width:34%; height:100%; aspect-ratio:auto; object-fit:cover;   /* height 必须给 100%: <img> 是可替换
+      元素, 只写 top/bottom 时高度会退回天然高度(实测: 辅图只占上半截), 撑不满 */
+  border-left:1px solid rgba(255,255,255,.15);
+}
 #feedList.big .thumb-stats { display:none; }
 /* 作者信息: 封面下方、标题上方(不再叠印在图上) */
 #feedList.big .meta-text { position:static; padding:7px 10px 0; color:var(--sub); font-size:11.5px; }
@@ -319,8 +334,13 @@ select option { background:var(--card); color:var(--txt); }
 }
 .card h3 { font-size:14px; line-height:1.45; display:-webkit-box; -webkit-line-clamp:2;
            -webkit-box-orient:vertical; overflow:hidden; }
-.card .badge { display:inline-block; background:var(--accent); color:#fff; border-radius:4px;
-               font-size:11px; padding:1px 6px; margin-right:8px; vertical-align:2px; }
+/* 来源标签(bug12 + 本轮): 原来是强调色/品牌色**实底**, 信息流里三块高饱和色块太抢眼。
+   改成低调形式 —— 透明底 + 细边框 + 强调色小字, 不再用蓝/红品牌色。 */
+.card .badge { display:inline-block; background:transparent; color:var(--sub);
+               border:1px solid var(--line); border-radius:4px; font-weight:600;
+               font-size:11px; padding:0 6px; margin-right:8px; vertical-align:2px; }
+/* 卡片里的来源标签同样跟随强调色(本轮): 不再用蓝/红品牌色区分平台 */
+.card .badge.plat-bili, .card .badge.plat-tb, .card .badge.plat-xhh { color:var(--accent); }
 /* 关注的人标注: 作者名强调色 + 标题栏【B站】右侧"关注的人"标签(轻量, 无整卡框) */
 .card .follow-author { color:var(--accent); font-weight:600; }
 .card .follow-tag { display:inline-block; background:transparent; color:var(--accent);

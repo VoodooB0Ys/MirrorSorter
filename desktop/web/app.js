@@ -3,6 +3,19 @@
 
 const $ = (s) => document.querySelector(s);
 
+/* ---------- 顶层绑定容错 (v0.3.1.25) ----------
+   本文件是单文件顶层脚本: 一句 $("#x").onclick = ... 在 x 缺失时抛 TypeError,
+   会让**其后所有绑定**一起失效 —— 用户侧就是「好几个按钮同时点了没反应」。
+   元素缺失的现实来源是 index.html 与 app.js 版本错配(旧页面缓存/更新中断/旧安装残留)。
+   对策: 每条顶层绑定单独 try/catch, 单点失败不连坐; 缺失元素记进 _bindMiss,
+   由文件末尾的版本自检做一次性自愈。 */
+const _bindMiss = [];
+function _bmiss(sel, e) {
+  if (_bindMiss.indexOf(sel) < 0) _bindMiss.push(sel);
+  try { console.warn("[msx] 绑定失败(元素缺失? 前端资源版本不一致): " + sel, e && e.message); } catch (_) {}
+}
+try { window.__msxBmiss = _bindMiss; } catch (_) {}   // 报障排查: F12 里看 __msxBmiss
+
 /* ---------- 链接跳转统一出口 ----------
    桌面窗口壳(pywebview, 见 app_window.py)内 → 应用内置浏览器窗口;
    普通浏览器/安卓壳 → 原生 window.open(安卓壳的 WebView 会转交系统浏览器)。
@@ -251,6 +264,20 @@ function applyTheme() {
   const zval = fontLv === "medium" ? "1.15" : fontLv === "large" ? "1.3" : "1";
   document.body.style.zoom = zval === "1" ? "" : zval;
   document.documentElement.style.setProperty("--ui-zoom", zval);
+  /* 视口高度自愈: 100vh 在"窗口比屏幕工作区高 / DPI 缩放 / WebView2 壳"等环境下与真实可视
+     高度不一致, #app 会比视口高出一截 → 设置栏底部(footer/黑名单)永远滚不到。这里把实测
+     可视高度写进 --app-h, #app 高度 = --app-h / --ui-zoom, 折叠/展开任何子栏都不会改变它;
+     窗口尺寸变化(含壳内最大化/全屏)会重算。 */
+  function syncAppH() {
+    try {
+      const h = Math.round((window.visualViewport && window.visualViewport.height) || window.innerHeight || 0);
+      if (h > 0) document.documentElement.style.setProperty("--app-h", h + "px");
+    } catch (e) {}
+  }
+  syncAppH();
+  window.addEventListener("resize", syncAppH);
+  window.addEventListener("orientationchange", syncAppH);
+  if (window.visualViewport) window.visualViewport.addEventListener("resize", syncAppH);
   document.querySelectorAll("#fontRow .seg").forEach((b) =>
     b.classList.toggle("on", b.dataset.font === fontLv));
   /* 背景颜色系统: 预设/自定义色卡 + 深度滑条(见 applyBg); 滑条位置随当前深度回显 */
@@ -459,6 +486,15 @@ document.addEventListener("click", (e) => {
     document.querySelectorAll("#ownuiRow .seg").forEach((x) => x.classList.toggle("on", x === ou));
     api("/api/settings", { method: "POST", body: { ui_ownui: ou.dataset.ownui } }).catch(() => {});
     toast("播放页自有UI已" + (ou.dataset.ownui === "1" ? "开启" : "关闭") + "，新打开的B站标签页生效");
+  }
+  /* 信息以新窗口形式打开(桌面窗口壳): 开=ui_new_window 1(默认), 关=0 —— 切换即生效 */
+  const om = e.target.closest("#openModeRow .seg");
+  if (om) {
+    document.querySelectorAll("#openModeRow .seg").forEach((x) => x.classList.toggle("on", x === om));
+    api("/api/settings", { method: "POST", body: { ui_new_window: om.dataset.open } }).catch(() => {});
+    toast(om.dataset.open === "1"
+      ? "已开启：信息以新窗口形式打开（可塞回标签页；标签页可拖出成悬浮窗）"
+      : "已关闭：信息仍在标签页内打开");
   }
   if (e.target.closest("#bgResetBtn")) {
     localStorage.removeItem("bgHex");
@@ -692,14 +728,14 @@ function applySortBar() {
   bar.querySelectorAll("button[data-sort]").forEach((b) =>
     b.classList.toggle("on", b.dataset.sort === feedState.sort));
 }
-$("#sortBar").addEventListener("click", (e) => {
+try { $("#sortBar").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-sort]");
   if (!b || b.dataset.sort === feedState.sort) return;
   feedState.sort = b.dataset.sort;
   localStorage.setItem("searchSort", feedState.sort);
   applySortBar();
   loadFeed();   // 不带force: 不发refresh=1, 服务端同一波次池直接重排
-});
+}); } catch (_e) { _bmiss("#sortBar", _e); }
 function loadFeed(force) {
   feedState.gen += 1;
   applySortBar();
@@ -881,22 +917,22 @@ function startPvTimer(tw) {
 }
 /* 触发范围 = 封面缩略图(thumb-wrap)本身; 播放浮层 pointer-events:none 不干扰。
    触屏设备整段禁用: 手机上点按封面会先触发模拟mouseover → 误触预览播放(用户已要求移除) */
-$("#feedList").addEventListener("mouseover", (e) => {
+try { $("#feedList").addEventListener("mouseover", (e) => {
   if (isTouchDevice()) return;
   const tw = e.target.closest(".thumb-wrap");
   if (!tw) return;
   if (e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest(".thumb-wrap") === tw)
     return;   // 封面内移动不重新计时(否则子元素切换会无限重置)
   startPvTimer(tw);
-});
-$("#feedList").addEventListener("mouseout", (e) => {
+}); } catch (_e) { _bmiss("#feedList", _e); }
+try { $("#feedList").addEventListener("mouseout", (e) => {
   const tw = e.target.closest(".thumb-wrap");
   if (!tw) return;
   if (e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest(".thumb-wrap") === tw)
     return;   // 封面内移动不停止
   clearTimeout(pvTimer);
   stopPreview();
-});
+}); } catch (_e) { _bmiss("#feedList", _e); }
 /* ---------- B站站内播放(官方embed播放器, 不跳出App) ---------- */
 let playerBox = null;
 function openPlayer(bvid, title) {
@@ -1050,10 +1086,10 @@ async function openXhhReader(lid, title) {
 }
 
 /* 滚动/窗口缩放时停止浮层(fixed 定位不跟随滚动, 停止更合理) */
-$("#feedList").addEventListener("scroll", () => stopPreview());
+try { $("#feedList").addEventListener("scroll", () => stopPreview()); } catch (_e) { _bmiss("#feedList", _e); }
 window.addEventListener("resize", () => stopPreview());
 
-$("#feedList").addEventListener("click", async (e) => {
+try { $("#feedList").addEventListener("click", async (e) => {
   if (window.__lpSuppress) { window.__lpSuppress = false; return; }   // 长按菜单后的点击不再触发跳转
   const btn = e.target.closest("button");
   const card = e.target.closest(".card");
@@ -1113,7 +1149,7 @@ $("#feedList").addEventListener("click", async (e) => {
   } else {
     openCard(card, key);
   }
-});
+}); } catch (_e) { _bmiss("#feedList", _e); }
 function cardHeading(card) {
   const h = card.querySelector("h3");
   if (!h) return "";
@@ -1217,16 +1253,16 @@ document.addEventListener("mousemove", (e) => {
 });
 
 /* ---------- 大面板 ---------- */
-$("#panelTabs").addEventListener("click", (e) => {
+try { $("#panelTabs").addEventListener("click", (e) => {
   const b = e.target.closest("button");
   if (!b) return;
   state.tab = b.dataset.tab;
   document.querySelectorAll("#panelTabs button").forEach((x) =>
     x.classList.toggle("on", x === b));
   loadPanel();
-});
-$("#btnHistory").onclick = () => switchTab("history");
-$("#btnSaved").onclick = () => switchTab("saved");
+}); } catch (_e) { _bmiss("#panelTabs", _e); }
+try { $("#btnHistory").onclick = () => switchTab("history"); } catch (_e) { _bmiss("#btnHistory", _e); }
+try { $("#btnSaved").onclick = () => switchTab("saved"); } catch (_e) { _bmiss("#btnSaved", _e); }
 function switchTab(tab) {
   const btn = document.querySelector(`#panelTabs button[data-tab="${tab}"]`);
   if (btn) btn.click();
@@ -1574,23 +1610,23 @@ async function sendChatText(text, payload) {
   if (trig === "settings") { loadSettings(); loadStatus(); loadFeed(); }
   else if (trig === "random") { loadFeed(); }
 }
-$("#chatSend").onclick = sendChat;
-$("#chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
-$("#chatStop").onclick = () => { if (streamCtrl) { try { streamCtrl.abort(); } catch (_) {} } };
-$("#convBtn").onclick = (e) => { e.stopPropagation(); $("#convList").classList.toggle("hidden"); loadConvs(); };
-$("#convNew").onclick = (e) => { e.stopPropagation(); newConv(); };
-$("#convNew2").onclick = newConv;
-$("#convTitle").addEventListener("click", () => renameConv(curConv));
+try { $("#chatSend").onclick = sendChat; } catch (_e) { _bmiss("#chatSend", _e); }
+try { $("#chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); }); } catch (_e) { _bmiss("#chatInput", _e); }
+try { $("#chatStop").onclick = () => { if (streamCtrl) { try { streamCtrl.abort(); } catch (_) {} } }; } catch (_e) { _bmiss("#chatStop", _e); }
+try { $("#convBtn").onclick = (e) => { e.stopPropagation(); $("#convList").classList.toggle("hidden"); loadConvs(); }; } catch (_e) { _bmiss("#convBtn", _e); }
+try { $("#convNew").onclick = (e) => { e.stopPropagation(); newConv(); }; } catch (_e) { _bmiss("#convNew", _e); }
+try { $("#convNew2").onclick = newConv; } catch (_e) { _bmiss("#convNew2", _e); }
+try { $("#convTitle").addEventListener("click", () => renameConv(curConv)); } catch (_e) { _bmiss("#convTitle", _e); }
 document.addEventListener("click", (e) => { if (!e.target.closest("#chat header")) closeConvList(); });
-$("#chatClear").onclick = async () => {
+try { $("#chatClear").onclick = async () => {
   if (streamCtrl) return toast("请先等待当前回复完成或点停止", { warn: true });
   if (!confirm("清空当前对话的所有消息？")) return;
   await api("/api/chat/clear", { method: "POST", body: { cid: curConv } });
   loadChat(); loadConvs();
-};
-$("#chatCtxClear").onclick = () => chatCtxApply("", "");
+}; } catch (_e) { _bmiss("#chatClear", _e); }
+try { $("#chatCtxClear").onclick = () => chatCtxApply("", ""); } catch (_e) { _bmiss("#chatCtxClear", _e); }
 /* 折叠到最右: 省出空间 */
-$("#chatCollapse").onclick = () => {
+try { $("#chatCollapse").onclick = () => {
   const collapsed = $("#chat").classList.toggle("collapsed");
   $("#sp2").classList.toggle("hidden", collapsed);   // 折叠时隐藏聊天框分割条
   localStorage.setItem("chat_collapsed", collapsed ? "1" : "");
@@ -1598,7 +1634,7 @@ $("#chatCollapse").onclick = () => {
     const r = localStorage.getItem("w_chat");
     if (r) $("#chat").style.width = clampSide(parseInt(r, 10) || 280, 220, $("#chat")) + "px";
   }
-};
+}; } catch (_e) { _bmiss("#chatCollapse", _e); }
 if (localStorage.getItem("chat_collapsed")) {
   $("#chat").classList.add("collapsed");
   $("#sp2").classList.add("hidden");
@@ -1624,34 +1660,34 @@ const MODEL_BASE = {
 };
 function modelValue() { return $("#cfgModel").value.trim() || "deepseek-chat"; }
 /* 自研下拉: 点箭头全量展示(分组), 点选即填, 也可继续直接输入 */
-$("#modelDropBtn").onclick = (e) => {
+try { $("#modelDropBtn").onclick = (e) => {
   e.stopPropagation();
   $("#modelDrop").classList.toggle("show");
-};
+}; } catch (_e) { _bmiss("#modelDropBtn", _e); }
 document.addEventListener("click", (e) => {
   if (!e.target.closest("#modelPick")) $("#modelDrop").classList.remove("show");
 });
-$("#modelDrop").addEventListener("click", (e) => {
+try { $("#modelDrop").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-m]");
   if (!b) return;
   $("#cfgModel").value = b.dataset.m;
   $("#modelDrop").classList.remove("show");
   if (!baseCustom) refreshBase();
-});
+}); } catch (_e) { _bmiss("#modelDrop", _e); }
 let baseCustom = false;
 function refreshBase() {
   const b = MODEL_BASE[modelValue()];
   if (b) $("#cfgBase").value = b;
   $("#baseToggle").textContent = baseCustom ? "恢复自动" : "自定义地址";
 }
-$("#baseToggle").onclick = () => {
+try { $("#baseToggle").onclick = () => {
   baseCustom = !baseCustom;
   $("#cfgBase").readOnly = !baseCustom;
   refreshBase();
-};
-$("#cfgModel").addEventListener("change", () => {
+}; } catch (_e) { _bmiss("#baseToggle", _e); }
+try { $("#cfgModel").addEventListener("change", () => {
   if (!baseCustom) refreshBase();   // 自动模式: 随模型切地址
-});
+}); } catch (_e) { _bmiss("#cfgModel", _e); }
 function effectiveBase() {
   if (baseCustom) return $("#cfgBase").value.trim();
   return MODEL_BASE[modelValue()] || $("#cfgBase").value.trim() || "https://api.deepseek.com/v1";
@@ -1681,6 +1717,10 @@ async function loadSettings() {
   const ouOn = s.ui_ownui !== "0";
   document.querySelectorAll("#ownuiRow .seg").forEach((b) =>
     b.classList.toggle("on", (b.dataset.ownui === "1") === ouOn));
+  /* 信息打开方式(桌面窗口壳): 开=ui_new_window 1(默认), 关=0 */
+  const nwOn = s.ui_new_window !== "0";
+  document.querySelectorAll("#openModeRow .seg").forEach((b) =>
+    b.classList.toggle("on", (b.dataset.open === "1") === nwOn));
   const srOn = s.ui_sr === "1";
   const srLvl = srOn ? (s.ui_sr_level || "高") : "关";
   document.querySelectorAll("#srLevelRow .seg").forEach((b) =>
@@ -1739,13 +1779,13 @@ async function savePlatWeights() {
   if (r.ok) { toast("平台权重已保存，正在重建信息流"); loadFeed(); loadStatus(); }
   else toast("权重保存失败：" + (r.error || ""), { warn: true });
 }
-$("#tbSave").onclick = async () => {
+try { $("#tbSave").onclick = async () => {
   const bars = $("#tbBars").value.split(/[\n,，、;；]+/).map((s) => s.trim()).filter(Boolean);
   const body = { bars, allow_help: $("#tbAllowHelp").checked };
   const r = await api("/api/tieba", { method: "POST", body });
   $("#tbStatus").textContent = r.ok ? "已保存 ✓" : ("失败：" + (r.error || ""));
   if (r.ok) { toast("吧列表/求助帖设置已保存，正在重建信息流"); loadFeed(); loadStatus(); }
-};
+}; } catch (_e) { _bmiss("#tbSave", _e); }
 /* AI 总开关 */
 function applyAiMainBtn(on) {
   const btn = $("#aiMainToggle");
@@ -1782,7 +1822,7 @@ async function refreshFloatBall() {
     applyFloatBallBtn(d.enabled, d.running, d.supported, d.reason, d.hint);
   } catch (_) {}
 }
-$("#floatBallToggle").onclick = async () => {
+try { $("#floatBallToggle").onclick = async () => {
   const btn = $("#floatBallToggle");
   const on = !btn.classList.contains("off");
   try {
@@ -1804,7 +1844,7 @@ $("#floatBallToggle").onclick = async () => {
   } catch (e) {
     toast("操作失败：" + (e.message || e), { warn: true });
   }
-};
+}; } catch (_e) { _bmiss("#floatBallToggle", _e); }
 
 // 「找不到球？」: 悬浮球可能被拖到屏幕边缘外、被别的置顶窗口盖住、或位置记在换屏前的坐标上。
 // 点这里让球自己回到右侧醒目位置并闪三下。
@@ -1812,7 +1852,7 @@ $("#floatBallToggle").onclick = async () => {
 // 关键: 请求「发出去」不等于球「收到了」。球是独立进程, 靠 2.5s 一次的心跳来取信号,
 // 所以这里不能一发出就报成功 —— 必须等球的回执(ack)才算数; 等不到就如实说"没响应",
 // 让用户知道该去重新开启悬浮窗, 而不是对着一个永远没反馈的按钮反复点。
-$("#floatBallFind").onclick = async () => {
+try { $("#floatBallFind").onclick = async () => {
   try {
     const d = await api("/api/floatball");
     if (!d.supported) {
@@ -1839,16 +1879,16 @@ $("#floatBallFind").onclick = async () => {
   } catch (e) {
     toast("定位失败：" + (e.message || e), { warn: true });
   }
-};
+}; } catch (_e) { _bmiss("#floatBallFind", _e); }
 
-$("#aiMainToggle").onclick = async () => {
+try { $("#aiMainToggle").onclick = async () => {
   const on = !(aiModeVals.ai_enabled === "1");
   await api("/api/settings", { method: "POST", body: { ai_enabled: on ? "1" : "0" } });
   aiModeVals.ai_enabled = on ? "1" : "0";
   applyAiMainBtn(on);
   toast(on ? "AI 功能已开启" : "AI 功能已关闭：不再消耗 token（聊天也停用）");
   loadFeed(); loadStatus();
-};
+}; } catch (_e) { _bmiss("#aiMainToggle", _e); }
 /* ---------- AI 推荐模式(卡片框 + 详细设置) ---------- */
 let aiModeVals = {};   // 最近一次 /api/settings 的快照
 function applyAiModeBtn(on) {
@@ -1876,7 +1916,7 @@ function segBind(rowId, cb) {
     cb(b.dataset.v);
   });
 }
-$("#aiModeToggle").onclick = async () => {
+try { $("#aiModeToggle").onclick = async () => {
   const on = !(aiModeVals.ai_full_scan === "1");
   await api("/api/settings", { method: "POST", body: { ai_full_scan: on ? "1" : "0" } });
   aiModeVals.ai_full_scan = on ? "1" : "0";
@@ -1884,8 +1924,8 @@ $("#aiModeToggle").onclick = async () => {
   toast(on ? "已开启 AI 推荐模式：全部视频经 AI 筛查后推送（消耗 token 较大）"
            : "已关闭全量筛查：仅热度前 120 条经 AI 筛查");
   loadFeed(); loadStatus();
-};
-$("#aiModeDetail").onclick = async () => {
+}; } catch (_e) { _bmiss("#aiModeToggle", _e); }
+try { $("#aiModeDetail").onclick = async () => {
   const s = await api("/api/settings");
   aiModeVals = s;
   segState("aiminRow", s.ai_interest_min || "0");
@@ -1893,18 +1933,18 @@ $("#aiModeDetail").onclick = async () => {
   segState("aibatchRow", s.ai_batch || "15");
   segState("aicacheRow", s.ai_cache_hours || "24");
   $("#aiDetailModal").classList.remove("hidden");
-};
-$("#aiDetailClose").onclick = $("#aiDetailCancel").onclick = () =>
-  $("#aiDetailModal").classList.add("hidden");
-$("#aiDetailModal").addEventListener("click", (e) => {
+}; } catch (_e) { _bmiss("#aiModeDetail", _e); }
+try { $("#aiDetailClose").onclick = $("#aiDetailCancel").onclick = () =>
+  $("#aiDetailModal").classList.add("hidden"); } catch (_e) { _bmiss("#aiDetailClose", _e); }
+try { $("#aiDetailModal").addEventListener("click", (e) => {
   if (e.target === $("#aiDetailModal")) $("#aiDetailModal").classList.add("hidden");
-});
+}); } catch (_e) { _bmiss("#aiDetailModal", _e); }
 let aiDetailDraft = {};
 segBind("aiminRow", (v) => { aiDetailDraft.ai_interest_min = v; });
 segBind("aifullRow", (v) => { aiDetailDraft.ai_full_scan = v; });
 segBind("aibatchRow", (v) => { aiDetailDraft.ai_batch = v; });
 segBind("aicacheRow", (v) => { aiDetailDraft.ai_cache_hours = v; });
-$("#aiDetailSave").onclick = async () => {
+try { $("#aiDetailSave").onclick = async () => {
   const body = { ...aiDetailDraft };
   if (!Object.keys(body).length) { $("#aiDetailModal").classList.add("hidden"); return; }
   await api("/api/settings", { method: "POST", body });
@@ -1913,8 +1953,8 @@ $("#aiDetailSave").onclick = async () => {
   toast("AI 推荐模式设置已保存，正在按新标准重建内容");
   await loadSettings();
   loadFeed(); loadStatus();
-};
-$("#aiDetailReset").onclick = async () => {
+}; } catch (_e) { _bmiss("#aiDetailSave", _e); }
+try { $("#aiDetailReset").onclick = async () => {
   await api("/api/settings", { method: "POST", body: {
     ai_interest_min: "0", ai_full_scan: "0", ai_batch: "15", ai_cache_hours: "24" } });
   aiDetailDraft = {};
@@ -1922,8 +1962,8 @@ $("#aiDetailReset").onclick = async () => {
   segState("aiminRow", "0"); segState("aifullRow", "0");
   segState("aibatchRow", "15"); segState("aicacheRow", "24");
   toast("已恢复默认设置");
-};
-$("#cfgSave").onclick = async () => {
+}; } catch (_e) { _bmiss("#aiDetailReset", _e); }
+try { $("#cfgSave").onclick = async () => {
   await api("/api/settings", { method: "POST", body: {
     ai_base: effectiveBase(),
     ai_key: $("#cfgKey").value.trim(), ai_model: modelValue(),
@@ -1933,17 +1973,17 @@ $("#cfgSave").onclick = async () => {
   $("#cfgStatus").className = "hint " + (r.ai_ok ? "ok" : "off");
   toast(r.ai_ok ? "AI 配置已保存" : "已保存（未填 Key，仍按热度排序）");
   loadFeed(); loadStatus();
-};
-$("#prefsSave").onclick = async () => {
+}; } catch (_e) { _bmiss("#cfgSave", _e); }
+try { $("#prefsSave").onclick = async () => {
   await api("/api/settings", { method: "POST", body: { prefs_note: $("#prefsNote").value } });
   toast("偏好备注已保存，评分时生效");
   loadFeed();
-};
-$("#dislikeSave").onclick = async () => {
+}; } catch (_e) { _bmiss("#prefsSave", _e); }
+try { $("#dislikeSave").onclick = async () => {
   await api("/api/settings", { method: "POST", body: { dislike_note: $("#dislikeNote").value } });
   toast("厌恶备注已保存，命中关键词的内容将被直接剔除");
   loadFeed();
-};
+}; } catch (_e) { _bmiss("#dislikeSave", _e); }
 
 /* ---------- 黑白名单 ---------- */
 async function loadBlacklist() {
@@ -1964,10 +2004,10 @@ async function addBlack(kind, val) {
   await api("/api/blacklist", { method: "POST", body: { kind, value: val } });
   loadBlacklist(); loadFeed();
 }
-$("#kwAdd").onclick = () => { addBlack("keyword", $("#kwInput").value.trim()); $("#kwInput").value = ""; };
-$("#auAdd").onclick = () => { addBlack("author", $("#auInput").value.trim()); $("#auInput").value = ""; };
-$("#kwInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#kwAdd").click(); });
-$("#auInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#auAdd").click(); });
+try { $("#kwAdd").onclick = () => { addBlack("keyword", $("#kwInput").value.trim()); $("#kwInput").value = ""; }; } catch (_e) { _bmiss("#kwAdd", _e); }
+try { $("#auAdd").onclick = () => { addBlack("author", $("#auInput").value.trim()); $("#auInput").value = ""; }; } catch (_e) { _bmiss("#auAdd", _e); }
+try { $("#kwInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#kwAdd").click(); }); } catch (_e) { _bmiss("#kwInput", _e); }
+try { $("#auInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#auAdd").click(); }); } catch (_e) { _bmiss("#auInput", _e); }
 
 /* ---------- 免责声明 ---------- */
 const DISCLAIMER_VERSION = "2026-09-03";
@@ -1981,13 +2021,13 @@ function closeDisclaimerModal() {
   if (disclaimerFirstOpen) return;
   $("#disclaimerModal").classList.add("hidden");
 }
-$("#btnDisclaimer").onclick = () => openDisclaimerModal();
-$("#disclaimerClose").onclick = closeDisclaimerModal;
-$("#disclaimerCancel").onclick = closeDisclaimerModal;
-$("#disclaimerModal").addEventListener("click", (e) => {
+try { $("#btnDisclaimer").onclick = () => openDisclaimerModal(); } catch (_e) { _bmiss("#btnDisclaimer", _e); }
+try { $("#disclaimerClose").onclick = closeDisclaimerModal; } catch (_e) { _bmiss("#disclaimerClose", _e); }
+try { $("#disclaimerCancel").onclick = closeDisclaimerModal; } catch (_e) { _bmiss("#disclaimerCancel", _e); }
+try { $("#disclaimerModal").addEventListener("click", (e) => {
   if (e.target === $("#disclaimerModal")) closeDisclaimerModal();
-});
-$("#disclaimerAgree").onclick = async () => {
+}); } catch (_e) { _bmiss("#disclaimerModal", _e); }
+try { $("#disclaimerAgree").onclick = async () => {
   const r = await api("/api/disclaimer/ack", {
     method: "POST", body: { version: DISCLAIMER_VERSION }
   });
@@ -1998,21 +2038,21 @@ $("#disclaimerAgree").onclick = async () => {
   disclaimerFirstOpen = false;
   $("#disclaimerModal").classList.remove("disclaimer-first-open");
   $("#disclaimerModal").classList.add("hidden");
-};
+}; } catch (_e) { _bmiss("#disclaimerAgree", _e); }
 
-$("#modeSelect").onchange = async () => {
+try { $("#modeSelect").onchange = async () => {
   await api("/api/settings", { method: "POST", body: { mode: $("#modeSelect").value } });
   toast("过滤档位：" + $("#modeSelect").value + ( $("#modeSelect").value === "严肃" ? "（严肃：只推硬核教程与知识）" : ""));
   loadFeed(true);   // 强制重建: 立即按新模式出内容, 不再显示旧池内容
-};
+}; } catch (_e) { _bmiss("#modeSelect", _e); }
 let searchTimer;
-$("#searchInput").addEventListener("input", (e) => {
+try { $("#searchInput").addEventListener("input", (e) => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => { feedState.q = e.target.value.trim(); loadFeed(); }, 350);
-});
-$("#btnUser").onclick = (e) => { e.stopPropagation(); $("#userDrop").classList.toggle("hidden"); };
+}); } catch (_e) { _bmiss("#searchInput", _e); }
+try { $("#btnUser").onclick = (e) => { e.stopPropagation(); $("#userDrop").classList.toggle("hidden"); }; } catch (_e) { _bmiss("#btnUser", _e); }
 document.addEventListener("click", () => $("#userDrop").classList.add("hidden"));
-$("#userDrop").addEventListener("click", async (e) => {
+try { $("#userDrop").addEventListener("click", async (e) => {
   const act = e.target.closest("button")?.dataset.act;
   if (!act) return;
   $("#userDrop").classList.add("hidden");
@@ -2029,7 +2069,7 @@ $("#userDrop").addEventListener("click", async (e) => {
     }
   }
   if (act === "about") openDisclaimerModal();
-});
+}); } catch (_e) { _bmiss("#userDrop", _e); }
 /* 启动预缓存档位: 点击即保存生效 */
 document.addEventListener("click", async (e) => {
   const b = e.target.closest("#mColdRow .seg");
@@ -2039,14 +2079,14 @@ document.addEventListener("click", async (e) => {
   toast(b.dataset.v === "0" ? "启动预缓存已关闭" : "启动预缓存：" + b.dataset.v + " 条（下次打开直接显示）");
 });
 
-$("#btnClearLog").onclick = async () => {
+try { $("#btnClearLog").onclick = async () => {
   if (!confirm("清空历史/收藏/聊天记录？")) return;
   await api("/api/reset", { method: "POST", body: {} });
   toast("已清空"); loadConvs(); loadChat(); loadPanel();
-};
+}; } catch (_e) { _bmiss("#btnClearLog", _e); }
 
 /* ---------- 设置栏折叠 ---------- */
-$("#railToggle").onclick = () => {
+try { $("#railToggle").onclick = () => {
   if ($("#rail").classList.contains("hide-txt")) { setRailTxt(false); return; }   // 隐藏文字状态下先恢复
   const willCollapse = !$("#rail").classList.contains("collapsed");
   $("#rail").classList.toggle("collapsed");
@@ -2055,7 +2095,7 @@ $("#railToggle").onclick = () => {
     if (r) $("#rail").style.width = clampSide(parseInt(r, 10) || 230, 230, $("#rail")) + "px";
   }
   localStorage.setItem("rail_collapsed", willCollapse ? "1" : "");
-};
+}; } catch (_e) { _bmiss("#railToggle", _e); }
 if (localStorage.getItem("rail_collapsed")) $("#rail").classList.add("collapsed");
 /* 隐藏设置文字: 面板全空但保留宽度/拖拽; 点击空白恢复 */
 function setRailTxt(hide) {
@@ -2063,8 +2103,8 @@ function setRailTxt(hide) {
   $("#rail").title = hide ? "点击恢复设置" : "";
   localStorage.setItem("rail_hide_txt", hide ? "1" : "");
 }
-$("#railHide").onclick = (e) => { e.stopPropagation(); setRailTxt(true); };
-$("#rail").addEventListener("click", () => { if ($("#rail").classList.contains("hide-txt")) setRailTxt(false); });
+try { $("#railHide").onclick = (e) => { e.stopPropagation(); setRailTxt(true); }; } catch (_e) { _bmiss("#railHide", _e); }
+try { $("#rail").addEventListener("click", () => { if ($("#rail").classList.contains("hide-txt")) setRailTxt(false); }); } catch (_e) { _bmiss("#rail", _e); }
 if (localStorage.getItem("rail_hide_txt")) setRailTxt(true);
 
 /* ---------- 分隔条(可拖拽调宽) ---------- */
@@ -2116,15 +2156,15 @@ if (w0 && !$("#rail").classList.contains("collapsed"))
 bindSplitter("sp0", $("#rail"), "left", "w_rail", 230);
 
 /* ---------- 信息流刷新按钮 + 默认宽度70% ---------- */
-$("#feedRefresh").onclick = () => { loadFeed(true); loadStatus(); toast("已刷新，正在获取新内容…"); };
-$("#feedClear").onclick = async () => {
+try { $("#feedRefresh").onclick = () => { loadFeed(true); loadStatus(); toast("已刷新，正在获取新内容…"); }; } catch (_e) { _bmiss("#feedRefresh", _e); }
+try { $("#feedClear").onclick = async () => {
   if (!confirm("确定清空信息池并重新收录吗？将清空已收录的全部内容，并按当前设置重新抓取/评分。")) return;
   const r = await api("/api/pool/clear", { method: "POST", body: {} });
   if (!r.ok) return toast("清空信息池失败", { warn: true });
   toast("已清空信息池，正在重新收录…");
   loadFeed(true);      // refresh=1 → 后端重新抓取收录
   loadStatus();
-};
+}; } catch (_e) { _bmiss("#feedClear", _e); }
 function defaultFeedWidth() {
   if (localStorage.getItem("w_feed")) return;   // 用户拖过就不覆盖
   const feed = $("#feed"), panel = $("#panel");
@@ -2213,32 +2253,32 @@ async function loadAccountView() {
         <b>收藏夹</b>：${(d.favs || []).map((f) => esc(f.title) + " (" + f.count + ")").join("、") || "暂无"}</div>`
     : "";
 }
-$("#qrRefresh").onclick = qrStart;
-$("#acctOpen").onclick = () => openExternal("https://www.bilibili.com");
-$("#acctLogin").onclick = async () => {
+try { $("#qrRefresh").onclick = qrStart; } catch (_e) { _bmiss("#qrRefresh", _e); }
+try { $("#acctOpen").onclick = () => openExternal("https://www.bilibili.com"); } catch (_e) { _bmiss("#acctOpen", _e); }
+try { $("#acctLogin").onclick = async () => {
   const cookie = $("#acctCookie").value.trim();
   if (!cookie) { toast("请先粘贴 Cookie", { warn: true }); return; }
   const r = await api("/api/account", { method: "POST", body: { cookie } });
   if (r.ok) { toast("B站账号登录成功，画像已生成"); loadAccountView(); loadMessages(); loadFeed(); loadStatus(); }
   else toast("登录失败：" + (r.error || "Cookie 无效"), { warn: true });
-};
-$("#acctSync").onclick = async () => {
+}; } catch (_e) { _bmiss("#acctLogin", _e); }
+try { $("#acctSync").onclick = async () => {
   const r = await api("/api/account/sync", { method: "POST", body: {} });
   if (r.ok) { toast("账号数据已同步"); loadAccountView(); loadFeed(); }
   else toast("同步失败：" + (r.error || ""), { warn: true });
-};
-$("#acctLogout").onclick = async () => {
+}; } catch (_e) { _bmiss("#acctSync", _e); }
+try { $("#acctLogout").onclick = async () => {
   await api("/api/account/logout", { method: "POST", body: {} });
   $("#acctCookie").value = "";
   loadAccountView();
   loadMessages();
   toast("已退出账号");
   loadFeed();
-};
-$("#acctClose").onclick = () => { qrStop(); tbLoginPollStop(); xhhPollStop(); $("#accountModal").classList.add("hidden"); };
-$("#accountModal").addEventListener("click", (e) => {
+}; } catch (_e) { _bmiss("#acctLogout", _e); }
+try { $("#acctClose").onclick = () => { qrStop(); tbLoginPollStop(); xhhPollStop(); $("#accountModal").classList.add("hidden"); }; } catch (_e) { _bmiss("#acctClose", _e); }
+try { $("#accountModal").addEventListener("click", (e) => {
   if (e.target.id === "accountModal") { qrStop(); tbLoginPollStop(); xhhPollStop(); $("#accountModal").classList.add("hidden"); }
-});
+}); } catch (_e) { _bmiss("#accountModal", _e); }
 /* ---------- 账号弹窗标签页(B站/贴吧) ---------- */
 function acctTab(name) {
   $("#tabBili").classList.toggle("on", name === "bili");
@@ -2248,11 +2288,11 @@ function acctTab(name) {
   $("#acctTieba").classList.toggle("hidden", name !== "tieba");
   $("#acctXhh").classList.toggle("hidden", name !== "xhh");
 }
-$("#tabBili").onclick = () => { acctTab("bili"); };
-$("#tabTieba").onclick = () => { acctTab("tieba"); };
-$("#tabXhh").onclick = () => { acctTab("xhh"); loadXhhView(); };
+try { $("#tabBili").onclick = () => { acctTab("bili"); }; } catch (_e) { _bmiss("#tabBili", _e); }
+try { $("#tabTieba").onclick = () => { acctTab("tieba"); }; } catch (_e) { _bmiss("#tabTieba", _e); }
+try { $("#tabXhh").onclick = () => { acctTab("xhh"); loadXhhView(); }; } catch (_e) { _bmiss("#tabXhh", _e); }
 function openAccountModal() { loadAccountView(); loadTiebaView(); $("#accountModal").classList.remove("hidden"); }
-$("#userAvatar").onclick = () => { openAccountModal(); acctTab("bili"); };
+try { $("#userAvatar").onclick = () => { openAccountModal(); acctTab("bili"); }; } catch (_e) { _bmiss("#userAvatar", _e); }
 
 /* ---------- 贴吧账号（一键浏览器登录 → CDP 抓 cookie） ---------- */
 let tbPollTimer = null;
@@ -2289,7 +2329,7 @@ async function loadTiebaView() {
   fillTbBrowseKw();
   return d;
 }
-$("#tbAvatarBox").onclick = () => { openAccountModal(); acctTab("tieba"); };
+try { $("#tbAvatarBox").onclick = () => { openAccountModal(); acctTab("tieba"); }; } catch (_e) { _bmiss("#tbAvatarBox", _e); }
 if (window.AndroidBridge) {
   const tbSms = document.getElementById("tbLoginNativeSms");
   const tbWeb = document.getElementById("tbLoginNativeWeb");
@@ -2302,7 +2342,7 @@ if (window.AndroidBridge) {
     tbWeb.onclick = () => window.AndroidBridge.openTiebaLogin("web");
   }
 }
-$("#tbLoginStart").onclick = async () => {
+try { $("#tbLoginStart").onclick = async () => {
   const r = await api("/api/tieba/login", { method: "POST", body: {} });
   if (!r.ok) { toast("启动失败：" + (r.error || ""), { warn: true }); return; }
   if (r.manual) {
@@ -2329,26 +2369,26 @@ $("#tbLoginStart").onclick = async () => {
       toast(p.status === "expired" ? "登录超时，请重试" : (p.message || "登录失败"), { warn: true });
     }
   }, 2500);
-};
-$("#tbLoginStop").onclick = async () => {
+}; } catch (_e) { _bmiss("#tbLoginStart", _e); }
+try { $("#tbLoginStop").onclick = async () => {
   await api("/api/tieba/login/stop", { method: "POST", body: {} });
   tbLoginPollStop(); $("#tbLoginStop").classList.add("hidden");
   $("#tbLoginState").textContent = "窗口已关闭";
-};
-$("#tbLoginManual").onclick = async () => {
+}; } catch (_e) { _bmiss("#tbLoginStop", _e); }
+try { $("#tbLoginManual").onclick = async () => {
   const cookie = $("#tbCookie").value.trim();
   if (!cookie) { toast("请先粘贴 Cookie", { warn: true }); return; }
   const res = await api("/api/tieba/login/manual", { method: "POST", body: { cookie } });
   if (res.ok) { toast("贴吧登录成功"); loadTiebaView(); loadMessages(); loadStatus(); }
   else toast("登录失败：" + (res.error || "Cookie 无效"), { warn: true });
-};
-$("#tbLogout").onclick = async () => {
+}; } catch (_e) { _bmiss("#tbLoginManual", _e); }
+try { $("#tbLogout").onclick = async () => {
   await api("/api/tieba/logout", { method: "POST", body: {} });
   $("#tbCookie").value = "";
   loadTiebaView(); loadMessages(); loadStatus(); loadFeed();
   toast("已退出贴吧账号");
-};
-$("#tbImport").onclick = async () => {
+}; } catch (_e) { _bmiss("#tbLogout", _e); }
+try { $("#tbImport").onclick = async () => {
   $("#tbImportHint").textContent = "拉取中…";
   const r = await api("/api/tieba/mylike");
   if (!r.ok) { $("#tbImportHint").textContent = ""; toast("导入失败：" + (r.error || ""), { warn: true }); return; }
@@ -2359,31 +2399,41 @@ $("#tbImport").onclick = async () => {
   const sv = await api("/api/tieba", { method: "POST", body: { bars: merged } });
   if (sv.ok) toast("已导入关注吧并保存，正在重建信息流");
   else toast("保存失败：" + (sv.error || ""), { warn: true });
-};
-/* ---------- 浏览器辅助采集(贴吧风控时手动通道) ---------- */
+}; } catch (_e) { _bmiss("#tbImport", _e); }
+/* ---------- 浏览器辅助采集(贴吧风控时手动通道) ----------
+   两处入口: 「机器筛选 → 贴吧」与「个人 → 贴吧账号 → 手动采集」。
+   v0.3.1.25 前两处共用同一组 id(重复 id) → 账号弹窗那组永远绑不上, 点了没反应。
+   现: 账号弹窗那组 id 加 2 后缀, 这里两组都绑; 下拉框按 class 统一填充。 */
 function fillTbBrowseKw() {
-  const sel = $("#tbBrowseKw");
-  if (!sel) return;
   const bars = ($("#tbBars").value || "").split(/[\n,，、;；]+/).map((s) => s.trim()).filter(Boolean);
-  sel.innerHTML = bars.map((b) => `<option value="${esc(b)}">${esc(b)}吧</option>`).join("") ||
+  const html = bars.map((b) => `<option value="${esc(b)}">${esc(b)}吧</option>`).join("") ||
     `<option value="">（先在设置里填吧名）</option>`;
+  document.querySelectorAll(".tb-kw-pick").forEach((sel) => { sel.innerHTML = html; });
 }
-$("#tbBars").addEventListener("input", fillTbBrowseKw);
-$("#tbBrowseOpen").onclick = async () => {
-  const kw = $("#tbBrowseKw").value;
-  if (!kw) { toast("请先在设置里填吧名", { warn: true }); return; }
-  const r = await api("/api/tieba/browse?kw=" + encodeURIComponent(kw));
-  $("#tbBrowseHint").textContent = r.ok ? r.message : ("失败：" + (r.error || ""));
-  if (!r.ok) { toast("打开失败：" + (r.error || ""), { warn: true }); return; }
-  toast("贴吧窗口已打开，等页面加载完点「抓取此页」");
-};
-$("#tbBrowseGrab").onclick = async () => {
-  $("#tbBrowseHint").textContent = "抓取中…";
-  const r = await api("/api/tieba/grab", { method: "POST", body: {} });
-  $("#tbBrowseHint").textContent = r.ok ? r.message : ("失败：" + (r.error || ""));
-  if (r.ok) { toast("已抓取 " + r.items + " 条：" + (r.fname || "")); loadFeed(); loadStatus(); }
-  else toast("抓取失败：" + (r.error || ""), { warn: true });
-};
+try { $("#tbBars").addEventListener("input", fillTbBrowseKw); } catch (_e) { _bmiss("#tbBars", _e); }
+function tbBrowseBind(kwId, openId, grabId, hintId) {
+  const open = document.getElementById(openId);
+  const grab = document.getElementById(grabId);
+  const kwVal = () => { const e = document.getElementById(kwId); return e ? e.value : ""; };
+  const hint = (t) => { const h = document.getElementById(hintId); if (h) h.textContent = t; };
+  if (open) open.onclick = async () => {
+    const kw = kwVal();
+    if (!kw) { toast("请先在设置里填吧名", { warn: true }); return; }
+    const r = await api("/api/tieba/browse?kw=" + encodeURIComponent(kw));
+    hint(r.ok ? r.message : ("失败：" + (r.error || "")));
+    if (!r.ok) { toast("打开失败：" + (r.error || ""), { warn: true }); return; }
+    toast("贴吧窗口已打开，等页面加载完点「抓取此页」");
+  };
+  if (grab) grab.onclick = async () => {
+    hint("抓取中…");
+    const r = await api("/api/tieba/grab", { method: "POST", body: {} });
+    hint(r.ok ? r.message : ("失败：" + (r.error || "")));
+    if (r.ok) { toast("已抓取 " + r.items + " 条：" + (r.fname || "")); loadFeed(); loadStatus(); }
+    else toast("抓取失败：" + (r.error || ""), { warn: true });
+  };
+}
+tbBrowseBind("tbBrowseKw", "tbBrowseOpen", "tbBrowseGrab", "tbBrowseHint");
+tbBrowseBind("tbBrowseKw2", "tbBrowseOpen2", "tbBrowseGrab2", "tbBrowseHint2");
 
 /* ---------- 小黑盒账号（扫码登录 → 稳定采集） ---------- */
 let xhhPollTimer = null;
@@ -2416,7 +2466,7 @@ async function loadXhhView() {
   }
   return d;
 }
-$("#xhhAvatarBox").onclick = () => { openAccountModal(); acctTab("xhh"); };
+try { $("#xhhAvatarBox").onclick = () => { openAccountModal(); acctTab("xhh"); }; } catch (_e) { _bmiss("#xhhAvatarBox", _e); }
 async function xhhNewQr(autoRenew) {
   const r = await api("/api/xhh/qr");
   if (!r.ok) { toast("二维码生成失败：" + (r.error || ""), { warn: true }); return false; }
@@ -2429,7 +2479,7 @@ async function xhhNewQr(autoRenew) {
     : "用手机小黑盒 App「扫一扫」登录（二维码 " + r.expire + " 秒有效，请提前打开手机小黑盒做好准备）";
   return true;
 }
-$("#xhhQrGen").onclick = async () => {
+try { $("#xhhQrGen").onclick = async () => {
   if (!(await xhhNewQr(false))) return;
   $("#xhhQrStop").classList.remove("hidden");
   xhhPollStop();
@@ -2451,13 +2501,13 @@ $("#xhhQrGen").onclick = async () => {
       }
     }
   }, 2500);
-};
-$("#xhhQrStop").onclick = () => { xhhPollStop(); $("#xhhQrStop").classList.add("hidden"); $("#xhhQrState").textContent = "已停止轮询"; };
-$("#xhhLogout").onclick = async () => {
+}; } catch (_e) { _bmiss("#xhhQrGen", _e); }
+try { $("#xhhQrStop").onclick = () => { xhhPollStop(); $("#xhhQrStop").classList.add("hidden"); $("#xhhQrState").textContent = "已停止轮询"; }; } catch (_e) { _bmiss("#xhhQrStop", _e); }
+try { $("#xhhLogout").onclick = async () => {
   await api("/api/xhh/logout", { method: "POST", body: {} });
   loadXhhView(); loadMessages(); loadStatus();
   toast("已退出小黑盒账号");
-};
+}; } catch (_e) { _bmiss("#xhhLogout", _e); }
 
 /* ---------- 机器筛选（其他设置） ---------- */
 let srcOn = {};
@@ -2523,11 +2573,11 @@ async function loadMachine() {
       loadMachine(); loadFeed(); toast("已移除该屏蔽");
     }));
 }
-$("#btnMachine").onclick = () => { loadMachine(); loadTiebaSettings(); machineTab("general"); $("#machineModal").classList.remove("hidden"); };
-$("#mClose").onclick = () => $("#machineModal").classList.add("hidden");
-$("#machineModal").addEventListener("click", (e) => {
+try { $("#btnMachine").onclick = () => { loadMachine(); loadTiebaSettings(); machineTab("general"); $("#machineModal").classList.remove("hidden"); }; } catch (_e) { _bmiss("#btnMachine", _e); }
+try { $("#mClose").onclick = () => $("#machineModal").classList.add("hidden"); } catch (_e) { _bmiss("#mClose", _e); }
+try { $("#machineModal").addEventListener("click", (e) => {
   if (e.target.id === "machineModal") $("#machineModal").classList.add("hidden");
-});
+}); } catch (_e) { _bmiss("#machineModal", _e); }
 /* 机器筛选弹窗标签页(B站/贴吧/小黑盒) */
 function machineTab(name) {
   $("#mTabGeneral").classList.toggle("on", name === "general");
@@ -2539,11 +2589,11 @@ function machineTab(name) {
   $("#mTieba").classList.toggle("hidden", name !== "tieba");
   $("#mXhh").classList.toggle("hidden", name !== "xhh");
 }
-$("#mTabGeneral").onclick = () => machineTab("general");
-$("#mTabBili").onclick = () => machineTab("bili");
-$("#mTabTieba").onclick = () => machineTab("tieba");
-$("#mTabXhh").onclick = () => machineTab("xhh");
-$("#mGeneralSave").onclick = async () => {
+try { $("#mTabGeneral").onclick = () => machineTab("general"); } catch (_e) { _bmiss("#mTabGeneral", _e); }
+try { $("#mTabBili").onclick = () => machineTab("bili"); } catch (_e) { _bmiss("#mTabBili", _e); }
+try { $("#mTabTieba").onclick = () => machineTab("tieba"); } catch (_e) { _bmiss("#mTabTieba", _e); }
+try { $("#mTabXhh").onclick = () => machineTab("xhh"); } catch (_e) { _bmiss("#mTabXhh", _e); }
+try { $("#mGeneralSave").onclick = async () => {
   await api("/api/machine", { method: "POST", body: {
     m_min_views: String(parseInt($("#mMinViews").value, 10) || 0),
     m_max_views: String(parseInt($("#mMaxViews").value, 10) || 0),
@@ -2557,8 +2607,8 @@ $("#mGeneralSave").onclick = async () => {
   }});
   toast("通用筛选设置已保存");
   loadFeed(true); loadMachine();
-};
-$("#xhhSave").onclick = async () => {
+}; } catch (_e) { _bmiss("#mGeneralSave", _e); }
+try { $("#xhhSave").onclick = async () => {
   const r = await api("/api/machine", { method: "POST", body: {
     xhh_comm: $("#xhhComm").value.trim(),
     xhh_topic: $("#xhhTopic").value.trim(),
@@ -2566,8 +2616,8 @@ $("#xhhSave").onclick = async () => {
   $("#xhhStatus").textContent = r.ok ? "已保存 ✓" : ("失败：" + (r.error || ""));
   if (r.ok) { toast("小黑盒筛选已保存，正在重建信息流"); loadFeed(); loadMachine(); }
   else toast("小黑盒筛选保存失败：" + (r.error || ""), { warn: true });
-};
-$("#mSave").onclick = async () => {
+}; } catch (_e) { _bmiss("#xhhSave", _e); }
+try { $("#mSave").onclick = async () => {
   await api("/api/machine", { method: "POST", body: {
     m_blocklist_sync: $("#mBlockSync").checked ? "1" : "0",
     m_dedup: $("#mDedup").checked ? "1" : "0",
@@ -2580,12 +2630,12 @@ $("#mSave").onclick = async () => {
   }});
   toast("机器筛选设置已保存");
   loadFeed(); loadMachine();
-};
-$("#mBlSync").onclick = async () => {
+}; } catch (_e) { _bmiss("#mSave", _e); }
+try { $("#mBlSync").onclick = async () => {
   const r = await api("/api/machine/blocklist-sync", { method: "POST", body: {} });
   if (r.ok) { toast("已同步 " + r.count + " 位拉黑用户"); loadMachine(); loadFeed(); }
   else toast("同步失败：" + (r.error || ""), { warn: true });
-};
+}; } catch (_e) { _bmiss("#mBlSync", _e); }
 
 /* 关注的人期限滑条: 实时更新显示 */
 function syncMonthsLabel() {
@@ -2594,6 +2644,113 @@ function syncMonthsLabel() {
   $("#mFollowMonthsVal").textContent = el.value;
 }
 if ($("#mFollowMonths")) $("#mFollowMonths").addEventListener("input", syncMonthsLabel);
+
+/* ---------- 评论筛选（其他设置） ---------- */
+async function loadCommentFilter() {
+  const d = await api("/api/machine");
+  const s = d.settings || {};
+  // cf_blk_on 缺省视为开(未设置时默认开启屏蔽黑名单评论)
+  const raw = s.cf_blk_on;
+  $("#cfBlkOn").checked = !(raw === "0" || raw === 0);
+  // v0.3.1.32 弹幕屏蔽总开关: 缺省视为开(与后端 DEFAULTS["m_dm_on"]="1" 一致)
+  if ($("#cfDmOn")) $("#cfDmOn").checked = !(s.m_dm_on === "0" || s.m_dm_on === 0);
+  // 无个性简介 / 动态抽奖: 默认关(缺省视为关; 只在播放页评论区生效)
+  if ($("#cfBlkMystery")) $("#cfBlkMystery").checked = s.m_block_mystery_bio === "1";
+  if ($("#cfBlkLottery")) $("#cfBlkLottery").checked = s.m_block_lottery === "1";
+  // 空首页(一条动态都没有)账号: 默认关; 只在播放页评论区生效
+  if ($("#cfBlkEmpty")) $("#cfBlkEmpty").checked = s.m_block_empty_space === "1";
+  const lv = String(s.cf_min_level || "2");
+  $("#cfLvlRow").querySelectorAll(".seg").forEach((b) =>
+    b.classList.toggle("on", b.dataset.v === lv));
+  // 多候选策略: 缺省 1(全命中才拦) —— 与后端 DEFAULTS["m_dm_multicand"] 保持一致
+  const mc = String(s.m_dm_multicand == null || s.m_dm_multicand === "" ? "1" : s.m_dm_multicand);
+  if ($("#cfMultiRow")) $("#cfMultiRow").querySelectorAll(".seg").forEach((b) =>
+    b.classList.toggle("on", b.dataset.v === mc));
+  // 筛选加速档位: 缺省 2(快速) —— 与后端 DEFAULTS["m_filter_speed"] 保持一致
+  const sp = String(s.m_filter_speed == null || s.m_filter_speed === "" ? "2" : s.m_filter_speed);
+  if ($("#cfSpeedRow")) $("#cfSpeedRow").querySelectorAll(".seg").forEach((b) =>
+    b.classList.toggle("on", b.dataset.v === sp));
+  cfDmGate();
+}
+/* 弹幕总开关关掉时, 把"只对弹幕生效"的那几行置灰(仍可点, 只是提示当前不生效) */
+function cfDmGate() {
+  const on = !$("#cfDmOn") || $("#cfDmOn").checked;
+  const b = $("#cfDmBody");
+  if (!b) return;
+  b.style.opacity = on ? "" : "0.45";
+  b.style.pointerEvents = on ? "" : "none";
+}
+try { $("#cfDmOn").addEventListener("change", cfDmGate); } catch (_e) { _bmiss("#cfDmOn", _e); }
+try { $("#btnCommentFilter").onclick = () => {
+  loadCommentFilter();
+  cfTab("general");
+  $("#commentFilterModal").classList.remove("hidden");
+}; } catch (_e) { _bmiss("#btnCommentFilter", _e); }
+try { $("#cfClose").onclick = () => $("#commentFilterModal").classList.add("hidden"); } catch (_e) { _bmiss("#cfClose", _e); }
+try { $("#commentFilterModal").addEventListener("click", (e) => {
+  if (e.target.id === "commentFilterModal") $("#commentFilterModal").classList.add("hidden");
+}); } catch (_e) { _bmiss("#commentFilterModal", _e); }
+function cfTab(name) {
+  $("#cfTabGeneral").classList.toggle("on", name === "general");
+  $("#cfTabBili").classList.toggle("on", name === "bili");
+  $("#cfGeneral").classList.toggle("hidden", name !== "general");
+  $("#cfBili").classList.toggle("hidden", name !== "bili");
+}
+try { $("#cfTabGeneral").onclick = () => cfTab("general"); } catch (_e) { _bmiss("#cfTabGeneral", _e); }
+try { $("#cfTabBili").onclick = () => cfTab("bili"); } catch (_e) { _bmiss("#cfTabBili", _e); }
+try { $("#cfLvlRow").querySelectorAll(".seg").forEach((b) => b.addEventListener("click", () => {
+  $("#cfLvlRow").querySelectorAll(".seg").forEach((x) => x.classList.toggle("on", x === b));
+})); } catch (_e) { _bmiss("#cfLvlRow", _e); }
+try { $("#cfMultiRow").querySelectorAll(".seg").forEach((b) => b.addEventListener("click", () => {
+  $("#cfMultiRow").querySelectorAll(".seg").forEach((x) => x.classList.toggle("on", x === b));
+})); } catch (_e) { _bmiss("#cfMultiRow", _e); }
+try { $("#cfSpeedRow").querySelectorAll(".seg").forEach((b) => b.addEventListener("click", () => {
+  $("#cfSpeedRow").querySelectorAll(".seg").forEach((x) => x.classList.toggle("on", x === b));
+})); } catch (_e) { _bmiss("#cfSpeedRow", _e); }
+try { $("#cfSave").onclick = async () => {
+  const on = $("#cfLvlRow .seg.on");
+  const lvl = String((on && on.dataset.v) || 2);
+  const wantM = $("#cfBlkMystery").checked ? "1" : "0";
+  const wantL = $("#cfBlkLottery").checked ? "1" : "0";
+  const wantE = $("#cfBlkEmpty").checked ? "1" : "0";
+  const mcOn = $("#cfMultiRow .seg.on");
+  const wantMC = String((mcOn && mcOn.dataset.v) || 1);
+  const spOn = $("#cfSpeedRow .seg.on");
+  const wantSP = String((spOn && spOn.dataset.v) || 2);
+  const wantDM = $("#cfDmOn").checked ? "1" : "0";
+  // 保存后回读校验: 以前后端不可达 / 键被白名单吞掉时会静默失败,
+  // 界面照样弹"已保存", 用户以为生效了其实没有 —— 现在必须回读确认。
+  try {
+    await api("/api/machine", { method: "POST", body: {
+      cf_blk_on: $("#cfBlkOn").checked ? "1" : "0",
+      cf_min_level: lvl,
+      m_block_mystery_bio: wantM,
+      m_block_lottery: wantL,
+      m_block_empty_space: wantE,
+      m_dm_multicand: wantMC,
+      m_filter_speed: wantSP,
+      m_dm_on: wantDM,
+    }});
+    const d = await api("/api/machine");
+    const s = (d && d.settings) || {};
+    if (String(s.cf_min_level || "2") !== lvl
+        || (s.m_block_mystery_bio === "1" ? "1" : "0") !== wantM
+        || (s.m_block_lottery === "1" ? "1" : "0") !== wantL
+        || (s.m_block_empty_space === "1" ? "1" : "0") !== wantE
+        || String(s.m_dm_multicand == null || s.m_dm_multicand === ""
+                  ? "1" : s.m_dm_multicand) !== wantMC
+        || String(s.m_filter_speed == null || s.m_filter_speed === ""
+                  ? "2" : s.m_filter_speed) !== wantSP
+        || (s.m_dm_on === "0" ? "0" : "1") !== wantDM) {
+      toast("保存未生效：后端没有写入（请重启软件后重试）");
+    } else {
+      toast("弹幕评论筛选设置已保存（打开 / 刷新播放页生效）");
+    }
+  } catch (e) {
+    toast("保存失败：" + (e && e.message ? e.message : e));
+  }
+  loadCommentFilter();
+}; } catch (_e) { _bmiss("#cfSave", _e); }
 
 /* ---------- 初始化 ---------- */
 (async function init() {
@@ -2857,9 +3014,11 @@ window.__nativeTiebaSaved = (ok) => {
 })();
 
 /* ---------- 设置导入导出(双端通用; 手机端经 AndroidBridge 直读剪贴板) ---------- */
-const IO_CRED_KEYS = ["bili_cookie", "tb_cookie", "tb_user", "tb_avatar", "xhh_cookie",
+/* ai_key 也属于账号内容: 用户要求「只导出设置」的文件里不能出现 aiKey */
+const IO_CRED_KEYS = ["ai_key", "bili_cookie", "tb_cookie", "tb_user", "tb_avatar", "xhh_cookie",
   "xhh_heybox_id", "xhh_pkey", "xhh_user", "xhh_avatar",
   "acct_nickname", "acct_profile", "bili_follow_mids", "bili_follow_names"];
+const IO_CRED_CAT = "账号与密钥";
 const IO_CATS = [
   ["AI 配置", ["ai_base", "ai_key", "ai_model", "ai_enabled", "ai_full_scan",
                "ai_interest_min", "ai_batch", "ai_cache_hours", "price_in", "price_out"]],
@@ -2900,7 +3059,7 @@ async function ioReadClip() {
   catch (e) { return ""; }
 }
 
-$("#btnIoOpen").onclick = () => {
+try { $("#btnIoOpen").onclick = () => {
   $("#settingsIoModal").classList.remove("hidden");
   $("#ioExpHint").textContent = "";
   $("#ioImpHint").textContent = "";
@@ -2908,12 +3067,21 @@ $("#btnIoOpen").onclick = () => {
   $("#ioImpPreview").innerHTML = "";
   $("#ioImpConfirm").disabled = true;
   ioParsed = null;
-};
-$("#ioClose").onclick = () => $("#settingsIoModal").classList.add("hidden");
+}; } catch (_e) { _bmiss("#btnIoOpen", _e); }
+try { $("#ioClose").onclick = () => $("#settingsIoModal").classList.add("hidden"); } catch (_e) { _bmiss("#ioClose", _e); }
 
-/* 导出 */
-$("#ioExportGen").onclick = async () => {
-  const r = await api("/api/settings/export", { method: "POST", body: { credentials: $("#ioExpCred").checked } });
+/* 导出: 默认只导出设置(不含个人信息); 含 aiKey/登录账号的那份必须显式勾选 ioExpPriv 才会产生。 */
+try { const _ioWarn = () => {
+  const c = $("#ioExpPriv");
+  const w = $("#ioExpWarn");
+  if (!c || !w) return;
+  w.textContent = c.checked
+    ? "⚠ 已选择：导出设置 + 个人信息（含 aiKey 与平台登录凭证）—— 仅用于自己备份，请勿外传。"
+    : "✓ 默认：只导出设置（不含 aiKey、登录账号与各平台 Cookie）—— 可直接分享给朋友，对方导入后填自己的密钥即可用。";
+}; const _priv = $("#ioExpPriv"); if (_priv) { _priv.onchange = _ioWarn; _ioWarn(); } } catch (_e) { _bmiss("#ioExpPriv", _e); }
+try { $("#ioExportGen").onclick = async () => {
+  const priv = $("#ioExpPriv") ? $("#ioExpPriv").checked : false;   // 默认不勾 = 只导出设置
+  const r = await api("/api/settings/export", { method: "POST", body: { credentials: priv } });
   if (!r.ok) { $("#ioExpHint").textContent = "导出失败：" + (r.error || ""); return; }
   const p = r.payload;
   p.io_prefs = {};
@@ -2921,22 +3089,39 @@ $("#ioExportGen").onclick = async () => {
   $("#ioExpText").value = JSON.stringify(p);
   const n = Object.keys(p.settings).length;
   $("#ioExpHint").textContent = "已生成：" + n + " 项设置 · 黑名单 " +
-    (p.blacklist.authors.length + p.blacklist.keywords.length) + " 条";
-};
-$("#ioExpCopy").onclick = async () => {
+    (p.blacklist.authors.length + p.blacklist.keywords.length) + " 条" +
+    (priv ? " · ⚠ 含 aiKey 与登录凭证" : " · 已脱敏（不含 aiKey / 登录账号）");
+}; } catch (_e) { _bmiss("#ioExportGen", _e); }
+try { $("#ioExpCopy").onclick = async () => {
   if (!$("#ioExpText").value) return toast("请先生成导出内容", { warn: true });
   $("#ioExpHint").textContent = (await ioCopy($("#ioExpText").value)) ? "已复制到剪贴板" : "复制失败，请手动全选复制";
-};
-$("#ioExpDownload").onclick = () => {
+}; } catch (_e) { _bmiss("#ioExpCopy", _e); }
+try { $("#ioExpDownload").onclick = async () => {
   if (!$("#ioExpText").value) return toast("请先生成导出内容", { warn: true });
+  const name = "洞鉴虚明-设置-" + new Date().toISOString().slice(0, 10) + ".json";
+  /* 桌面窗口壳: WebView2 里 <a download> 不触发(壳没接 DownloadStarting),
+     改走原生「另存为」(app_window.ShellApi.save_text)。失败再退回 Blob 下载。 */
+  const nat = window.pywebview && window.pywebview.api;
+  if (nat && nat.save_text) {
+    try {
+      const r = String(await nat.save_text(name, $("#ioExpText").value) || "");
+      if (r === "cancel") return;
+      if (r.slice(0, 3) === "ok:") { $("#ioExpHint").textContent = "已保存到：" + r.slice(3); return; }
+      $("#ioExpHint").textContent = "保存失败：" + r.replace(/^err:/, "");
+      return;
+    } catch (_) { /* 桥异常 → 下面的 Blob 兜底 */ }
+  }
   const blob = new Blob([$("#ioExpText").value], { type: "application/json" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = "洞鉴虚明-设置-" + new Date().toISOString().slice(0, 10) + ".json";
+  a.download = name;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 3000);
-};
-if (isTouchDevice()) $("#ioExpDownload").classList.add("hidden");   // WebView 无下载监听, 隐藏
+}; } catch (_e) { _bmiss("#ioExpDownload", _e); }
+/* 触屏端没有原生另存为时才隐藏(壳里有 save_text 就能用, 别把按钮藏掉) */
+if (isTouchDevice() && !(window.pywebview && window.pywebview.api && window.pywebview.api.save_text)) {
+  $("#ioExpDownload").classList.add("hidden");
+}
 if (window.AndroidBridge && window.AndroidBridge.shareText) {
   $("#ioExpShare").classList.remove("hidden");   // 安卓: 调系统分享面板存文件/发给自己
   $("#ioExpShare").onclick = () => {
@@ -2957,11 +3142,11 @@ function ioReadFile(file) {
   fr.onerror = () => toast("文件读取失败", { warn: true });
   fr.readAsText(file, "utf-8");
 }
-$("#ioImpFile").onclick = () => $("#ioImpFileInput").click();
-$("#ioImpFileInput").addEventListener("change", () => {
+try { $("#ioImpFile").onclick = () => $("#ioImpFileInput").click(); } catch (_e) { _bmiss("#ioImpFile", _e); }
+try { $("#ioImpFileInput").addEventListener("change", () => {
   ioReadFile($("#ioImpFileInput").files && $("#ioImpFileInput").files[0]);
   $("#ioImpFileInput").value = "";   // 允许重复选择同一文件
-});
+}); } catch (_e) { _bmiss("#ioImpFileInput", _e); }
 /* 电脑端: 拖 .json 文件进弹窗窗口 */
 const ioModal = $("#settingsIoModal");
 ioModal.addEventListener("dragover", (e) => { e.preventDefault(); });
@@ -2982,7 +3167,7 @@ function ioExtractJson(text) {
 }
 function ioCatOf(key) {
   for (const [name, keys] of IO_CATS) if (keys.includes(key)) return name;
-  return IO_CRED_KEYS.includes(key) ? "登录凭证" : null;
+  return IO_CRED_KEYS.includes(key) ? IO_CRED_CAT : null;
 }
 function ioRunParse(text) {
   let p;
@@ -3000,14 +3185,18 @@ function ioRunParse(text) {
     if (n) cats.push([name, n]);
   });
   const credN = keys.filter((k) => IO_CRED_KEYS.includes(k)).length;
-  if (credN) cats.push(["登录凭证", credN]);
+  if (credN) cats.push([IO_CRED_CAT, credN]);
   const prefsN = Object.keys(p.io_prefs || {}).length;
   if (prefsN) cats.push(["界面偏好", prefsN]);
   const bl = p.blacklist || {};
   const blN = (bl.authors || []).length + (bl.keywords || []).length;
   let html = '<label><b>解析成功，勾选要导入的部分：</b></label>';
+  if (p.sanitized) {
+    html += '<p class="tip">此文件已脱敏（导出时勾了「只导出设置」），不含 aiKey 与登录账号。</p>';
+  }
   cats.forEach(([name, n]) => {
-    const warn = name === "登录凭证" ? ' <span class="tip-inline">⚠ 含登录Cookie，导入后免扫码直接登录</span>' : "";
+    const warn = name === IO_CRED_CAT
+      ? ' <span class="tip-inline">⚠ 含 aiKey / 登录 Cookie，导入后免扫码直接登录</span>' : "";
     html += '<label class="m-row"><input type="checkbox" data-cat="' + esc(name) + '" checked>' +
             '<span>' + esc(name) + '（' + n + ' 项）</span></label>' + warn;
   });
@@ -3017,8 +3206,8 @@ function ioRunParse(text) {
   $("#ioImpConfirm").disabled = false;
   $("#ioImpHint").textContent = "导出时间 " + (p.ts ? new Date(p.ts * 1000).toLocaleString() : "未知");
 }
-$("#ioImpParse").onclick = () => ioRunParse($("#ioImpText").value);
-$("#ioImpClip").onclick = async () => {
+try { $("#ioImpParse").onclick = () => ioRunParse($("#ioImpText").value); } catch (_e) { _bmiss("#ioImpParse", _e); }
+try { $("#ioImpClip").onclick = async () => {
   const text = await ioReadClip();
   if (!text.trim()) {
     $("#ioImpHint").textContent = window.AndroidBridge ? "剪贴板是空的" : "无法读取剪贴板，请手动粘贴到下方输入框";
@@ -3026,8 +3215,8 @@ $("#ioImpClip").onclick = async () => {
   }
   $("#ioImpText").value = text;
   ioRunParse(text);
-};
-$("#ioImpConfirm").onclick = async () => {
+}; } catch (_e) { _bmiss("#ioImpClip", _e); }
+try { $("#ioImpConfirm").onclick = async () => {
   if (!ioParsed) return;
   const checked = new Set([...$("#ioImpPreview").querySelectorAll("input:checked")].map((c) => c.dataset.cat));
   const settings = {};
@@ -3051,3 +3240,31 @@ $("#ioImpConfirm").onclick = async () => {
   $("#settingsIoModal").classList.add("hidden");
   loadSettings(); loadFeed(); loadStatus(); loadPanel(); loadBlacklist();
 };
+
+/* ---------- 前端资源版本自检 + 一次性自愈 (v0.3.1.25) ----------
+   有顶层绑定失败 = 手上的 index.html 与 app.js 不是同一版本(最常见是旧页面被缓存)。
+   带时间戳强刷一次绕开缓存; sessionStorage 保证一个会话只试一次, 不会死循环。
+   强刷后仍缺 → 明确告诉用户, 不再让「点了没反应」无声无息。 */
+(function () {
+  if (!_bindMiss.length) return;
+  var KEY = "msx_reload_for_skew";
+  var seen = 0;
+  try { seen = Number(sessionStorage.getItem(KEY) || 0); } catch (_) {}
+  if (seen < 1) {
+    try { sessionStorage.setItem(KEY, String(seen + 1)); } catch (_) {}
+    try {
+      console.warn("[msx] 前端资源版本不一致, 缺元素: " + _bindMiss.join(", ") + " → 强刷一次");
+      location.replace(location.pathname + "?_msxr=" + Date.now());
+      return;
+    } catch (_) {}
+  }
+  try {
+    var tip = document.createElement("div");
+    tip.setAttribute("style", "position:fixed;left:0;right:0;bottom:0;z-index:2147483647;"
+      + "padding:9px 12px;background:#5a2222;color:#fff;text-align:center;"
+      + "font:12px/1.6 system-ui,-apple-system,'Microsoft YaHei',sans-serif");
+    tip.textContent = "界面资源版本不一致，部分按钮可能失效（缺 " + _bindMiss.join("、")
+      + "）。请完全退出本程序后重新启动；若仍不行请重新安装。";
+    (document.body || document.documentElement).appendChild(tip);
+  } catch (_) {}
+})(); } catch (_e) { _bmiss("#ioImpConfirm", _e); }

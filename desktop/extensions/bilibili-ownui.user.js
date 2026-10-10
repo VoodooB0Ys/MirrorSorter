@@ -1,9 +1,12 @@
-/* 洞鉴虚明 · B站播放页自有UI (v0.3.1.2) —— 注入脚本(document-start, MAIN world)
+/* 洞鉴虚明 · B站播放页自有UI (v0.3.1.30) —— 注入脚本(document-start, MAIN world)
  *
  * 门控: window.__MSX_OWNUI__ === 1(壳按设置键 ui_ownui 注入) 且 www.bilibili.com/video/*。
  * 作用: 评论区 + 右侧栏整块替换为自有UI(Shadow DOM, 数据走B站官方web API+壳内登录态);
  *       播放器/弹幕/三连工具条 DOM 一律不碰 —— 超分管线红线(shell_pages 另行注入)。
  * 降级: 任一区域选择器找不到/接口异常 → 静默保持原生, 绝不让页面白屏。
+ * v0.3.1.28: 弹幕面板的渲染是**追加式**的(只往末尾添行), 数据源缩短/换新时无法重画,
+ * 于是「切隐藏屏蔽」看起来毫无反应。现在 chunk() 认源数组的**引用变化**与 oid 变化,
+ * 一变就 hardReset() 清空重建; 开关也强制 hardReset 后再画。
  * 主题: 读 theme_style cookie 跟随B站原生深浅(壳内深色由 CookieManager 写入)。
  */
 (function () {
@@ -20,21 +23,88 @@
    * 遮罩用 visibility:hidden(保留布局)而非 display:none —— 不影响 B站头部新旧
    * 切换时对容器的几何测量/IntersectionObserver, 不会再触发顶栏消失问题。
    * 挂载完成(或15s兜底失败)即摘除; SPA 路由重建时重新戴上。 */
+  function veilHold(ttl) {
+    // 连带申请"壳级防闪幕布"延后揭幕: 改版面前别把原生评论区/右栏露出来。
+    // ttl 到期自动失效, 所以即使本脚本异常也不会把页面永久盖住。
+    try {
+      if (window.__msx_veil_hold) { window.__msx_veil_hold("ownui", ttl); return; }
+      var H = window.__msx_veil_holds || (window.__msx_veil_holds = {});
+      H["ownui"] = Date.now() + ttl;   // 幕布脚本还没跑: 先排队
+    } catch (e) {}
+  }
+  function veilRelease() {
+    try {
+      if (window.__msx_veil_release) { window.__msx_veil_release("ownui"); return; }
+      var H = window.__msx_veil_holds;
+      if (H) delete H["ownui"];
+    } catch (e) {}
+  }
+  /* 文档根可能还不存在 —— 壳用 AddScriptToExecuteOnDocumentCreated 注入, 与浏览器扩展的
+     document-start 同点: 文档刚创建、解析器还没建 <html>, document.head 与
+     document.documentElement 都是 null。原写法 (document.head || document.documentElement)
+     .appendChild(...) 会抛 TypeError 并被 catch 吞掉 ⇒ 样式永不生效。
+     实测(desktop/_ad_probe.js, Edge + 壳真实注入串): #msx-ownui-adblock 与
+     #msx-ownui-boot-style 根本没进 DOM —— 广告屏蔽与防闪遮罩一直是失效的;
+     且 catch 里的 bootMaskOff() 会立刻 veilRelease(), 防闪幕布白申请。
+     这里统一等根节点出现(解析器建 <html> 那一帧 MutationObserver 就会回调)再挂,
+     DOMContentLoaded 兜底。 */
+  function whenRoot(fn) {
+    try { if (document.documentElement) { fn(); return; } } catch (e) {}
+    try {
+      var mo = new MutationObserver(function () {
+        try { if (document.documentElement) { mo.disconnect(); fn(); } } catch (e) {}
+      });
+      mo.observe(document, { childList: true, subtree: true });
+    } catch (e) {}
+    try { document.addEventListener("DOMContentLoaded", fn, { once: true }); } catch (e) {}
+  }
+  function mountStyle(id, css) {
+    whenRoot(function () {
+      try {
+        if (document.getElementById(id)) return;
+        var st = document.createElement("style");
+        st.id = id;
+        st.textContent = css;
+        (document.head || document.documentElement).appendChild(st);
+      } catch (e) {}
+    });
+  }
+  var maskOff = false;   // bootMaskOff 已调用过 → 晚到的 whenRoot 回调别再戴遮罩
+
   function bootMaskOn() {
-    try { document.documentElement.classList.add("msx-ownui-boot"); } catch (e) {}
+    whenRoot(function () {
+      if (maskOff) return;
+      try { document.documentElement.classList.add("msx-ownui-boot"); } catch (e) {}
+    });
+    /* 防闪 hold: 只盖住"最初一瞬"。壳幕布自己的揭幕闸门是 LATE=900ms(见 shell_pages
+       的 _NOFLASH_JS), 所以这里给 700ms —— 不会再往后拖揭幕(用户反馈: 播放页比浏览器
+       慢 2s+, 就是被这个 hold 拖到 2.2s 才露画面)。原生评论区/右栏由下面的
+       msx-ownui-boot 类全程遮着, 挂好再摘, 不靠幕布兜。 */
+    veilHold(700);
   }
   function bootMaskOff() {
+    maskOff = true;
     try { document.documentElement.classList.remove("msx-ownui-boot"); } catch (e) {}
+    veilRelease();    // 自有UI已挂好(或放弃挂载) → 允许揭幕
   }
   bootMaskOn();
-  try {
-    var bm = document.createElement("style");
-    bm.id = "msx-ownui-boot-style";
-    bm.textContent = "html.msx-ownui-boot #comment,html.msx-ownui-boot .comment-container,"
-      + "html.msx-ownui-boot .comment,html.msx-ownui-boot .right-container,"
-      + "html.msx-ownui-boot #right-container{visibility:hidden!important}";
-    (document.head || document.documentElement).appendChild(bm);
-  } catch (e) { bootMaskOff(); }
+  mountStyle("msx-ownui-boot-style",
+    "html.msx-ownui-boot #commentapp,html.msx-ownui-boot #comment,"
+    + "html.msx-ownui-boot .comment-container,html.msx-ownui-boot .comment,"
+    + "html.msx-ownui-boot .right-container,html.msx-ownui-boot #right-container"
+    + "{visibility:hidden!important}");
+
+  /* ---------------- 广告屏蔽(bug11): 播放页右栏的"大广告框" ----------------
+   * 现场实测(探针 desktop/_biliref.js, BV1tGpT6oEQy)右栏底部那个大推广块就是:
+   *   div.ad-report.ad-floor-exp.right-bottom-banner (350x175)
+   *     └ a.ad-report-inner / div.ad-floor-cover.b-img
+   * 另有视频页的"特别推荐"卡 .video-page-special-card-small(同类推广位)。全部去掉。
+   * 用 CSS 常驻规则而不是 JS 删除 —— 广告是懒加载插入的, JS 删会漏掉后插入的节点。
+   * ⚠ 不要动 .bpx-player-adv-dm-wrap: 那是播放器的高级弹幕层, 不是广告。 */
+  mountStyle("msx-ownui-adblock",
+    ".ad-report,.ad-report-inner,.ad-floor-exp,.ad-floor-cover,.right-bottom-banner,"
+    + ".video-page-special-card-small,.slide-ad-exp,.video-card-ad-small,"
+    + ".bili-video-card__info--ad,.adblock-tips{display:none!important}");
 
   /* ---------------- 顶栏精简: 只去左侧频道导航(保留LOGO/搜索框/用户区) ----------------
    * 不整块隐藏 left-entry(部分登录态变体下会连带整条栏消失), 改为逐条目处理:
@@ -154,6 +224,44 @@
     return out;
   }
 
+  /* ---------------- 评论筛选(与壳"其他设置 · 评论筛选"同源) ----------------
+   * window.__MSX_CF__ = { blk_on, blk:[用户名...], lvl:1..5 }
+   * 规则在页面本地执行, 不消耗服务端资源:
+   *   · blk_on 时, 用户名命中"软件黑名单"的评论不渲染;
+   *   · 用户 B站等级低于 lvl 的评论不渲染(lvl<=1 等于不过滤)。
+   * 取不到等级信息时不过滤, 避免误伤。
+   * 注(2026-10-08): 权威过滤已挪到 extensions/bilibili-cfilter.user.js —— 它在
+   * document-start 劫持 api.bilibili.com/x/v2/reply* 的响应, 对 B站原生评论区同样生效
+   * (本脚本自建评论区的挂载点 #comment/.comment-container/.comment 在现版 B站 全落空,
+   *  评论区根元素实为 #commentapp, 面板挂不上)。下面 cfPass 仅作自建面板的兜底。 */
+  var CF = window.__MSX_CF__ || null;
+  /* v0.3.1.31: 黑名单改成字典查表 O(1)。旧实现是 `for (i < CF.blk.length) if (nm === CF.blk[i])`
+     —— 每条评论线性扫整个名单(43 个名字 × 200 条评论 = 8600 次字符串比较/页)。
+     与 dmfilter / cfilter 保持一致: Object.create(null) 哈希, 键名不会撞 Object 原型。 */
+  var CF_BLK = null;
+  if (CF && CF.blk_on && CF.blk && CF.blk.length) {
+    CF_BLK = Object.create(null);
+    for (var _bi = 0; _bi < CF.blk.length; _bi++) {
+      var _bn = String(CF.blk[_bi] == null ? "" : CF.blk[_bi]).trim();
+      if (_bn) CF_BLK[_bn] = 1;
+    }
+    if (!Object.keys(CF_BLK).length) CF_BLK = null;
+  }
+  function cfPass(r) {
+    if (!CF) return true;
+    var m = r && r.member;
+    if (CF_BLK) {
+      var nm = String(m && m.uname || "").trim();
+      if (nm && CF_BLK[nm]) return false;
+    }
+    var lv = Number(CF.lvl) || 0;
+    if (lv > 1) {
+      var cur = m && m.level_info ? Number(m.level_info.current_level) : NaN;
+      if (isFinite(cur) && cur < lv) return false;
+    }
+    return true;
+  }
+
   /* ---------------- 工具 ---------------- */
   function qs(sel, root) { return (root || document).querySelector(sel); }
   function qsa(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
@@ -161,6 +269,13 @@
     return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
     });
+  }
+  /* 侧栏推荐标题截断: 只留 n 个"字"(按码点切, 不劈开 emoji/代理对)。
+     标题变短 → 条目高度稳定, 缩略图才能放大(见 buildRelated 的 .it .cv)。 */
+  function clipTitle(s, n) {
+    var t = String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+    var a = Array.from(t);
+    return a.length > n ? a.slice(0, n).join("") + "…" : t;
   }
   function cookie(name) {
     var m = String(document.cookie || "").match(new RegExp("(?:^|;\\s*)" + name + "=([^;]*)"));
@@ -208,6 +323,7 @@
     bvid: "", aid: 0, owner: null, stat: null,
     hosts: [],        // 自有 host 元素(teardown 时移除)
     hidden: [],       // 被隐藏的原生节点(restore 时恢复)
+    styles: [],       // 注入页面的 <style>(teardown 时移除)
     tick: null, lastPath: location.pathname,
     cmtPage: 1, cmtSort: 3, degraded: false,
   };
@@ -268,56 +384,37 @@
     t._tm = setTimeout(function () { t.classList.remove("show"); }, 2600);
   }
 
-  /* ================= 右栏: UP主卡 + 相关推荐 ================= */
+  /* ================= 右栏: 相关推荐(原生 UP主卡保留) =================
+   * 只接管"相关推荐"区。**保留 B站原生 UP主信息卡 .up-panel-container**
+   * (头像 / 名称 / 发消息 / 简介 / 充电 / 关注按钮) —— 用户要求这个"关注界面"
+   * 必须留着; 旧实现把整个右栏替换成自建卡, 连关注按钮一起关掉了。
+   * 用一条 style 规则隐藏右栏里"除 UP主卡与自建面板之外"的原生块, 这样懒加载
+   * 迟到的推荐列表/广告也会被盖住(纯 JS 隐藏会漏掉后插入的节点)。 */
   function buildRelated() {
     var rc = qs(".right-container") || qs("#right-container");
     if (!rc) return false;
-    qsa(":scope > *", rc).forEach(function (n) {
-      if (n.dataset && n.dataset.msxOwn === "1") return;
-      n.style.setProperty("display", "none", "important");
-      S.hidden.push(n);
-    });
+    var inner = qs(".right-container-inner", rc) || rc;
     var hostEl = document.createElement("div");
     hostEl.id = "msx-ownui-related";
     hostEl.dataset.msxOwn = "1";
-    rc.appendChild(hostEl);
-    S.hosts.push(hostEl);
     var root = hostEl.attachShadow({ mode: "open" });
     var p = palette();
     root.innerHTML = "<style>" + baseCSS(p)
       + ".wrap{padding:0 0 16px}"
-      + ".up{display:flex;align-items:center;gap:10px;padding:12px;border-radius:10px;background:" + p.card + ";margin-bottom:10px}"
-      + ".up img{width:44px;height:44px}"
-      + ".up .nm{font-weight:600;font-size:14px}"
-      + ".up .fans{margin-top:2px}"
-      + ".rel{font-size:15px;font-weight:600;padding:4px 12px}"
-      + ".it{display:flex;gap:8px;padding:8px 12px;border-radius:10px;cursor:pointer}"
+      + ".rel{font-size:19px;font-weight:700;padding:6px 12px}"   /* 本轮: 标题字号加大(15→19), 一眼读成标题 */
+      + ".it{display:flex;gap:10px;padding:9px 12px;border-radius:10px;cursor:pointer}"
       + ".it:hover{background:" + p.hover + "}"
-      + ".it .cv{position:relative;flex:0 0 152px;height:86px;border-radius:8px;overflow:hidden;background:" + p.hover + "}"
-      + ".it .cv img{width:152px;height:86px;border-radius:8px;display:block}"
+      + ".it .cv{position:relative;flex:0 0 60%;min-width:150px;max-width:300px;aspect-ratio:16/9;border-radius:8px;overflow:hidden;background:" + p.hover + "}"
+      + ".it .cv img{width:100%;height:100%;object-fit:cover;border-radius:8px;display:block}"
       + ".it .cv .du{position:absolute;right:4px;bottom:4px;background:rgba(0,0,0,.6);color:#fff;font-size:11px;padding:0 4px;border-radius:4px;line-height:16px}"
       + ".it .tx{flex:1;min-width:0}"
       + ".it .tt{font-size:13px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}"
+      + ".it .tt .ex{color:" + p.accent + ";border:1px solid " + p.accent + ";border-radius:3px;font-size:10px;padding:0 3px;margin-left:3px}"
       + ".it .mt{margin-top:4px}"
       + ".err{padding:12px}"
       + "</style>"
-      + '<div class="wrap"><div class="toast"></div><div class="up" id="msxUp"><span class="sub">加载中…</span></div>'
+      + '<div class="wrap"><div class="toast"></div>'
       + '<div class="rel">相关推荐</div><div id="msxRel" class="sub" style="padding:8px 12px">加载中…</div></div>';
-    // UP卡
-    var upEl = root.getElementById("msxUp");
-    if (S.owner) {
-      upEl.innerHTML = '<img src="' + esc((S.owner.face || "").replace(/^http:/, "https:")) + '" referrerpolicy="no-referrer">'
-        + '<div style="flex:1;min-width:0"><div class="nm">' + esc(S.owner.name) + '</div>'
-        + '<div class="fans sub" id="msxFans">…</div></div>';
-      apiGet("https://api.bilibili.com/x/relation/stat?vmid=" + S.owner.mid)
-        .then(function (j) {
-          if (j && j.code === 0 && root.getElementById("msxFans")) {
-            root.getElementById("msxFans").textContent = "粉丝 " + fmtCount(j.data.follower);
-          }
-        }).catch(function () {});
-    } else {
-      upEl.innerHTML = '<span class="sub">未取到UP主信息</span>';
-    }
     // 相关推荐(+可选筛选与7:3探索混排)
     var listEl = root.getElementById("msxRel");
     var relTitle = qs(".rel", root);
@@ -326,9 +423,9 @@
       d.className = "it";
       d.dataset.bvid = b.bvid || "";
       d.innerHTML = '<div class="cv"><img loading="lazy" src="'
-        + esc(String(b.pic || "").replace(/^http:/, "https:")) + '@200w_112h.webp" referrerpolicy="no-referrer">'
+        + esc(String(b.pic || "").replace(/^http:/, "https:")) + '@416w_234h.webp" referrerpolicy="no-referrer">'
         + '<span class="du">' + fmtDur(b.duration) + '</span></div>'
-        + '<div class="tx"><div class="tt">' + esc(b.title) + (explore ? ' <span class="ex">探索</span>' : '') + '</div>'
+        + '<div class="tx"><div class="tt">' + esc(clipTitle(b.title, 20)) + (explore ? ' <span class="ex">探索</span>' : '') + '</div>'
         + '<div class="mt sub">' + esc(b.owner && b.owner.name || "") + '</div>'
         + '<div class="sub">' + fmtCount(b.stat && b.stat.view) + '播放 ' + fmtCount(b.stat && b.stat.danmaku) + '弹幕</div></div>';
       d.addEventListener("click", function () {
@@ -369,6 +466,308 @@
       .catch(function (e) {
         listEl.textContent = "相关推荐加载失败(" + e + ")";
       });
+    /* ⚠️ v0.3.1.26 顺序要紧: 整块 UI 先在**离屏**建完 → 再挂进页面 → 最后才藏原生右栏。
+       旧顺序是"先挂空壳 → 再填内容 → 提前藏原生", 页面会先露一眼原生推荐/空白,
+       再被我们的面板顶掉 —— 就是用户反馈的"侧边栏闪烁一下"。 */
+    inner.appendChild(hostEl);
+    S.hosts.push(hostEl);
+    if (!qs("#msx-ownui-right-style")) {
+      var rs = document.createElement("style");
+      rs.id = "msx-ownui-right-style";
+      rs.textContent =
+        ".right-container>*:not(.right-container-inner):not(.up-panel-container):not(.teleport):not([data-msx-own=\"1\"]),"
+        + "#right-container>*:not(.right-container-inner):not(.up-panel-container):not(.teleport):not([data-msx-own=\"1\"]),"
+        + ".right-container-inner>*:not(.up-panel-container):not(.teleport):not([data-msx-own=\"1\"])"
+        + "{display:none!important}";
+      (document.head || document.documentElement).appendChild(rs);
+      S.styles.push(rs);
+    }
+    if (!qs("#msx-ownui-page-pad")) {
+      /* 用户要求(m03204)「播放页左侧宽一点, 把视频挤得更居中」+ 报修(m03496)「那条窗口级留白
+         太宽、像一条独立边框, 而且 B站顶栏左侧空出一块」:
+         —— 窗口级留白已取消(控件与窗口等宽, 顶栏从窗口左缘连续, 见 shell_pages._tab_geo);
+         —— 左侧这点空白改在**页面内部**留: 只给内容容器加左内边距。顶栏 .bili-header 是容器
+            之外的节点, 完全不受影响; 整块内容(视频 + 右栏)一起右移, 两者间距不变、右侧不裁。
+         数值一处可调: 4vw ≈ 内容右移 20+ 逻辑像素; 播放器全屏时禁用这条(全屏不该留边)。 */
+      var padSel = qs("#mirror-vdcon") ? "#mirror-vdcon" : ".video-container-v1";
+      var ps = document.createElement("style");
+      ps.id = "msx-ownui-page-pad";
+      ps.textContent = "html:not(:fullscreen) " + padSel
+        + "{padding-left:4vw!important;box-sizing:border-box!important}";
+      (document.head || document.documentElement).appendChild(ps);
+      S.styles.push(ps);
+      var syncPad = function () { ps.disabled = !!document.fullscreenElement; };
+      document.addEventListener("fullscreenchange", syncPad);
+      syncPad();
+    }
+    return true;
+  }
+
+
+  /* ================= 右栏: 弹幕列表(数据源: bilibili-dmfilter) =================
+   * B站 原生弹幕列表(#danmukuBox)被右栏接管规则一并藏掉了(v0.3.1.2 起), 用户要求做回来,
+   * 并加"跳转发送者主页"。数据由 bilibili-dmfilter 解析 seg.so 后发布到
+   * window.__msxDanmaku(已按「弹幕评论筛选」过滤), 这里只管渲染:
+   *   · 行 = 时间 / 弹幕内容 / 发送时间(与原生列表同款三栏);
+   *   · 增量渲染(每批 120 行, 滚动到底自动续) —— 大视频几万条也不卡;
+   *   · 点行 → dmfilter.resolveFull(midHash) → 壳逆推+验真 → 唯一解直接开 space.bilibili.com;
+   *     多个账号都能对上时弹候选框让用户自己挑; 一个都对不上(≥11 位新 UID)明确提示。
+   * (绝不乱跳 —— B站对 11 位以上新 UID 只给哈希, 逆推不出来。) */
+  function buildDanmaku() {
+    var DMF = window.__msxDanmaku || null;
+    if (!DMF) return false;                 // dmfilter 不在(极少见) → 不挂, 免得只有个空壳
+    var rc = qs(".right-container") || qs("#right-container");
+    if (!rc) return false;
+    var inner = qs(".right-container-inner", rc) || rc;
+    var hostEl = document.createElement("div");
+    hostEl.id = "msx-ownui-danmaku";
+    hostEl.dataset.msxOwn = "1";
+    var root = hostEl.attachShadow({ mode: "open" });
+    var p = palette();
+    root.innerHTML = "<style>" + baseCSS(p)
+      + ".wrap{position:relative;margin:10px 0 14px;border-radius:10px;background:" + p.card + ";overflow:hidden}"
+      + ".hd{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:10px 14px 8px}"
+      + ".hd b{font-size:15px}"
+      + ".hd .hr{display:flex;align-items:center;gap:8px;margin-left:auto}"
+      + ".hd .fo{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none}"
+      + ".hd .fo .ar{display:inline-block;width:10px;text-align:center;color:" + p.sub + ";font-size:11px}"
+      + ".tg{padding:2px 9px;font-size:12px;line-height:18px;border-radius:6px;flex:none}"
+      + ".tg.on{background:" + p.accent + ";border-color:" + p.accent + ";color:#fff}"
+      + ".cols,.rw{display:grid;grid-template-columns:60px 1fr 92px;gap:8px;align-items:baseline;padding:5px 14px}"
+      + ".cols{color:" + p.sub + ";font-size:12px;border-bottom:1px solid " + p.line + ";padding-bottom:7px}"
+      + ".box{max-height:460px;overflow-y:auto;overscroll-behavior:contain}"
+      + ".rw{font-size:13px;cursor:pointer}"
+      + ".rw:hover{background:" + p.hover + "}"
+      + ".rw .t{color:" + p.sub + ";font-size:12px;font-variant-numeric:tabular-nums}"
+      + ".rw .x{word-break:break-word}"
+      + ".rw .c{color:" + p.sub + ";font-size:12px;text-align:right;font-variant-numeric:tabular-nums}"
+      + ".rw.blk{background:rgba(251,114,153,.07)}"
+      + ".rw.blk .x{color:" + p.sub + "}"
+      + ".rw .wy{display:inline-block;margin-right:6px;padding:0 5px;border-radius:4px;font-size:11px;"
+      + "line-height:16px;background:rgba(251,114,153,.18);color:" + p.accent + ";vertical-align:1px}"
+      + ".more{padding:8px 14px;text-align:center;color:" + p.sub + ";font-size:12px;cursor:pointer}"
+      + ".tip{padding:12px 14px;color:" + p.sub + ";font-size:12px}"
+      + ".pick{position:absolute;inset:0;display:none;align-items:center;justify-content:center;"
+      + "background:rgba(0,0,0,.42);z-index:20}"
+      + ".pick.on{display:flex}"
+      + ".pick .pb{width:min(340px,90%);max-height:78%;overflow-y:auto;background:" + p.card
+      + ";border:1px solid " + p.line + ";border-radius:10px;padding:12px}"
+      + ".pick .pb h4{font-size:14px;margin-bottom:5px}"
+      + ".pick .pi{display:flex;align-items:center;gap:9px;padding:7px 8px;border-radius:8px;cursor:pointer}"
+      + ".pick .pi:hover{background:" + p.hover + "}"
+      + ".pick .pi img{width:32px;height:32px;flex:none}"
+      + ".pick .pi .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+      + ".pick .pc{text-align:right;margin-top:9px}"
+      + "</style>"
+      + '<div class="wrap"><div class="toast"></div>'
+      + '<div class="hd"><b class="fo" id="msxDmFold" title="点击折叠 / 展开弹幕列表">'
+      + '<span class="ar" id="msxDmAr">▾</span>弹幕列表 <span class="sub" id="msxDmN"></span></b>'
+      + '<span class="hr"><button type="button" class="tg" id="msxDmBlk"'
+      + ' title="在列表里显示被「弹幕评论筛选」屏蔽掉的弹幕（只看不改：播放器里的过滤不受影响）">显示屏蔽</button>'
+      + '<span class="sub" style="font-size:12px">点行查发送者主页</span></span></div>'
+      + '<div class="cols" id="msxDmCols"><span>时间</span><span>弹幕内容</span><span style="text-align:right">发送时间</span></div>'
+      + '<div class="box" id="msxDmBox"><div class="tip" id="msxDmTip">加载中…</div>'
+      + '<div class="more" id="msxDmMore" style="display:none">显示更多</div></div>'
+      + '<div class="pick" id="msxDmPick"></div></div>';
+    var box = root.getElementById("msxDmBox");
+    var tipEl = root.getElementById("msxDmTip");
+    var moreEl = root.getElementById("msxDmMore");
+    var nEl = root.getElementById("msxDmN");
+    var pickEl = root.getElementById("msxDmPick");
+    var blkBtn = root.getElementById("msxDmBlk");
+    /* 折叠/展开(bug5): 标题本身就是开关 —— 点一下把列头与列表收起来, 只留一条标题行。
+       状态记住(localStorage 可能被禁用 → try/catch 兜住)。
+       用户报修(m03496): **默认折叠** —— 打开播放页时弹幕列表就是收起的, 想看再手动展开。
+       所以只有用户显式展开过(存 "0")才展开, 没存过/存过 "1" 都是折叠。 */
+    var colsEl = root.getElementById("msxDmCols");
+    var arEl = root.getElementById("msxDmAr");
+    var folded = true;
+    try { folded = localStorage.getItem("msx_dm_fold") !== "0"; } catch (e) {}
+    function applyFold() {
+      if (colsEl) colsEl.style.display = folded ? "none" : "";
+      box.style.display = folded ? "none" : "";
+      if (arEl) arEl.textContent = folded ? "▸" : "▾";
+      if (folded && pickEl) pickEl.classList.remove("on");
+    }
+    applyFold();
+    root.getElementById("msxDmFold").addEventListener("click", function () {
+      folded = !folded;
+      try { localStorage.setItem("msx_dm_fold", folded ? "1" : "0"); } catch (e) {}
+      applyFold();
+    });
+    var R = 0, lastOid = null, lastRowsRef = null, lastHiddenRef = null, lastShowBlk = null;
+    /* 整体重画: 行全删 + 游标归零 + 视图缓存作废 */
+    function hardReset() {
+      qsa(".rw", box).forEach(function (n) { n.remove(); });
+      R = 0;
+      VIEW = null;
+    }
+    /* 「显示屏蔽」: 只切这个列表的视图, 不碰播放器里的过滤。
+       默认值记住上次选择(localStorage 可能被禁用 → try/catch 兜住)。 */
+    var showBlk = false;
+    try { showBlk = localStorage.getItem("msx_dm_show_blk") === "1"; } catch (e) {}
+    function syncBlkBtn() {
+      if (!blkBtn) return;
+      var n = (DMF.hidden || []).length;
+      var pend = 0;
+      try { pend = DMF.pendingCount ? DMF.pendingCount() : 0; } catch (e) {}
+      /* 没有屏蔽项但还有画像没到 → 显示「…」: 否则用户会以为筛选没生效(实际是在等壳
+         后台限速查账号资料, 查到一个就一条条更新)。 */
+      blkBtn.textContent = (showBlk ? "隐藏屏蔽" : "显示屏蔽")
+        + (n ? " " + n : (pend ? " …" : ""));
+      blkBtn.title = n
+        ? "在列表里显示被「弹幕评论筛选」屏蔽掉的弹幕（只看不改：播放器里的过滤不受影响）"
+        : (pend ? "正在补账号画像（壳在后台限速查，查到一个就生效一条）—— 稍等片刻"
+                : "在列表里显示被「弹幕评论筛选」屏蔽掉的弹幕（只看不改：播放器里的过滤不受影响）");
+      blkBtn.classList.toggle("on", showBlk);
+    }
+    if (blkBtn) blkBtn.addEventListener("click", function () {
+      showBlk = !showBlk;
+      try { localStorage.setItem("msx_dm_show_blk", showBlk ? "1" : "0"); } catch (e) {}
+      hardReset();                          // 视图变了 → 整体重画
+      syncBlkBtn();
+      chunk();
+    });
+    function closePick() { pickEl.classList.remove("on"); pickEl.innerHTML = ""; }
+    pickEl.addEventListener("click", function (ev) { if (ev.target === pickEl) closePick(); });
+    /* 多候选选择框: hash 逆不唯一(B站弹幕只给 8 位哈希, 几个账号都能对上) → 让用户自己挑 */
+    function pickSender(cands, h) {
+      var html = '<div class="pb"><h4>这条弹幕的哈希对应多个账号</h4>'
+        + '<div class="sub" style="margin-bottom:7px">B站弹幕只给 8 位哈希，下面 '
+        + cands.length + ' 个账号都能对上（#' + esc(h) + '）；点一个打开它的主页</div>';
+      for (var i = 0; i < cands.length; i++) {
+        var c = cands[i];
+        html += '<div class="pi" data-mid="' + esc(c.mid) + '">'
+          + (c.face ? '<img src="' + esc(c.face) + '" referrerpolicy="no-referrer" alt="">' : '')
+          + '<span class="nm">' + esc(c.name || ("UID " + c.mid)) + '</span>'
+          + '<span class="sub">' + esc(c.mid) + '</span></div>';
+      }
+      html += '<div class="pc"><button type="button" id="msxDmPickX">取消</button></div></div>';
+      pickEl.innerHTML = html;
+      pickEl.classList.add("on");
+      var bx = pickEl.querySelector("#msxDmPickX");
+      if (bx) bx.addEventListener("click", closePick);
+      qsa(".pi", pickEl).forEach(function (n) {
+        n.addEventListener("click", function () {
+          var m = n.dataset.mid;
+          closePick();
+          if (m) window.open("https://space.bilibili.com/" + m, "_blank");
+        });
+      });
+    }
+    function fmtT(ms) {
+      var sec = Math.floor((Number(ms) || 0) / 1000);
+      var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s2 = sec % 60;
+      return (h ? h + ":" + String(m).padStart(2, "0") : String(m)) + ":" + String(s2).padStart(2, "0");
+    }
+    function fmtD(ts) {
+      var d = new Date(Number(ts) * 1000);
+      if (isNaN(d.getTime())) return "";
+      return String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0")
+        + " " + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+    }
+    function rowEl(o) {
+      var blk = !!o.why;                    // 只有 FEED.hidden 里的行带 why
+      var el = document.createElement("div");
+      el.className = "rw" + (blk ? " blk" : "");
+      el.dataset.h = o.h || "";
+      el.innerHTML = '<span class="t">' + esc(fmtT(o.t)) + '</span><span class="x">'
+        + (blk ? '<span class="wy"' + (String(o.why).indexOf("候选") >= 0
+            ? ' title="B站弹幕只给发送者 ID 的 8 位哈希, 该哈希对上了多个账号 ——'
+              + '这条是按「哈希对上多个账号时」的策略判定的, 不一定是它发的"' : '')
+            + '>' + esc(o.why) + '</span>' : '') + esc(o.text)
+        + '</span><span class="c">' + esc(fmtD(o.ct)) + '</span>';
+      el.addEventListener("click", function () {
+        var h = el.dataset.h;
+        if (!h) { toastIn(root, "该弹幕没有发送者信息"); return; }
+        if (el.dataset.busy === "1") return;         // 连点: 同一条只解一次
+        el.dataset.busy = "1";
+        var fin = function () { el.dataset.busy = ""; };
+        var tm = setTimeout(fin, 15000);             // 兜底: 请求卡住也要能再点
+        toastIn(root, "正在解析发送者…");
+        var pr = DMF.resolveFull ? DMF.resolveFull(h)
+          : DMF.resolve(h).then(function (m) {
+              return { ok: true, mid: m, ncand: 0, cands: [], why: "" };
+            });
+        pr.then(function (j) {
+          clearTimeout(tm); fin();
+          if (!j || j.ok === false) { toastIn(root, "解析失败：弹幕哈希不合法"); return; }
+          var m = j.mid ? String(j.mid) : "";
+          if (m) { window.open("https://space.bilibili.com/" + m, "_blank"); return; }
+          var cs = j.cands || [];
+          if (cs.length > 1) { pickSender(cs, h); return; }
+          if (cs.length === 1) { window.open("https://space.bilibili.com/" + cs[0].mid, "_blank"); return; }
+          toastIn(root, j.why === "newuid"
+            ? "查不到发送者：该 UID 在 11 位以上，B站只给哈希，无法还原"
+            : "查不到发送者：B站只给哈希，无法还原该 UID");
+        })["catch"](function () {
+          clearTimeout(tm); fin();
+          toastIn(root, "解析失败，请稍后再试");
+        });
+      });
+      return el;
+    }
+    /* 当前要渲染的行: 关 → 只有保留的; 开 → 保留 + 被屏蔽的(按时间合并)。
+       合并结果缓存(滚动到底会反复调 chunk, 每次都重排会白烧 CPU)。 */
+    var VIEW = null;
+    function view() {
+      if (VIEW) return VIEW;
+      var rows = DMF.rows || [];
+      if (!showBlk) { VIEW = rows; return VIEW; }
+      var all = rows.concat(DMF.hidden || []);
+      all.sort(function (a, b) { return (a.t || 0) - (b.t || 0); });
+      VIEW = all;
+      return VIEW;
+    }
+    function chunk() {
+      if (lastOid !== DMF.oid) {           // 换视频/换P → 清空重挂
+        lastOid = DMF.oid;
+        hardReset();
+      }
+      /* ⚠️ v0.3.1.28: 源列表(rows/hidden)每次重算都是**新数组**(dmfilter.refilter 整体替换)
+         —— 用引用变化判定"必须整体重画"。旧写法只追加(`if (end > R)`): 画像回填后有行从
+         「保留」挪进「屏蔽」时列表长度可能不变 → 界面永远不动; 关掉「显示屏蔽」列表变短
+         时已画出来的屏蔽行也删不掉。用户看到的就是"切了条数一条没变"。 */
+      if (DMF.rows !== lastRowsRef || DMF.hidden !== lastHiddenRef || showBlk !== lastShowBlk) {
+        lastRowsRef = DMF.rows;
+        lastHiddenRef = DMF.hidden;
+        lastShowBlk = showBlk;
+        hardReset();
+      }
+      var rows = view();
+      var end = Math.min(rows.length, R + 120);
+      if (end > R) {
+        var frag = document.createDocumentFragment();
+        for (var i = R; i < end; i++) frag.appendChild(rowEl(rows[i]));
+        box.insertBefore(frag, moreEl);
+        R = end;
+      }
+      /* 只报总行数: 屏蔽条数由按钮自己带("隐藏屏蔽 3")。
+         早先在这里补「（含屏蔽 N）」会把头部顶到第二行, 一开一关还跟着抖动。 */
+      nEl.textContent = rows.length ? ("共 " + rows.length + " 条") : "";
+      tipEl.style.display = rows.length ? "none" : "";
+      if (!rows.length) tipEl.textContent = R ? "" : "加载中…（弹幕按分段陆续到位）";
+      moreEl.style.display = (R < rows.length) ? "" : "none";
+    }
+    var pend = 0;
+    DMF.onChange = function () {           // 新分段/换视频 → 节流重画
+      VIEW = null;
+      syncBlkBtn();                        // 屏蔽条数是流式涨上来的, 按钮计数跟着走
+      if (pend) return;
+      pend = setTimeout(function () { pend = 0; try { chunk(); } catch (e) {} }, 120);
+    };
+    moreEl.addEventListener("click", chunk);
+    box.addEventListener("scroll", function () {
+      if (box.scrollTop + box.clientHeight >= box.scrollHeight - 40) chunk();
+    }, { passive: true });
+    syncBlkBtn();
+    chunk();                        // 第一屏先在离屏渲染好
+    /* ⚠️ v0.3.1.26: 整块 UI 建完才挂上去 —— 挂空壳再填内容会让侧栏闪一下(同 buildRelated)。 */
+    var rel = qs("#msx-ownui-related", inner);
+    if (rel && rel.parentNode === inner) inner.insertBefore(hostEl, rel);
+    else inner.appendChild(hostEl);
+    S.hosts.push(hostEl);
+    S.dmFeed = DMF;
     return true;
   }
 
@@ -376,15 +775,12 @@
   function buildComments() {
     var box = qs("#comment") || qs(".comment-container") || qs(".comment");
     if (!box) return false;
-    box.style.setProperty("display", "none", "important");
-    S.hidden.push(box);
     var parent = box.parentNode;
     if (!parent) return false;
+    var anchor = box.nextSibling;          // 挂载位置先记下, 建完再插
     var hostEl = document.createElement("div");
     hostEl.id = "msx-ownui-comments";
     hostEl.dataset.msxOwn = "1";
-    parent.insertBefore(hostEl, box.nextSibling);
-    S.hosts.push(hostEl);
     var root = hostEl.attachShadow({ mode: "open" });
     var p = palette();
     root.innerHTML = "<style>" + baseCSS(p)
@@ -437,6 +833,11 @@
       });
     });
     loadComments(1);
+    /* ⚠️ v0.3.1.26: UI 建完才挂 + 才藏原生评论区 —— 否则会先露一眼原生/空白再被顶掉。 */
+    parent.insertBefore(hostEl, anchor);
+    S.hosts.push(hostEl);
+    box.style.setProperty("display", "none", "important");
+    S.hidden.push(box);
     return true;
   }
 
@@ -555,7 +956,7 @@
         var list = document.createElement("div");
         list.className = "sublist";
         box.appendChild(list);
-        reps.forEach(function (s2) { list.appendChild(commentNode(s2, true)); });
+        reps.filter(cfPass).forEach(function (s2) { list.appendChild(commentNode(s2, true)); });
         var page = j.data && j.data.page;
         if (page && page.count > reps.length) {
           var more = document.createElement("div");
@@ -569,7 +970,7 @@
                    + "&root=" + r.rpid + "&pn=" + pn + "&ps=10")
               .then(function (j2) {
                 if (j2.code !== 0) { more.textContent = "加载失败"; return; }
-                (j2.data.replies || []).forEach(function (s3) { list.appendChild(commentNode(s3, true)); });
+                (j2.data.replies || []).filter(cfPass).forEach(function (s3) { list.appendChild(commentNode(s3, true)); });
                 if (pn * 10 >= page.count) more.remove();
               });
           });
@@ -600,7 +1001,7 @@
         var frag = document.createDocumentFragment();
         // 置顶
         if (d.upper && d.upper.top) frag.appendChild(commentNode(d.upper.top, false));
-        reps.forEach(function (r) {
+        reps.filter(cfPass).forEach(function (r) {
           var el = commentNode(r, false);
           if (Number(r.count) > 0) {
             var sub = document.createElement("div");
@@ -655,8 +1056,10 @@
   function teardown() {
     S.hosts.forEach(function (h) { if (h && h.parentNode) h.parentNode.removeChild(h); });
     S.hidden.forEach(function (n) { if (n) n.style.removeProperty("display"); });
-    S.hosts = []; S.hidden = []; S.cmtRoot = null;
+    S.styles.forEach(function (s) { if (s && s.parentNode) s.parentNode.removeChild(s); });
+    S.hosts = []; S.hidden = []; S.styles = []; S.cmtRoot = null;
     S.cmtPage = 1;
+    if (S.dmFeed) { try { S.dmFeed.onChange = null; } catch (e) {} S.dmFeed = null; }
   }
   function init() {
     loadMeta().then(function () {
@@ -668,10 +1071,12 @@
           user.mid = j.data.mid || 0;
         }
         buildRelated();
+        try { buildDanmaku(); } catch (e) {}
         buildComments();
         bootMaskOff();   // 自有UI已挂上, 摘启动遮罩
       }).catch(function () {
         buildRelated();
+        try { buildDanmaku(); } catch (e) {}
         buildComments();
         bootMaskOff();
       });

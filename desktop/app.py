@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.3.1.8dsk)
-=========================
+洞鉴虚明 · 基础版 (v0.3.1.30dsk)
+==========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
 运行:   python app.py
@@ -20,6 +20,7 @@
 """
 import base64
 import collections
+import contextlib
 import ctypes
 import hashlib
 import html
@@ -43,11 +44,26 @@ import urllib.parse
 import urllib.request
 import webbrowser
 import uuid
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORTS = (8000, 8010, 8020)
-APP_VER = "v0.3.1.8dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+# v0.3.1.34: 「信息以新窗口形式打开」(主题设置, 默认开) —— 点开信息弹**独立悬浮窗**,
+#           悬浮窗可塞回标签页, 标签页也能拖出成悬浮窗(控件实例跨窗迁移, 页面不重载)。
+# v0.3.1.33: 「弹幕列表一直是空的(有概率)」根治 —— 分段补取重写成"自愈看门狗 + 代次守卫",
+#           并修掉"播放器那次响应被当成整段到手"(实测只有半段: 52KB vs 98KB)。
+# v0.3.1.32: 弹幕屏蔽总开关 m_dm_on(默认开) —— 关掉即完全不筛弹幕; 面板文案精简。
+# v0.3.1.31: 筛选链路上的 N+1 SQL 往返与重复 fsync 全部消除(索引 + 批量 + 合并提交)。
+# v0.3.1.30: MIRRORSORTER_PORT 可指定单一端口(不回落) —— 供自测/多开隔离用。
+# 没有它的话, 测试实例会去抢用户正在用的 8000, 然后被页面的 /api/shutdown 关掉。
+_PORT_ENV = os.environ.get("MIRRORSORTER_PORT")
+if _PORT_ENV:
+    try:
+        PORTS = (int(_PORT_ENV),)
+    except Exception:
+        pass
+APP_VER = "v0.3.1.41dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -83,10 +99,15 @@ _IO_STATE_KEYS = {"fetch_error", "fetch_last", "last_feed", "last_types", "score
                   "tb_cursor", "tb_error", "tb_last_fetch", "xhh_error", "xhh_last_fetch",
                   "xhh_qr_code", "xhh_qr_tokenid", "explore_boost_ts", "feedback_sig",
                   "tmp_blocks", "cur_conv", "disclaimer_version"}
-# 登录凭证类键: 敏感, 仅在显式勾选时导出; 导入方可一键克隆各平台登录态
+# 账号内容/登录凭证类键: 敏感, **绝不进入脱敏导出**, 只在用户显式取消
+# 「只导出设置」勾选(完整备份)时才写进文件。
+# v0.3.1.39: ai_key 以前不在这个集合里 ⇒ 用户勾了「只导出设置」也照样把 aiKey 写进
+# 导出文本, 分享出去就等于泄露自己的 AI 密钥(用户明确要求: aiKey、登陆账号这类账号
+# 内容必须不出现在导出文件里)。同类项一并归入: 各平台 Cookie/账号画像/关注列表。
 _IO_CRED_KEYS = {"bili_cookie", "tb_cookie", "tb_user", "tb_avatar", "xhh_cookie",
                  "xhh_heybox_id", "xhh_pkey", "xhh_user", "xhh_avatar",
-                 "acct_nickname", "acct_profile", "bili_follow_mids", "bili_follow_names"}
+                 "acct_nickname", "acct_profile", "bili_follow_mids", "bili_follow_names",
+                 "ai_key"}
 # 允许导入的白名单(= 可导出的全集): 防止导入文件里塞进任意键污染 settings 表
 _IO_IMPORTABLE = ({"mode", "ai_base", "ai_key", "ai_model", "ai_enabled", "ai_full_scan",
                    "ai_interest_min", "ai_batch", "ai_cache_hours", "price_in", "price_out",
@@ -96,19 +117,31 @@ _IO_IMPORTABLE = ({"mode", "ai_base", "ai_key", "ai_model", "ai_enabled", "ai_fu
                    "m_news_fresh", "ser_max_age_months", "m_sources", "tb_allow_help",
                    "tb_bars", "xhh_comm", "xhh_topic", "bili_weight", "tb_weight",
                    "xhh_weight", "bili_follow_emph", "bili_follow_months",
-                   "prefs_note", "dislike_note"} | _IO_CRED_KEYS) - _IO_STATE_KEYS
+                   "prefs_note", "dislike_note", "cf_blk_on", "cf_min_level",
+                   "m_block_mystery_bio", "m_block_lottery",
+                   "m_block_empty_space", "m_dm_on"} | _IO_CRED_KEYS) - _IO_STATE_KEYS
+# 脱敏导出白名单(白名单, 不是黑名单): 只有列在这里的键才会进「只导出设置」的文件。
+# 将来新增设置项默认**不导出**, 必须显式加进来 —— 避免新字段悄悄把敏感信息带出去。
+_IO_SHAREABLE = frozenset(_IO_IMPORTABLE - _IO_CRED_KEYS)
 
 
 def settings_export_payload(include_credentials):
-    """收集可导出的设置 + 黑名单(含登录凭证与否由调用方决定)。"""
+    """收集可导出的设置 + 黑名单。
+
+    include_credentials=False(默认, 界面「只导出设置」勾选态):
+        只取脱敏白名单 _IO_SHAREABLE —— ai_key / 各平台 Cookie / 账号画像/关注列表
+        一个都不进文件, 生成物可以直接分享给别人配置软件。
+    include_credentials=True(用户显式取消勾选 = 完整备份):
+        含账号与密钥, 界面会给出「请勿外传」告警。
+    """
+    allow = _IO_IMPORTABLE if include_credentials else _IO_SHAREABLE
     rows = db().execute("SELECT k,v FROM settings").fetchall()
-    st = {k: v for k, v in rows
-          if k in _IO_IMPORTABLE and (include_credentials or k not in _IO_CRED_KEYS)
-          and v not in (None, "")}
+    st = {k: v for k, v in rows if k in allow and v not in (None, "")}
     bl = {"authors": [r[0] for r in db().execute("SELECT value FROM blacklist WHERE kind='author'")],
           "keywords": [r[0] for r in db().execute("SELECT value FROM blacklist WHERE kind='keyword'")]}
     return {"app": "洞鉴虚明", "kind": "mirror-sorter-settings", "v": 1,
-            "ts": int(time.time()), "settings": st, "blacklist": bl}
+            "ts": int(time.time()), "sanitized": (not include_credentials),
+            "settings": st, "blacklist": bl}
 
 APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 # 正式运行统一读用户存档目录; 测试/隔离开发可用 MIRRORSORTER_DATA_DIR 覆盖。
@@ -150,6 +183,41 @@ _db_lock = threading.RLock()   # RLock: 允许嵌套(锁内再调 sget 等); 用
 _tls = threading.local()       # 每线程独立连接: 共享连接并发读写会竞态(InterfaceError/空值)
 
 
+# ── 合并提交(v0.3.1.31) ──────────────────────────────────────────────────
+# WAL 下每次 commit 都是一次 fsync, 实测 ~1.2ms。一次 /api/feed 的尾部原本要提交 4 次
+# (record_feed_presentations / shown 回写 / set_last_feed / last_types), 合计 ~5ms
+# 全花在磁盘同步上 —— 而这 4 批写没有任何一批需要"立刻对别的线程可见"。
+# 用 _batch_commit() 圈起来后只落 1 次 fsync。同连接内的读不受影响(未提交的写对本连接
+# 立即可见), 代价只是别的线程晚几毫秒看到这批写。
+_defer = threading.local()
+
+
+def _commit():
+    """在 _batch_commit() 区域内 → 攒着, 出区时统一提交; 否则立刻提交。"""
+    if getattr(_defer, "n", 0) > 0:
+        _defer.dirty = True
+        return
+    db().commit()
+
+
+@contextlib.contextmanager
+def _batch_commit():
+    """把区域内所有 _commit() 合并成一次真正的 commit。可嵌套(只最外层提交)。"""
+    _defer.n = getattr(_defer, "n", 0) + 1
+    if _defer.n == 1:
+        _defer.dirty = False
+    try:
+        yield
+    finally:
+        _defer.n -= 1
+        if _defer.n == 0 and getattr(_defer, "dirty", False):
+            _defer.dirty = False
+            try:
+                db().commit()
+            except Exception:
+                pass
+
+
 def db():
     conn = getattr(_tls, "conn", None)
     if conn is None:
@@ -161,6 +229,11 @@ def db():
         CREATE TABLE IF NOT EXISTS items(key TEXT PRIMARY KEY, json TEXT, fetched_at INTEGER,
                                           score_json TEXT, score_at INTEGER);
         CREATE TABLE IF NOT EXISTS feedback(key TEXT, author TEXT, action TEXT, ts INTEGER);
+        /* 负反馈硬排除每次出页都要跑 SELECT DISTINCT key FROM feedback WHERE action='dislike';
+           没有索引时 EXPLAIN QUERY PLAN 是 "SCAN feedback | USE TEMP B-TREE FOR DISTINCT"
+           (v0.3.1.31 实测)。(action, key) 复合索引让 action 走等值查找、key 天然有序,
+           DISTINCT 免排序; 表长大以后这就是 O(n) → O(log n)。 */
+        CREATE INDEX IF NOT EXISTS idx_feedback_action_key ON feedback(action, key);
         CREATE TABLE IF NOT EXISTS blacklist(kind TEXT, value TEXT, PRIMARY KEY(kind, value));
         CREATE TABLE IF NOT EXISTS saved(key TEXT, kind TEXT, ts INTEGER, PRIMARY KEY(key, kind));
         CREATE TABLE IF NOT EXISTS history(key TEXT, ts INTEGER, PRIMARY KEY(key));
@@ -169,6 +242,13 @@ def db():
         CREATE TABLE IF NOT EXISTS stats(day TEXT PRIMARY KEY, in_tokens INTEGER, out_tokens INTEGER,
                                          calls INTEGER, received INTEGER, filtered INTEGER);
         CREATE TABLE IF NOT EXISTS ablock(name TEXT PRIMARY KEY, ts INTEGER);
+        CREATE TABLE IF NOT EXISTS dm_sender(hash TEXT PRIMARY KEY, mids TEXT,
+                                              ncand INTEGER, ts INTEGER);
+        CREATE TABLE IF NOT EXISTS name_mid(name TEXT PRIMARY KEY, mid TEXT, ts INTEGER);
+        /* 已确认**不存在**的账号(acc/info 返回 -404「啥都木有」)。
+           多候选判定时这类候选不可能是发送者, 必须排除 —— 否则「全部候选都命中才拦」
+           永远等不到那几个查不出画像的候选, 规则永不生效(v0.3.1.28)。 */
+        CREATE TABLE IF NOT EXISTS absent_mid(mid TEXT PRIMARY KEY, ts INTEGER);
         CREATE TABLE IF NOT EXISTS kw(kw TEXT PRIMARY KEY, last_used INTEGER, new_cnt INTEGER,
                                       ok_cnt INTEGER, gid TEXT);
         CREATE TABLE IF NOT EXISTS shown(key TEXT PRIMARY KEY, ts INTEGER);
@@ -179,9 +259,26 @@ def db():
                                                        cooldown_until INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS rebut_saved(id INTEGER PRIMARY KEY AUTOINCREMENT,
                                                source TEXT, seg TEXT, content TEXT, ts INTEGER);
+        CREATE TABLE IF NOT EXISTS author_meta(mid TEXT PRIMARY KEY, sign TEXT,
+                                               mystery INTEGER DEFAULT 0,
+                                               lottery INTEGER DEFAULT 0,
+                                               nodyn INTEGER, ts INTEGER);
         """)
         try:   # 老库补 gid 列
             conn.execute("ALTER TABLE kw ADD COLUMN gid TEXT")
+        except Exception:
+            pass
+        try:   # 老库补 nodyn 列(空首页判定: 该账号是否一条动态都没有)
+            # 新列留 NULL = 未知 —— _am_row_get 见到 NULL 当作过期, 下次按需重取
+            conn.execute("ALTER TABLE author_meta ADD COLUMN nodyn INTEGER")
+        except Exception:
+            pass
+        try:   # 老库补 level 列(弹幕侧等级筛选: 弹幕接口不提供等级, 只能按缓存账号资料判)
+            conn.execute("ALTER TABLE author_meta ADD COLUMN level INTEGER")
+        except Exception:
+            pass
+        try:   # 老库补 ablock.mid 列(拉黑名单接口自带 mid, 存下来供弹幕按 hash 就地屏蔽)
+            conn.execute("ALTER TABLE ablock ADD COLUMN mid TEXT")
         except Exception:
             pass
         try:   # 老库补 cid 列(多会话); 旧消息归为默认会话
@@ -202,8 +299,20 @@ def db():
                              (int(time.time()), int(time.time())))
             except Exception:
                 pass
-        # 老库消息(无cid)归入默认会话1
-        conn.execute("UPDATE chat SET cid=1 WHERE cid=0")
+        # 老库消息(无cid)归入默认会话1。
+        # ⚠ 必须先判有无再写: 这条 UPDATE 曾是本连接的**唯一写语句**, 无条件执行时
+        # 只要别的线程/进程正持写锁, 就要在 PRAGMA busy_timeout=10000 上等满 10 秒,
+        # 然后抛 `sqlite3.OperationalError: database is locked`。
+        # 实测(desktop\_db_lock_bench.py --steps, 用户库副本 + 另一连接 BEGIN IMMEDIATE):
+        #   合计 10884ms  ⇒  UPDATE chat SET cid=1 WHERE cid=0  10883ms  <<< 全部耗时在此
+        #   WAL pragma 0.3ms / 3233 字符 DDL executescript 0.1ms / 5 条 ALTER 各 0.0ms
+        #   / SELECT feed_version 0.0ms / SELECT COUNT(*) FROM conv 0.0ms
+        # 窗口壳的注入串构建(_build_inject_script)跑在 WinForms UI 线程的 on_ready 回调里,
+        # 中途要读十几次设置(sget 是纯读) —— 一旦撞上这 10 秒, 整窗「未响应」、注入串
+        # 永不落地, 用户看到的就是「双击后一直卡死」。改成先判有无后, 稳态下这条写不再
+        # 发生, 新连接首访纯读(WAL 下读不被写阻塞, 实测 1ms), 卡死根因消除。
+        if conn.execute("SELECT 1 FROM chat WHERE cid=0 LIMIT 1").fetchone() is not None:
+            conn.execute("UPDATE chat SET cid=1 WHERE cid=0")
         conn.commit()
         _tls.conn = conn
     return conn
@@ -225,6 +334,17 @@ DEFAULTS = {
     "m_min_duration": "60", # 机器筛选: 时长低于此秒数剔除(默认1分钟)
     "m_dedup": "1",         # 机器筛选: 相似标题去重
     "m_blocklist_sync": "1",  # 机器筛选: 同步B站账号拉黑名单并屏蔽
+    "m_block_mystery_bio": "0",  # 评论筛选(B站): 屏蔽无个性简介(空简介/"这个人很神秘")账号的评论(默认关)
+    "m_block_lottery": "0",    # 评论筛选(B站): 屏蔽动态抽奖账号的评论(默认关; 需登录B站, 只读缓存)
+    "m_block_empty_space": "0",  # 评论筛选(B站): 屏蔽空首页账号(个人空间一条动态都没有)的评论(默认关; 需登录B站)
+    "m_dm_multicand": "1",    # 弹幕筛选: 一个哈希对上多个账号时怎么办(0=放行 1=全部候选都命中才拦(零误杀, 默认) 2=任一命中即拦)
+    "m_filter_speed": "2",    # 筛选加速档位: 后台补画像/逆推哈希的并发与速率(0=兼容 1=标准 2=快速(默认) 3=极速)
+    # v0.3.1.32 弹幕屏蔽总开关: 0=完全不筛弹幕(原样播放, 不查发送者资料, 注入端连哈希表都不建)。
+    # 只影响弹幕; 评论筛选(mystery/lottery/empty/level/黑名单)照常。
+    "m_dm_on": "1",
+    # v0.3.1.34 信息打开方式(桌面窗口壳): 1=点开信息弹独立悬浮窗(默认; 悬浮窗可塞回标签页,
+    # 标签页也能拖出成悬浮窗) 0=旧的标签页内打开。仅桌面壳生效, 安卓/浏览器忽略。
+    "ui_new_window": "1",
     "m_max_age_months": "5",  # 机器筛选: 只显示最近N个月发布的内容(0=不限)
     "ser_max_age_months": "30",  # 严肃模式独立时间窗: 知识/教程内容历史长, 默认30个月(0=不限)
     "m_seen_hours": "6",      # 通用筛选: 已看信息N小时内不重复出现(0=不限)
@@ -236,6 +356,8 @@ DEFAULTS = {
     "m_news_fresh": "1",      # 机器筛选: 资讯/热点类只推送24小时内(干货/教程不受此限)
     "bili_follow_emph": "1",  # B站关注的人: 强调关注up发布的视频(入池+视觉强调)
     "bili_follow_months": "1",  # B站关注的人: 只强调最近N个月发布(0=不限, 滑条0-12)
+    "cf_blk_on": "1",         # 评论筛选: 屏蔽黑名单(作者名单+已同步B站拉黑)内用户评论(1=开)
+    "cf_min_level": "2",      # 评论筛选: 屏蔽B站等级低于N级的用户评论(1=不过滤)
     "ai_full_scan": "0",      # AI推荐模式: 1=所有候选都AI评分+推荐理由(费token), 0=只评热度前120条
     "ai_interest_min": "0",   # 推荐标准: 兴趣分门槛(0=不限, 5=一般, 7=严格)
     "ai_batch": "15",         # 省钱方式: 每批评分条数(15=稳, 30=省一半请求)
@@ -275,18 +397,41 @@ DEFAULTS = {
 }
 
 
+# v0.3.1.31: settings 表只有几十行, 但一次 /api/feed 要读 ~28 次 —— 每次都 _db_lock
+# + 一条 SQL。全进程只有 sset 一个写入点(实测: 只有建库初始化与 sset 两处写 settings;
+# /api/settings/import 也是走 sset), 所以在 sset 里同步更新缓存即可, 不需要失效扫描。
+_SET_CACHE = {}
+_SET_LOCK = threading.Lock()
+_SET_MISS = object()
+
+
+def _set_cache_clear():
+    """极端情况兜底(外部直接改库/换库文件后调用)。"""
+    with _SET_LOCK:
+        _SET_CACHE.clear()
+
+
 def sget(key):
+    v = _SET_CACHE.get(key, _SET_MISS)
+    if v is not _SET_MISS:
+        return v
     # 锁保护: _FX 8线程并发 sget 会导致共享连接读竞态(InterfaceError/空值)
     with _db_lock:
         row = db().execute("SELECT v FROM settings WHERE k=?", (key,)).fetchone()
-    return row[0] if row else DEFAULTS.get(key, "")
+    v = row[0] if row else DEFAULTS.get(key, "")
+    with _SET_LOCK:
+        _SET_CACHE[key] = v
+    return v
 
 
 def sset(key, value):
+    value = str(value)
     with _db_lock:
         db().execute("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                     (key, str(value)))
-        db().commit()
+                     (key, value))
+        _commit()   # v0.3.1.31: 区域内合并提交
+    with _SET_LOCK:
+        _SET_CACHE[key] = value
 
 
 def today():
@@ -3019,16 +3164,12 @@ def get_feed_raw(force=False):
         sset("fetch_error", payload.get("error", ""))
         if not payload["offline"]:
             with _db_lock:
-                for it in payload["items"]:
-                    old = db().execute("SELECT json FROM items WHERE key=?", (it["key"],)).fetchone()
-                    if old:
-                        try:
-                            prev = json.loads(old[0])
-                        except Exception:
-                            prev = {}
-                    db().execute("INSERT INTO items(key,json,fetched_at,score_at) VALUES(?,?,?,0) "
+                # v0.3.1.31: 与 build_universe 里那处同源 —— 旧实现每条先 SELECT json 再 UPSERT,
+                # 而取回的 old/prev **从未被使用**(UPSERT 恒以 excluded.json 覆盖), 纯浪费往返。
+                db().executemany("INSERT INTO items(key,json,fetched_at,score_at) VALUES(?,?,?,0) "
                                  "ON CONFLICT(key) DO UPDATE SET json=excluded.json,fetched_at=excluded.fetched_at",
-                                 (it["key"], json.dumps(it, ensure_ascii=False), now))
+                                 [(it["key"], json.dumps(it, ensure_ascii=False), now)
+                                  for it in payload["items"]])
                 db().execute("DELETE FROM items WHERE fetched_at < ?", (now - 7 * 86400,))  # 只留7天历史
                 db().commit()
     return _feed_cache["payload"]
@@ -4821,22 +4962,101 @@ def fetch_account_profile():
     return profile
 
 
+_ABLOCK_PAGE = 50          # 接口硬上限: ps 传多大都只回 50 条(实测 ps=500 仍回 50)
+_ABLOCK_MAX_PAGES = 80     # 上限保护(4000 人), 防接口异常时无限翻页
+_ABLOCK_GAP = 0.4          # 页间隔(秒): 16 页约 8-10 秒。实测连发会把 B站风控招来
+                           # (acc/info 随即返回 -352「风控校验失败」), 所以宁可慢一点。
+
+
 def fetch_account_blocklist():
-    """读取 B站账号拉黑名单 → 写入本地 ablock 表。返回数量。"""
-    d = bili_get("https://api.bilibili.com/x/relation/blacks")
-    if d.get("code") != 0:
-        if d.get("code") == -101:
-            raise RuntimeError("未登录B站账号，无法同步拉黑名单")
-        raise RuntimeError("拉黑名单读取失败(code=%s)" % d.get("code"))
-    items = (d.get("data") or {}).get("list") or []
-    names = [it.get("uname") or it.get("name") for it in items]
-    names = [n for n in names if n]
+    """读取 B站账号拉黑名单 → 写入本地 ablock 表。返回写入条数。
+
+    v0.3.1.32c: 这个接口是**分页**的, 且 ps 传多大都只回 50 条。
+    以前只取第一页 —— 而实测账号里有 778 个拉黑 = 16 页, 本地名单因此只覆盖 1/16,
+    「屏蔽黑名单内用户的弹幕」只能命中极小一部分(753 个哈希里只算得出 50 个),
+    这就是"按昵称拉黑了却还看得见它弹幕"的根子。
+    现在翻完全部页; 只有**完整拿全**时才做镜像替换(清掉已不在名单里的老行),
+    任何后续页失败都退化成"只增量补写", 绝不误删。
+    """
+    seen = {}
+    fetched = 0                 # 注意: 必须数"取回条数", 不能数 len(seen) ——
+                                # 同一昵称可能有多人(实测 778 条里只有 753 个不同昵称),
+                                # 用 len(seen) 判"翻完了"会永远判不出来。
+    total = None
+    complete = False
+    for pn in range(1, _ABLOCK_MAX_PAGES + 1):
+        d = bili_get("https://api.bilibili.com/x/relation/blacks?pn=%d&ps=%d" % (pn, _ABLOCK_PAGE))
+        if d.get("code") != 0:
+            if pn == 1:
+                if d.get("code") == -101:
+                    raise RuntimeError("未登录B站账号，无法同步拉黑名单")
+                raise RuntimeError("拉黑名单读取失败(code=%s)" % d.get("code"))
+            break                       # 后续页失败: 拿多少算多少, 不删数据
+        data = d.get("data") or {}
+        if total is None:
+            try:
+                total = int(data.get("total") or 0)
+            except Exception:
+                total = 0
+        lst = data.get("list") or []
+        if not lst:
+            complete = (total == 0)     # 空页 + total 也是 0 → 确实一个拉黑都没有
+            break
+        for it in lst:
+            n = it.get("uname") or it.get("name")
+            if not n:
+                continue
+            m = it.get("mid")
+            seen[n] = str(m) if m else None
+            fetched += 1
+        if total and fetched >= total:
+            complete = True
+            break
+        time.sleep(_ABLOCK_GAP)         # 别把风控招来
+    rows = [(n, m) for n, m in seen.items()]
+    if not rows and not complete:
+        return 0                        # 一页都没成功 → 什么都不动
     with _db_lock:
-        for n in names:
-            db().execute("INSERT OR REPLACE INTO ablock(name, ts) VALUES(?,?)",
-                         (n, int(time.time())))
+        if complete:
+            # 名单是权威的 → 清掉不在里面的老行。它们 mid 恒 NULL, 既算不出哈希,
+            # 又会让内容过滤误伤已经解禁的作者。
+            db().execute("DELETE FROM ablock")
+        if rows:
+            now = int(time.time())
+            db().executemany("INSERT OR REPLACE INTO ablock(name, ts, mid) VALUES(?,?,?)",
+                             [(n, now, m) for n, m in rows])
         db().commit()
-    return len(names)
+    if complete:
+        try:
+            sset("ablock_v", "2")       # 标记"本地已是完整镜像", 启动修复不再重复拉
+        except Exception:
+            pass
+    return len(rows)
+
+
+def repair_blocklist_mids():
+    """v0.3.1.32: 补齐/重建本地拉黑名单(只在需要时打一次网络)。
+
+    两个历史问题叠在一起, 让「屏蔽黑名单内用户的弹幕」几乎失效:
+      ① ablock.mid 是后加的列 —— 它之前同步进来的行 mid 全 NULL, dm_blocked_hashes()
+         一条哈希都算不出来(实测用户库里 50 行全是 NULL mid, dmhash = 0 条);
+      ② 拉黑接口是分页的(50 条/页), 老代码只取第一页 ——
+         实测账号 778 个拉黑只同步了 50 个。
+    用 ablock_v 版本号兜底: 不等于 '2' 就重拉一次全量(分页), 成功后才打标记,
+    之后不再联网。失败(如离线)不打标记, 下次启动再试。
+    """
+    try:
+        if sget("m_blocklist_sync") != "1":
+            return 0
+        if sget("ablock_v") == "2":
+            return 0
+        old = db().execute("SELECT COUNT(*) FROM ablock").fetchone()
+        old = old[0] if old else 0
+        n = fetch_account_blocklist()
+        print("[v0.3.1.32] 重建本地拉黑名单: 写入 %d 行(原有 %d 行)" % (n, old))
+        return n
+    except Exception:
+        return 0
 
 
 def maybe_sync_blocklist():
@@ -6195,6 +6415,1015 @@ def dislike_keywords():
     return list(dict.fromkeys(out))
 
 
+
+# ------------------------------------------------- B站作者画像(评论区: 无个性简介 / 动态抽奖)
+
+# 用途: 「其他设置 · 评论筛选 → B站」里那两个账号级开关 —— 在播放页评论区把这两类
+# 账号的评论摘掉。**不再作用于信息流**(v0.3.1.20 起; 信息流不再按简介/抽奖过滤)。
+#
+# "无个性简介": B站把**空简介**显示为「这个人很神秘，什么都没有写」——
+# 实测(2026-10-08 用真实 Cookie): 空简介账号 sign 就是空串, 那句"神秘"只是前端占位
+# 文案。而评论接口(x/v2/reply*)的 member 里**自带 sign**(顶层与楼中楼都实测有), 所以
+# 这一项在页面端就能就地判定: 零请求、零延迟 —— 这里只保留同规则的兜底实现。
+#
+# "动态抽奖": 评论本身看不出抽奖, 只能按作者最近 3 条动态判, 且必须登录 B站 ——
+# 于是走下面的 author_meta 缓存: 页面端只读缓存(命中即拦), 未命中的作者丢进后台
+# 限速队列慢慢补, 绝不把网络等待放在评论加载的关键路径上。
+MYSTERY_SIGN = "这个人很神秘，什么都没有写"
+# B站「这个账号不存在」的返回码。实测 acc/info 对不存在的 mid 返回 -404 + message「啥都木有」;
+# 风控(-352 等)是**另一回事** —— 那是"查不到", 绝不能当成"不存在"(会误杀)。
+_BILI_NO_SUCH_MID = frozenset((-404, -400))
+# 抽奖文本标记(B站抽奖动态普遍带这些话题/短语)
+LOTTERY_KW = ("互动抽奖", "动态抽奖", "转发抽奖", "抽奖活动", "抽奖福利", "宠粉福利",
+              "粉丝福利", "福利抽奖")
+# 只出现"抽奖"两字不判(可能是在聊抽奖机制) —— 必须同时出现"参与类"线索
+LOTTERY_CUE = ("转发", "关注", "参与", "转赞评", "点赞", "评论", "开奖", "中奖", "获奖",
+               "抽1", "抽一", "抽送", "送出", "奖品", "名额", "恭喜", "欢迎", "拼手气")
+
+_author_meta = {}                  # "mid" -> {"sign","mystery","lottery","ts"}
+_author_meta_lock = threading.Lock()
+_AUTHOR_META_TTL = 24 * 3600       # 作者画像缓存 24h(内存 + DB 双层)
+_AUTHOR_WARM_MAX = 400             # 后台补图队列上限(防无界增长)
+_AUTHOR_WARM_GAP = 0.6             # 两次作者查询之间的最小间隔(秒): 限速, 免触发风控
+_AUTHOR_WARM_CAP = 60              # 单次请求最多认领的未知作者数
+_am_warm_q = []                    # 待补图的 mid(有序 + 去重)
+_am_warm_seen = set()
+_am_warm_lock = threading.Lock()
+# v0.3.1.30: 单线程 _am_warm_thread 已换成 _am_pool 线程池(见下方「筛选加速」段)
+_am_conn_tls = threading.local()    # /api/bili/flags 专用连接(短 busy_timeout)
+_AM_DB_BUSY_MS = 200                # 上述连接 busy_timeout(ms): DB 被写锁占住就立刻放弃读取
+
+
+# ── v0.3.1.30 筛选加速: 有界线程池 + 令牌桶 ─────────────────────────────
+# 实测瓶颈(2026-10-09, 用户库副本 + 真实接口):
+#   · 逆推队列 1 线程 + _DMREV_GAP=0.25s → 3.4 个/秒; 逆推稳态其实只要 15.2ms
+#     (66 个/秒) —— 那 0.25s 是**纯白等**, 白白浪费 19 倍。
+#   · 画像队列 1 线程 + _AUTHOR_WARM_GAP=0.6s + 每账号两次串行 HTTP(557ms)
+#     → 0.86 账号/秒; 200 个账号要 231 秒。
+# 改法: 两个队列都改**有界线程池**; 网络侧再叠一层**令牌桶** ——
+#   并发只用来掩盖延迟, **速率才是风控闸门**(并发开大不会提高请求速率)。
+#   撞上风控(-352 之类)自动降速, 5 分钟后恢复, 不拿用户的账号冒险。
+_FILTER_GEARS = {
+    # 档位 -> (画像并发, 画像速率/秒, 逆推并发, 逆推速率/秒)
+    # 逆推速率 0 = 不限速(纯本地 CPU, 单线程上限 ~66/s)
+    "0": (1, 1.0 / 0.6, 1, 1.0 / 0.25),    # 兼容: 与 v0.3.1.29 行为一致
+    "1": (3, 4.0, 2, 20.0),                # 标准
+    "2": (6, 7.0, 3, 45.0),                # 快速(默认)
+    "3": (12, 14.0, 4, 0.0),               # 极速
+}
+_gear_cache = {"v": None, "ts": 0.0}
+
+
+class _TokenBucket(object):
+    """令牌桶限速: 突发额度让短页面「一瞬间」过完, 之后按 rate 匀速。
+    线程安全; rate <= 0 表示不限速。"""
+    __slots__ = ("rate", "cap", "_t", "_last", "_lk")
+
+    def __init__(self, rate, burst):
+        self._lk = threading.Lock()
+        self.rate = 0.0
+        self.cap = 1.0
+        self._t = 0.0
+        self._last = time.time()
+        self.set(rate, burst)
+        with self._lk:
+            self._t = self.cap     # 起始灌满: 短页面(条目数 ≤ 并发数)要能「一瞬间」过完
+
+    def set(self, rate, burst):
+        """改速率/额度。会先把「距上次结算这段时间」的令牌结息记上, 再按新额度调整 ——
+        否则每次入队都调 set() 会把攒下的令牌悄悄清零(短页面就享受不到突发额度了)。
+        额度变大时补足差额(用户从「兼容」调到「快速」应当立刻拿到新额度)。"""
+        with self._lk:
+            now = time.time()
+            if self.rate > 0:
+                self._t = min(self.cap, self._t + (now - self._last) * self.rate)
+            new_cap = float(max(1.0, burst))
+            if new_cap > self.cap:
+                self._t += (new_cap - self.cap)
+            self.rate = float(rate)
+            self.cap = new_cap
+            self._t = min(self.cap, self._t)
+            self._last = now
+
+    def acquire(self):
+        """取一个令牌; 取不到就睡到能取为止。"""
+        if self.rate <= 0:
+            return True
+        while True:
+            with self._lk:
+                now = time.time()
+                self._t = min(self.cap, self._t + (now - self._last) * self.rate)
+                self._last = now
+                if self._t >= 1.0:
+                    self._t -= 1.0
+                    return True
+                wait = (1.0 - self._t) / self.rate
+            time.sleep(min(wait, 0.25))
+
+
+def _filter_gear():
+    """当前「筛选加速」档位。2 秒缓存 —— 免得每页都查一次库。"""
+    now = time.time()
+    if _gear_cache["v"] is not None and now - _gear_cache["ts"] < 2.0:
+        return _gear_cache["v"]
+    try:
+        g = str(sget("m_filter_speed") or "2")
+    except Exception:
+        g = "2"
+    v = _FILTER_GEARS.get(g) or _FILTER_GEARS["2"]
+    _gear_cache["v"] = v
+    _gear_cache["ts"] = now
+    return v
+
+
+_am_gate = _TokenBucket(0, 1)          # 画像请求闸门
+_dmrev_gate = _TokenBucket(0, 1)       # 逆推闸门(纯本地, 控的是 CPU 占空比)
+_am_pool = []                          # 画像池的活线程
+_dmrev_pool = []                       # 逆推池的活线程
+# 风控退避: 连续撞到非 0/非 -404 的返回就把画像速率减半, 冷却 5 分钟后恢复
+_am_risk = {"n": 0, "until": 0.0, "factor": 1.0}
+
+
+def _am_note_risk(code):
+    """acc/info 返回风控码(-352 等) → 记一笔; 连续 3 次就把速率砍半。"""
+    if code is None or code == 0 or code in _BILI_NO_SUCH_MID:
+        _am_risk["n"] = 0
+        return
+    now = time.time()
+    if now < _am_risk["until"]:
+        return                      # 已在冷却期, 不重复降速
+    _am_risk["n"] += 1
+    if _am_risk["n"] >= 3:
+        _am_risk["n"] = 0
+        _am_risk["factor"] = max(0.125, _am_risk["factor"] * 0.5)
+        _am_risk["until"] = now + 300.0
+        print("[filter] 检测到 B站风控, 画像速率降到 %.0f%%, 5 分钟后自动恢复"
+              % (_am_risk["factor"] * 100))
+
+
+def _am_apply_gear():
+    """把档位写进画像闸门, 返回并发数。"""
+    conc, rate, _rc, _rr = _filter_gear()
+    if _am_risk["factor"] < 1.0 and time.time() > _am_risk["until"]:
+        _am_risk["factor"] = 1.0        # 冷却结束 → 速率恢复
+        _am_risk["n"] = 0
+    # 突发额度 = 并发数: 短页面(条目数 ≤ 并发数)一瞬间过完, 但**绝不突破并发上限**。
+    # 兼容档 conc=1 → 额度 1 → 与 v0.3.1.29 的「每个间隔 0.6s」逐条等价。
+    _am_gate.set(rate * _am_risk["factor"], max(1.0, conc))
+    return int(conc)
+
+
+def _dmrev_apply_gear():
+    """把档位写进逆推闸门, 返回并发数。"""
+    _c, _r, rconc, rrate = _filter_gear()
+    _dmrev_gate.set(rrate, max(1.0, rconc))
+    return int(rconc)
+
+
+def _pool_fill(pool, conc, target):
+    """保证 pool 里有 conc 个活线程(worker 队列空就退出, 入队时再补)。
+    调用方须持有对应队列锁。"""
+    pool[:] = [t for t in pool if t.is_alive()]
+    for _ in range(max(0, int(conc) - len(pool))):
+        t = threading.Thread(target=target, daemon=True)
+        t.start()
+        pool.append(t)
+
+
+def _bili_get_t(url, timeout=5):
+    """B站 GET, 短超时(作者画像用; 拖慢构建要不得)。"""
+    req = urllib.request.Request(url, headers=dict(ACCOUNT_HEADERS, Cookie=account_cookie()))
+    return json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8"))
+
+
+def _dyn_text(*objs):
+    """从动态对象里抽取可见文本(desc.text / major.opus.summary / draw.description ...)。"""
+    out = []
+
+    def walk(o, depth=0):
+        if depth > 7 or len(out) > 500:
+            return
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if isinstance(v, str):
+                    if k in ("text", "title", "description", "desc", "summary"):
+                        out.append(v)
+                elif isinstance(v, (dict, list)):
+                    walk(v, depth + 1)
+        elif isinstance(o, list):
+            for v in o[:10]:
+                walk(v, depth + 1)
+
+    for o in objs:
+        walk(o)
+    return " ".join(out)
+
+
+def _dyn_is_lottery(it):
+    """单条动态是否抽奖:
+    ① 硬标记 —— 官方"互动抽奖"附加模块(additional.type 含 LOTTERY / reserve / upower_lottery);
+    ② 文本标记 —— 含"互动抽奖/动态抽奖/转发抽奖"等, 或 "抽奖" + 参与线索。"""
+    if not isinstance(it, dict):
+        return False
+    for node in (it, it.get("orig")):
+        if not isinstance(node, dict):
+            continue
+        add = (((node.get("modules") or {}).get("module_dynamic") or {}).get("additional") or {})
+        if "LOTTERY" in str(add.get("type") or "").upper():
+            return True
+        if add.get("reserve") or add.get("upower_lottery") or add.get("lottery"):
+            return True
+    text = _dyn_text(it)
+    if any(k in text for k in LOTTERY_KW):
+        return True
+    return ("抽奖" in text) and any(c in text for c in LOTTERY_CUE)
+
+
+def _bili_acc_probe(mid):
+    """返回 (data, code)。code == 0 才有 data。
+    必须把「账号不存在」(-404 啥都木有)和「风控/失败」区分开: 前者是确定的结论,
+    后者是"还不知道"。混为一谈会让「全命中才拦」永远等一个查不出画像的候选。"""
+    qs = wbi_enc({"mid": mid, "token": "", "platform": "web", "web_location": 1550101})
+    d = _bili_get_t("https://api.bilibili.com/x/space/wbi/acc/info?" + qs)
+    if not isinstance(d, dict):
+        return {}, None
+    code = d.get("code")
+    return ((d.get("data") or {}) if code == 0 else {}), code
+
+
+def _bili_acc_info(mid):
+    return _bili_acc_probe(mid)[0]
+
+
+def _bili_recent_dynamics(mid, n=3):
+    """作者最近 n 条动态。**None = 接口失败(未知)**, [] = 确实一条动态都没有 ——
+    调用方必须区分: 失败时绝不能把作者写进缓存当成"没有动态"(空首页判定会误伤)。"""
+    qs = wbi_enc({"host_mid": mid, "offset": "", "timezone_offset": -480,
+                  "features": "itemOpusStyle", "web_location": 1550101})
+    try:
+        d = _bili_get_t("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?" + qs)
+    except Exception:
+        return None
+    if not isinstance(d, dict) or d.get("code") != 0:
+        return None
+    return ((d.get("data") or {}).get("items") or [])[:n]
+
+
+def _am_conn():
+    """页面脚本(/api/bili/flags)专用连接: 短 busy_timeout。
+    评论加载的关键路径上, DB 被别的写事务占住时宁可立刻"读不到"(→ 放行),
+    也绝不能让这个读把页面卡住。"""
+    c = getattr(_am_conn_tls, "c", None)
+    if c is None:
+        c = sqlite3.connect(os.path.join(DATA_DIR, "data.db"),
+                            check_same_thread=False, timeout=_AM_DB_BUSY_MS / 1000.0)
+        try:
+            c.execute("PRAGMA busy_timeout=%d" % _AM_DB_BUSY_MS)
+            c.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
+        _am_conn_tls.c = c
+    return c
+
+
+_am_absent = {}                # mid -> 1(内存镜像; 表 absent_mid 是持久层)
+_am_absent_ok = False
+_am_absent_lock = threading.Lock()
+
+
+def _am_is_absent(m, fast=False):
+    """该 mid 是否已被确认**不存在**(acc/info 返回 -404「啥都木有」)。
+    不存在的候选不可能是弹幕发送者 —— 多候选判定时必须排除它, 而不是当成"画像还没到"
+    (否则「全部候选都命中才拦」永远等不到那几个永远查不出画像的候选, 规则永不生效)。
+    读不到就返回 False(保守: 只会少拦, 不会误杀)。"""
+    global _am_absent_ok
+    m = str(m or "")
+    with _am_absent_lock:
+        if _am_absent_ok:
+            return m in _am_absent
+    try:
+        rows = [str(r[0]) for r in (_am_conn() if fast else db()).execute(
+            "SELECT mid FROM absent_mid") if r[0]]
+    except Exception:
+        return False
+    with _am_absent_lock:
+        for x in rows:
+            _am_absent[x] = 1
+        _am_absent_ok = True
+        return m in _am_absent
+
+
+def _am_mark_absent(m):
+    m = str(m or "")
+    if not m:
+        return
+    with _am_absent_lock:
+        _am_absent[m] = 1
+    try:
+        db().execute("INSERT OR REPLACE INTO absent_mid(mid,ts) VALUES(?,?)",
+                     (m, int(time.time())))
+        db().commit()
+    except Exception:
+        pass
+
+
+def _am_row_get(m, fast=False):
+    """只读缓存(内存 → DB), 不联网。命中且未过期返回画像, 否则 None。
+    fast=True: 给页面脚本用 —— 走短超时连接(_am_conn), 不长等 DB 锁。"""
+    now = time.time()
+    with _author_meta_lock:
+        c = _author_meta.get(m)
+    if c and now - c["ts"] < _AUTHOR_META_TTL:
+        return c
+    try:
+        conn = _am_conn() if fast else db()
+        row = conn.execute("SELECT sign,mystery,lottery,nodyn,level,ts FROM author_meta WHERE mid=?",
+                           (m,)).fetchone()
+    except Exception:
+        return None
+    if not row or now - int(row[5] or 0) >= _AUTHOR_META_TTL:
+        return None
+    if row[3] is None:      # 老记录(没有 nodyn 列 / 当时取动态失败) → 当作未知, 触发重取
+        return None
+    c = {"sign": row[0] or "", "mystery": bool(row[1]), "lottery": bool(row[2]),
+         "nodyn": bool(row[3]), "level": (int(row[4]) if row[4] is not None else None),
+         "ts": int(row[5])}
+    with _author_meta_lock:
+        _author_meta[m] = c
+    return c
+
+
+def bili_author_meta(mid, want_bio=True, want_lottery=True):
+    """按 mid 取作者画像(简介是否空 / 最近动态是否含抽奖 / 是否一条动态都没有)。内存+DB 缓存。
+    未登录或接口异常 → 返回 None(调用方一律放行, 宁可漏杀不可误杀)。
+    一份缓存记录**永远是完整画像**(简介 + 动态一起取): 只取一半会把另一半写成
+    "干净", 之后按缓存判定就会漏杀 —— 那两个 want_* 参数只为兼容旧调用点保留。"""
+    m = str(mid or "")
+    if not m.isdigit() or int(m) <= 0:
+        return None
+    c = _am_row_get(m)
+    if c is not None:
+        return c
+    if not account_cookie():
+        return None
+    try:
+        acc, _code = _bili_acc_probe(m)
+        _am_note_risk(_code)        # v0.3.1.30: 撞风控自动降速
+        if not acc:
+            # v0.3.1.27: 接口返回空(风控/失败)时**绝不写缓存** —— 旧实现会让 acc={}
+            # 一路走到 sign="" → mystery=True, 把"查不到"记成"无简介"(误杀源)。
+            # v0.3.1.28: 但 -404「啥都木有」是**确定的"这个账号不存在"**, 要单独记下来 ——
+            # 多候选判定时它不可能是发送者, 不能当成"画像还没到"一直等下去。
+            if _code in _BILI_NO_SUCH_MID:
+                _am_mark_absent(m)
+            return None
+        sign = (acc.get("sign") or "").strip()
+        # 等级: 2026-10-09 实测 acc/info **已不返回 level_info**, 真实等级在顶层 level;
+        # 且 0 是合法等级(LV0 小号)—— 旧写法把"等级为 0"和"等级未知"混成同一个 None, 把 LV0 记成
+        # "未知", 于是「等级低」规则对最该拦的 LV0 永远不生效。
+        level = None
+        _li = acc.get("level_info") or {}
+        if isinstance(_li, dict) and _li.get("current_level") is not None:
+            try:
+                level = int(_li["current_level"])
+            except Exception:
+                level = None
+        elif acc.get("level") is not None:
+            try:
+                level = int(acc["level"])
+            except Exception:
+                level = None
+        mystery = (not sign) or (re.sub(r"\s+", "", sign) == MYSTERY_SIGN)
+        items = _bili_recent_dynamics(m)
+        if items is None:
+            return None     # 动态接口失败 → 不写缓存(否则会把"不知道"记成"没有动态")
+        lottery = any(_dyn_is_lottery(x) for x in items)
+        nodyn = (len(items) == 0)   # 一条动态都没有 = 空首页(判定口径由用户 2026-10-08 定)
+        c = {"sign": sign, "mystery": bool(mystery), "lottery": bool(lottery),
+             "nodyn": bool(nodyn), "level": level, "ts": int(time.time())}
+    except Exception:
+        return None
+    with _author_meta_lock:
+        _author_meta[m] = c
+    try:
+        db().execute("INSERT INTO author_meta(mid,sign,mystery,lottery,nodyn,level,ts) "
+                     "VALUES(?,?,?,?,?,?,?) "
+                     "ON CONFLICT(mid) DO UPDATE SET sign=excluded.sign, mystery=excluded.mystery, "
+                     "lottery=excluded.lottery, nodyn=excluded.nodyn, level=excluded.level, ts=excluded.ts",
+                     (m, c["sign"], int(c["mystery"]), int(c["lottery"]), int(c["nodyn"]),
+                      c["level"], c["ts"]))
+        db().commit()
+    except Exception:
+        pass
+    return c
+
+
+# ── v0.3.1.27 一次性数据修复 ────────────────────────────────────────────────
+# `level` 列是后加的: 列上线前写入的画像行 level 全为 NULL(用户库实测 567 行),
+# 抽查 10 条真实等级是 6/4/2/6/5/5/5/6/5/4 —— 一条 LV0 都没有, 全是"没记上"。
+# 把这类行标脏(nodyn=NULL → _am_row_get 视为过期)让它们按需重取; 重取会写入真实
+# 等级。只跑一次(设置键打标记), 重取走原有后台限速队列, 不会造成请求风暴。
+try:
+    if sget("_mig_am_level27") != "1":
+        _n27 = db().execute(
+            "UPDATE author_meta SET nodyn=NULL WHERE nodyn IS NOT NULL AND level IS NULL"
+        ).rowcount
+        db().commit()
+        sset("_mig_am_level27", "1")
+        if _n27:
+            print("[mig] author_meta: %d 行(level 列上线前写入)已标脏, 将按需重取真实等级" % _n27)
+except Exception:
+    pass
+
+
+def _am_warm_worker():
+    """画像池 worker: 取一个 mid → 过令牌桶 → 取画像。
+    队列空就退出(下次入队 _pool_fill 再补线程) —— 不再空转占资源。
+    v0.3.1.30: 旧实现是**单线程 + 每账号 sleep 0.6s**(0.86 账号/秒); 现在并发
+    由池给、速率由令牌桶给 —— 两者解耦, 才能既快又不失控。"""
+    while True:
+        with _am_warm_lock:
+            if not _am_warm_q:
+                return
+            m = _am_warm_q.pop(0)
+        _am_gate.acquire()          # 闸门在锁外: 等待时不占锁
+        try:
+            if bili_author_meta(m) is None:
+                with _am_warm_lock:
+                    _am_warm_seen.discard(m)
+        except Exception:
+            with _am_warm_lock:
+                _am_warm_seen.discard(m)
+
+
+def _am_enqueue(mids):
+    """把未知 mid 塞进后台补图队列(去重 / 有上限 / 不阻塞调用方)。
+    v0.3.1.30: 改为按档位补足线程池(旧实现只保证 1 个线程)。"""
+    add = []
+    conc = _am_apply_gear()      # 先读档位(可能查库) —— 在锁外, 不占锁
+    with _am_warm_lock:
+        for m in mids:
+            m = str(m or "")
+            if len(add) >= _AUTHOR_WARM_CAP:
+                break
+            if not m.isdigit() or int(m) <= 0 or m in _am_warm_seen:
+                continue
+            if _am_is_absent(m):
+                continue        # 已确认不存在 → 别再白跑接口
+            if len(_am_warm_q) >= _AUTHOR_WARM_MAX:
+                break
+            _am_warm_seen.add(m)
+            _am_warm_q.append(m)
+            add.append(m)
+        if add:
+            _pool_fill(_am_pool, conc, _am_warm_worker)
+    return add
+
+
+def _am_rows_get(ms, fast=True):
+    """v0.3.1.31: 批量版 _am_row_get —— 内存优先, 剩余一次 IN 查询取回。
+    旧实现每个 mid 一条 SELECT(200 个作者 = 200 次往返, 实测 6.1ms);
+    批量后固定 1~2 条语句。语义与 _am_row_get 逐条版完全一致:
+    TTL 过期当未知; nodyn 为 NULL 的老记录当未知(触发重取); 读失败一律当未知(放行)。"""
+    now = time.time()
+    out, miss = {}, []
+    with _author_meta_lock:
+        for m in ms:
+            c = _author_meta.get(m)
+            if c and now - c["ts"] < _AUTHOR_META_TTL:
+                out[m] = c
+            else:
+                miss.append(m)
+    if not miss:
+        return out
+    try:
+        conn = _am_conn() if fast else db()
+    except Exception:
+        return out
+    for i in range(0, len(miss), _SQL_CHUNK):
+        part = miss[i:i + _SQL_CHUNK]
+        ph = ",".join("?" for _ in part)
+        try:
+            rows = conn.execute("SELECT mid,sign,mystery,lottery,nodyn,level,ts FROM author_meta "
+                                "WHERE mid IN (" + ph + ")", part).fetchall()
+        except Exception:
+            continue
+        for row in rows:
+            if now - int(row[6] or 0) >= _AUTHOR_META_TTL:
+                continue
+            if row[4] is None:      # 老记录(没有 nodyn 列 / 当时取动态失败) → 未知, 触发重取
+                continue
+            c = {"sign": row[1] or "", "mystery": bool(row[2]), "lottery": bool(row[3]),
+                 "nodyn": bool(row[4]), "level": (int(row[5]) if row[5] is not None else None),
+                 "ts": int(row[6])}
+            out[row[0]] = c
+            with _author_meta_lock:
+                _author_meta[row[0]] = c
+    return out
+
+
+def bili_author_flags(mids, want_bio=True, want_lottery=True, want_empty=True):
+    """评论区(页面脚本)调用: **只读缓存**, 立刻返回, 绝不联网等待。
+    返回 {"flags": {"mid": {"mystery","lottery","nodyn"}}, "pending":[未知 mid],
+          "cookie": 是否已登录 B站(没登录时页面端就不必再问了)}。
+    走 _am_rows_get(fast=True): 短 busy_timeout, DB 被写锁占住时立刻返回未知(放行)。
+    v0.3.1.31: 批量 IN, 不再逐 mid 一条 SQL。"""
+    flags, pending, unknown = {}, [], []
+    valid, seen = [], set()
+    for m in (mids or []):
+        m = str(m or "")
+        if not m.isdigit() or int(m) <= 0 or m in seen:
+            continue
+        seen.add(m)
+        valid.append(m)
+    cache = _am_rows_get(valid, fast=True) if valid else {}
+    for m in valid:
+        c = cache.get(m)
+        if c is None:
+            unknown.append(m)
+            pending.append(m)
+            continue
+        if ((want_bio and c.get("mystery")) or (want_lottery and c.get("lottery"))
+                or (want_empty and c.get("nodyn"))):
+            flags[m] = {"mystery": bool(c.get("mystery")), "lottery": bool(c.get("lottery")),
+                        "nodyn": bool(c.get("nodyn"))}
+    cookie = bool(account_cookie())
+    if cookie and unknown:
+        _am_enqueue(unknown)
+    return {"flags": flags, "pending": pending, "cookie": cookie}
+
+
+# ───────────────────────── 弹幕筛选(v0.3.1.22) ─────────────────────────
+# 弹幕接口(x/v2/dm/web/seg.so)是 protobuf, 发送者只有 midHash = crc32(str(mid))
+# 的 8 位十六进制 —— 没有昵称/等级/简介。CRC32 对"纯数字串"可以 meet-in-the-middle
+# 本地逆推(≤9 位基本唯一, 位数越多碰撞候选越多), 于是弹幕侧数据链:
+#   · 黑名单: 已知 mid(B站拉黑名单接口自带 / 评论区见过的 name→mid 索引 name_mid)
+#     → 正算 hash, 注入页面按 hash 集合就地摘弹幕 —— 精确、零延迟;
+#   · 抽奖/空首页/无简介/等级: midHash 由后台线程逆推出 mid(存 dm_sender, 跨视频复用)
+#     → 复用 author_meta 画像。候选不唯一时一律放行 —— 宁可漏杀, 绝不误杀。
+
+def _crc_m1(x):
+    """CRC32 消费一个 0x00 字节的线性转移(对初态线性)。"""
+    return (x >> 8) ^ _CRC_T[x & 0xFF]
+
+
+def _crc_apply(x, n):
+    for _ in range(n):
+        x = _crc_m1(x)
+    return x
+
+
+_CRC_T = []
+for _i in range(256):
+    _c = _i
+    for _ in range(8):
+        _c = (_c >> 1) ^ (0xEDB88320 if _c & 1 else 0)
+    _CRC_T.append(_c)
+
+
+def crc32_mid(mid):
+    """B站弹幕 midHash 正算: crc32(十进制mid字符串) → 8位十六进制。"""
+    return "%08x" % (zlib.crc32(str(mid).encode("ascii")) & 0xFFFFFFFF)
+
+
+_crc_suf_cache = {}     # b -> {reg0(s): s}(与目标 hash 无关, 可跨查询复用)
+
+
+def _crc_suffix_dict(b):
+    d = _crc_suf_cache.get(b)
+    if d is not None:
+        return d
+    d = {}
+    stack = [(b"", 0)]
+    while stack:
+        pre, st = stack.pop()
+        if len(pre) == b:
+            d[st] = pre.decode()
+            continue
+        for c in range(10):
+            stack.append((pre + bytes([48 + c]),
+                          (st >> 8) ^ _CRC_T[(st ^ (48 + c)) & 0xFF]))
+    if len(_crc_suf_cache) > 6:
+        _crc_suf_cache.clear()
+    _crc_suf_cache[b] = d
+    return d
+
+
+def crc32_reverse(target_hex, max_len=11, budget_s=8.0):
+    """逆推: 返回长度 2..max_len 内**所有**满足 crc32==target 的候选 mid 串。
+    32 位校验值, 候选数随长度指数涨(≈10^L/2^32) —— 调用方必须消歧, 多候选别猜。
+
+    ⚠️ v0.3.1.25 起**已无调用点**, 一律改用 crc32_reverse_fast(前缀预表, 2..10 位完整, ~20ms)。
+    不要再在点击/批量路径上用它: 它按 budget_s 截断, 算不完会返回**残缺候选集** ——
+    被落库当负缓存后就永远查不出真身了(这正是 v0.3.1.24 弹幕跳转大面积失败的真因)。
+    保留仅为对照/离线研究。"""
+    try:
+        target = int(target_hex, 16) & 0xFFFFFFFF
+    except Exception:
+        return []
+    t0 = time.time()
+    out = []
+    for L in range(2, max_len + 1):
+        if time.time() - t0 > budget_s:
+            break
+        b = min(5, L - 1)
+        a = L - b
+        K = target ^ (_crc_apply(0xFFFFFFFF, L) ^ 0xFFFFFFFF)
+        suf = _crc_suffix_dict(b)
+        stack = [(b"", 0)]
+        while stack:
+            pre, st = stack.pop()
+            if len(pre) == a:
+                s = suf.get(K ^ _crc_apply(st, b))
+                if s is not None:
+                    out.append(pre.decode() + s)
+                continue
+            first = 1 if not pre else 0
+            for c in range(first, 10):
+                stack.append((pre + bytes([48 + c]),
+                              (st >> 8) ^ _CRC_T[(st ^ (48 + c)) & 0xFF]))
+        if time.time() - t0 > budget_s:
+            break
+    return out
+
+
+# ---- 快速批量逆推(v0.3.1.24) ----
+# 痛点: crc32_reverse 每个 hash 都现场 DFS 枚举前缀, max_len=11 时光 L=11 一轮就要
+# 走 90 万个栈节点(~2s 纯 Python CPU), 队列 800 个 = 半小时满载, GIL 把壳的窗口消息泵
+# 和 HTTP 一起拖死(用户反馈「特别特别卡」的真因)。
+# 改法: 前缀段的状态与目标 hash 无关 → 按(前缀位数a, 后缀位数b)预算一次、跨查询复用;
+# 每 hash 剩下的只是 9 万次异或+字典查表(~20ms)。后台批量逆推封顶 10 位:
+# 10 位以上的新 UID 逆不动 → 空结果落库当负缓存, 绝不让它拖死进程。
+_crc_pre_cache = {}     # (a, b) -> [(st, st_after_b_zeros, prefix_str)]
+
+
+def _crc_pre_states(a, b):
+    d = _crc_pre_cache.get((a, b))
+    if d is not None:
+        return d
+    lst = []
+    stack = [(b"", 0)]
+    while stack:
+        pre, st = stack.pop()
+        if len(pre) == a:
+            lst.append((st, pre.decode()))
+            continue
+        first = 1 if not pre else 0
+        for c in range(first, 10):
+            stack.append((pre + bytes([48 + c]),
+                          (st >> 8) ^ _CRC_T[(st ^ (48 + c)) & 0xFF]))
+    d = [(st, _crc_apply(st, b), s) for st, s in lst]
+    if len(_crc_pre_cache) > 8:
+        _crc_pre_cache.clear()
+    _crc_pre_cache[(a, b)] = d
+    return d
+
+
+def crc32_reverse_fast(target_hex):
+    """后台批量用: 语义与 crc32_reverse(max_len=10) 完全一致, 但前缀段走预表。
+    每 hash ~20ms(9999/10000 的工作量在查表), 不再是每个 2s 的 CPU 风暴。"""
+    try:
+        target = int(target_hex, 16) & 0xFFFFFFFF
+    except Exception:
+        return []
+    out = []
+    for L in range(2, 11):
+        b = min(5, L - 1)
+        a = L - b
+        K = target ^ (_crc_apply(0xFFFFFFFF, L) ^ 0xFFFFFFFF)
+        suf = _crc_suffix_dict(b)
+        if a <= 3:                      # 表太小不值得缓存, 现算只有 9/90/900 个节点
+            stack = [(b"", 0)]
+            while stack:
+                pre, st = stack.pop()
+                if len(pre) == a:
+                    s = suf.get(K ^ _crc_apply(st, b))
+                    if s is not None:
+                        out.append(pre.decode() + s)
+                    continue
+                first = 1 if not pre else 0
+                for c in range(first, 10):
+                    stack.append((pre + bytes([48 + c]),
+                                  (st >> 8) ^ _CRC_T[(st ^ (48 + c)) & 0xFF]))
+        else:
+            for st, stb, s in _crc_pre_states(a, b):
+                r = suf.get(K ^ stb)
+                if r is not None:
+                    out.append(s + r)
+    return out
+
+
+_dmrev_q = []                # 待逆推 hash(有序去重)
+_dmrev_seen = set()
+_dmrev_lock = threading.Lock()
+# v0.3.1.30: 单线程 _dmrev_thread 已换成 _dmrev_pool 线程池
+_DMREV_MAX = 800             # 队列上限(防无界增长)
+_DMREV_CAP = 120             # 单次请求最多认领
+_DMREV_GAP = 0.25            # 两个 hash 之间的间隔(纯本地计算)
+
+
+def _dm_sender_row(h, fast=False):
+    try:
+        conn = _am_conn() if fast else db()
+        return conn.execute("SELECT mids,ncand,ts FROM dm_sender WHERE hash=?", (h,)).fetchone()
+    except Exception:
+        return None
+
+
+def _dm_pick_mid(mids, fast=False):
+    """候选消歧: 唯一候选直接用; 多候选时用本地已知 mid(name_mid/ablock.mid)撞唯一解。
+    返回 (mid or None, ncand)。撞不出唯一解返回 None —— 绝不猜。"""
+    if not mids:
+        return None, 0
+    if len(mids) == 1:
+        return mids[0], 1
+    try:
+        conn = _am_conn() if fast else db()
+        q = ",".join("?" * len(mids))
+        known = {str(r[0]) for r in conn.execute(
+            "SELECT mid FROM name_mid WHERE mid IN (%s)" % q, tuple(mids)) if r[0]}
+        if sget("m_blocklist_sync") == "1":
+            known |= {str(r[0]) for r in conn.execute(
+                "SELECT mid FROM ablock WHERE mid IN (%s)" % q, tuple(mids)) if r[0]}
+        hits = [m for m in mids if m in known]
+        if len(hits) == 1:
+            return hits[0], len(mids)
+    except Exception:
+        pass
+    return None, len(mids)
+
+
+def _dmrev_store(h, cands):
+    uniq = sorted(set(cands))[:8]
+    db().execute("INSERT OR REPLACE INTO dm_sender(hash,mids,ncand,ts) VALUES(?,?,?,?)",
+                 (h, ",".join(uniq), len(set(cands)), int(time.time())))
+    db().commit()
+    return uniq
+
+
+def _dmrev_worker():
+    """逆推池 worker(纯本地 CPU, 不联网)。队列空就退出。
+    v0.3.1.30: 旧实现**单线程 + 每 hash sleep 0.25s** → 3.4 个/秒;
+    而逆推稳态只要 15.2ms(66 个/秒) —— 那 0.25s 是纯白等, 白白浪费 19 倍。
+    闸门在这里控的是 **CPU 占空比**(逆推是纯 Python, GIL 下总 CPU = 速率 × 15.2ms),
+    所以档位同时决定了会不会把界面拖卡。"""
+    while True:
+        with _dmrev_lock:
+            if not _dmrev_q:
+                return
+            h = _dmrev_q.pop(0)
+        _dmrev_gate.acquire()
+        try:
+            if _dm_sender_row(h) is None:
+                uniq = _dmrev_store(h, crc32_reverse_fast(h))   # ~15ms/个, 封顶10位(负缓存落库)
+                m, _nc = _dm_pick_mid(uniq)
+                if m:
+                    _am_enqueue([m])     # 画像(简介/动态/等级)走既有补图队列
+        except Exception:
+            pass
+
+
+def _dmrev_enqueue(hashes):
+    """v0.3.1.30: 改为按档位补足线程池(旧实现只保证 1 个线程)。"""
+    add = []
+    conc = _dmrev_apply_gear()
+    with _dmrev_lock:
+        if len(_dmrev_seen) > 20000:
+            _dmrev_seen.clear()      # 防长期驻留膨胀; 被清的会借 pending 再次进队
+        for h in hashes:
+            if len(add) >= _DMREV_CAP:
+                break
+            if not h or h in _dmrev_seen:
+                continue
+            if len(_dmrev_q) >= _DMREV_MAX:
+                break
+            _dmrev_seen.add(h)
+            _dmrev_q.append(h)
+            add.append(h)
+        if add:
+            _pool_fill(_dmrev_pool, conc, _dmrev_worker)
+    return add
+
+
+def _am_bad(c, want_bio=False, want_lottery=False, want_empty=False, lvl=0):
+    """一条账号画像是否命中「弹幕评论筛选」的账号级规则。"""
+    if not c:
+        return False
+    return bool((want_bio and c.get("mystery")) or (want_lottery and c.get("lottery"))
+                or (want_empty and c.get("nodyn"))
+                or (lvl > 0 and c.get("level") is not None and c["level"] <= lvl))
+
+
+def _dm_flag_of(c, multi):
+    """回给页面端的标记。multi = 这个哈希对上了几个账号(>1 时页面端标注「N候选」)。"""
+    return {"mystery": bool(c.get("mystery")), "lottery": bool(c.get("lottery")),
+            "nodyn": bool(c.get("nodyn")), "level": c.get("level"),
+            "multi": int(multi)}
+
+
+def bili_dm_flags(hashes, want_bio=False, want_lottery=False, want_empty=False, lvl=0, multi=1):
+    """弹幕版 bili_author_flags: 按 midHash 查(先逆推出 mid, 再查账号画像)。
+    只读本地缓存, 绝不联网等待; 没逆过的 hash 进后台队列慢慢算。
+
+    multi —— 一个 8 位哈希常常对上 2~8 个真实账号(B站只给 crc32, 32 位有损;
+    用户库实测 361 个哈希里 329 个是多候选 = 91%), 这时无法唯一确定发送者:
+      · 0 = 放行           —— 旧行为(宁可漏杀), 代价是这些规则对 91% 的弹幕形同虚设;
+      · 1 = 全部候选都命中 —— 零误杀(不管真身是哪个候选, 他都该被拦), 默认;
+      · 2 = 任一候选命中   —— 宁可误杀, 拦得最狠(候选一多几乎等于清空弹幕, 慎用)。
+    多候选时**所有候选都会进后台补画像队列** —— 旧实现在这里直接 continue,
+    候选永远没有画像, 规则永远等不到数据(死循环)。
+    """
+    flags, pending = {}, []
+    for h in (hashes or [])[:300]:
+        h = str(h or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{8}", h):
+            continue
+        row = _dm_sender_row(h, fast=True)
+        if row is None:
+            pending.append(h)
+            _dmrev_enqueue([h])
+            continue
+        mids = [m for m in str(row[0] or "").split(",") if m]
+        m, _nc = _dm_pick_mid(mids, fast=True)
+        if m:
+            # 唯一解: 直接按画像判
+            c = _am_row_get(m, fast=True)
+            if c is None:
+                _am_enqueue([m])
+                continue
+            if _am_bad(c, want_bio, want_lottery, want_empty, lvl):
+                flags[h] = _dm_flag_of(c, 1)
+            continue
+        if not mids or multi == 0:
+            continue          # 逆不出来(≥11 位新 UID) / 用户选了放行
+        # ── 多候选: 逐个候选查画像 ──
+        # 候选分三类: 有画像 / 确认不存在(-404, 不可能是发送者) / 还不知道。
+        # 只有"还不知道"才值得等 —— 把"不存在"也当成"等不到画像"是「全命中才拦」
+        # 永不生效的真因: 实测哈希 e6f1d278 的 6 个候选里有 4 个是 -404。
+        prof, unknown = [], []
+        for x in mids:
+            c = _am_row_get(x, fast=True)
+            if c is not None:
+                prof.append(c)
+            elif not _am_is_absent(x, fast=True):
+                unknown.append(x)
+        if unknown:
+            _am_enqueue(unknown)   # ← 关键修复: 多候选也要补画像, 否则规则永远不生效
+        bad = [c for c in prof if _am_bad(c, want_bio, want_lottery, want_empty, lvl)]
+        if bad:
+            # 展示用原因与页面端 blkWhy 的优先级保持一致(无简介 > 抽奖 > 空首页 > 等级低)
+            bad.sort(key=lambda c: (not (want_bio and c.get("mystery")),
+                                    not (want_lottery and c.get("lottery")),
+                                    not (want_empty and c.get("nodyn"))))
+        if multi == 2:
+            hit = bad                     # 任一命中即拦
+        elif prof and not unknown:
+            # 候选全部查清了(有画像的 + 确认不存在的), 且每个有画像的都命中
+            # → 真身无论是谁都该拦。零误杀。
+            hit = bad if len(bad) == len(prof) else []
+        else:
+            hit = []                      # 还有候选没查清 → 断不了"全部命中"
+        if hit:
+            flags[h] = _dm_flag_of(hit[0], len(mids))
+    return {"flags": flags, "pending": pending, "cookie": bool(account_cookie())}
+
+
+_card_ok = {}                  # mid -> {"mid","name","face"} / None(确认不存在) / "?"(查不通)
+_card_ok_lock = threading.Lock()
+
+
+def _card_info(mid, timeout=5):
+    """card 接口一次拿全: 账号是否存在 + 昵称 + 头像(未注册 → code -404「啥都木有」)。
+    返回 {"mid","name","face"} / None(确认不存在) / "?"(查不通, 不参与消歧)。
+    只在"点击弹幕找发送者"这条慢路径上用, 带内存缓存, 绝不进弹幕/评论加载路径。
+    (v0.3.1.25: 原来只回布尔, 消歧后还得为每个候选再打一次 acc/info 拿昵称 —— 现在一次到位。)"""
+    m = str(mid or "")
+    with _card_ok_lock:
+        v = _card_ok.get(m, 0)
+    if v != 0:
+        return v
+    try:
+        d = _bili_get_t("https://api.bilibili.com/x/web-interface/card?mid=%s&photo=false" % m,
+                        timeout=timeout)
+        if d.get("code") == 0:
+            c = ((d.get("data") or {}).get("card") or {})
+            v = {"mid": m, "name": (c.get("name") or "").strip(),
+                 "face": (c.get("face") or "").replace("http:", "https:")}
+        else:
+            v = None             # -404 啥都木有 → 确认不存在
+            if d.get("code") in _BILI_NO_SUCH_MID:
+                _am_mark_absent(m)      # 点过主页的账号顺手记上, 多候选判定直接排除
+    except Exception:
+        return "?"               # 查不了 → 不拿它消歧, 也不误判
+    with _card_ok_lock:
+        if len(_card_ok) > 2000:
+            _card_ok.clear()
+        _card_ok[m] = v
+    return v
+
+
+def bili_dm_mid(hash_hex, budget_s=2.5):
+    """弹幕列表点「发送者」时用: 逆推 midHash → 主页 mid(唯一解 / 多候选 / 查不到)。
+    消歧顺序: 本地已知 mid(name_mid/ablock) → card 接口验真(≤8 个候选并发查, 每个 4s 超时,
+    一次拿全 存在性+昵称+头像)。结果落 dm_sender 供全局复用。
+
+    返回 {"ok":True, "mid":唯一解或None, "ncand":候选总数,
+          "cands":[{"mid","name","face"},...], "why":""}
+      · mid 非空            → 唯一解, 前端直接跳主页;
+      · mid 空 + cands 多个 → hash 撞了(几个账号都能对上), 前端弹候选框让用户自己挑;
+      · mid 空 + cands 空   → 真身是 ≥11 位新 UID(或接口查不通), why 说明原因。
+
+    v0.3.1.25 修: 旧实现走带时间预算的 crc32_reverse, 算不完就把**残缺候选**当负缓存
+    落库, 之后永远查不出真身; 且"恰好 1 个存活"才算成功 → 多候选一律失败。现在改成
+    完整逆推(2..10 位, ~20ms)并与库里旧结果取并集覆盖落库, 多候选照实返回。
+    (budget_s 仅为兼容旧调用签名保留, 已不参与计算。)"""
+    h = str(hash_hex or "").lower().strip()
+    if not re.fullmatch(r"[0-9a-f]{8}", h):
+        return {"ok": False, "mid": None, "ncand": 0, "cands": [], "why": "bad"}
+    row = _dm_sender_row(h)
+    mids = [m for m in str(row[0] or "").split(",") if m] if row else []
+    try:
+        fresh = crc32_reverse_fast(h)      # 2..10 位完整候选, 不吃时间预算
+    except Exception:
+        fresh = []
+    if fresh:
+        merged = sorted(set(mids) | set(fresh))
+        if merged != mids:
+            try:
+                _dmrev_store(h, merged)    # 覆盖式落库: 顺手把历史残缺候选修回来
+            except Exception:
+                pass
+        mids = merged
+    if not mids:
+        _dmrev_enqueue([h])                # 真身多半 ≥11 位 → 后台队列(负缓存标记)
+        return {"ok": True, "mid": None, "ncand": 0, "cands": [], "why": "newuid"}
+    m, ncand = _dm_pick_mid(mids)
+    if m:
+        _am_enqueue([m])
+        return {"ok": True, "mid": m, "ncand": ncand, "cands": [], "why": ""}
+    # 本地索引撞不出唯一解 → 用 card 接口验真(一次拿全 存在性+昵称+头像)。
+    # 并发查(≤8 个, 每个 4s 超时): 串行最坏 8×5s ≈ 40s, 点击路径上不能这么晾着用户。
+    cands = []
+    try:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futs = [(ex.submit(_card_info, c, 4), c) for c in mids[:8]]
+            for f, c in futs:
+                try:
+                    v = f.result(timeout=6)
+                except Exception:
+                    v = "?"
+                if v and v != "?":
+                    cands.append(v)
+    except Exception:
+        cands = []
+    cands.sort(key=lambda d: (len(d["mid"]), d["mid"]))
+    if len(cands) == 1:
+        _am_enqueue([cands[0]["mid"]])
+        return {"ok": True, "mid": cands[0]["mid"], "ncand": ncand, "cands": [], "why": ""}
+    if not cands:
+        _dmrev_enqueue([h])                # ≤10 位全不存在 → 真身多半是 11 位以上
+        return {"ok": True, "mid": None, "ncand": ncand, "cands": [], "why": "newuid"}
+    return {"ok": True, "mid": None, "ncand": ncand, "cands": cands, "why": "multi"}
+
+
+def dm_blocked_hashes():
+    """注入用: 该拦的 midHash 集合 = B站拉黑名单的 mid ∪ 黑名单作者(经 name→mid 索引)。
+    注入时一次正算好, 页面端 O(1) 查表 —— 不做逐条扫描。"""
+    mids = set()
+    try:
+        if sget("m_blocklist_sync") == "1":
+            mids |= {str(r[0]) for r in db().execute(
+                "SELECT mid FROM ablock WHERE mid IS NOT NULL") if r[0]}
+        names = [r[0] for r in db().execute(
+            "SELECT value FROM blacklist WHERE kind='author'") if r[0]]
+        if names:
+            q = ",".join("?" * len(names))
+            mids |= {str(r[0]) for r in db().execute(
+                "SELECT mid FROM name_mid WHERE name IN (%s)" % q, tuple(names)) if r[0]}
+    except Exception:
+        pass
+    return sorted({crc32_mid(m) for m in mids if str(m).isdigit()})
+
+
+def dm_names_save(pairs):
+    """页面端评论区见过的 (昵称, mid) 对 → name_mid 索引(黑名单作者因此能管到弹幕)。"""
+    n = 0
+    try:
+        with _db_lock:
+            for name, mid in (pairs or [])[:200]:
+                name = str(name or "").strip()
+                mid = str(mid or "").strip()
+                if not name or not mid.isdigit():
+                    continue
+                db().execute("INSERT OR REPLACE INTO name_mid(name, mid, ts) VALUES(?,?,?)",
+                             (name, mid, int(time.time())))
+                n += 1
+            db().commit()
+    except Exception:
+        pass
+    return n
+
+
 def machine_filter(items):
     """纯程序规则过滤(不耗AI): 时间范围/最低播放/最大时长/相似标题去重/账号拉黑名单。
     贴吧条目无播放/时长语义(views=0), 跳过播放量/时长规则, 仅保留时间/去重/黑名单;
@@ -7333,8 +8562,9 @@ def _profile_signals():
         rows = db().execute("SELECT key FROM history ORDER BY ts DESC LIMIT 60").fetchall()
     except Exception:
         rows = []
+    hmap = items_by_keys([k for (k,) in rows])   # v0.3.1.31: 原本逐条 item_by_key(60 次往返)
     for (k,) in rows:
-        it = item_by_key(k)
+        it = hmap.get(k)
         if not it:
             continue
         for t in ((it.get("topic") or "").split("、") + (it.get("tag") or "").split(",")
@@ -7649,8 +8879,22 @@ def cooldown_keys(now=None):
         return set()
 
 
+_UPSERT_EXPOSURE = ("INSERT INTO item_exposure_state(key,run_count,last_presented_at,cooldown_until) "
+                    "VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
+                    "run_count=excluded.run_count,last_presented_at=excluded.last_presented_at,"
+                    "cooldown_until=excluded.cooldown_until")
+_SQL_CHUNK = 300     # IN / 多值 VALUES 分片大小(SQLite 变量上限远大于此, 留足余量)
+
+
 def record_feed_presentations(items, request_id, now=None):
-    """只在卡片实际返回给信息流时累计展示；同一请求重试不会重复计数。"""
+    """只在卡片实际返回给信息流时累计展示；同一请求重试不会重复计数。
+
+    v0.3.1.31: 旧实现是**逐条 3 条语句**(30 条 = 94 条语句 / 6.2ms, 实测),
+    现在固定 3 条批量语句。语义完全不变:
+      · 同一 request_id 内重复的 key 只登记一次 —— 旧实现靠 INSERT OR IGNORE 的
+        rowcount==0 去重, 这里改用 INSERT..RETURNING(只返回真正插入的行)等价实现;
+      · _cooldown_relaxed 的条目计数继续递增、冷却截止原样保留。
+    """
     if not request_id:
         return
     now = int(now or time.time())
@@ -7659,30 +8903,55 @@ def record_feed_presentations(items, request_id, now=None):
         hours = max(0, int(sget("m_repeat_cooldown_hours") or 72))
     except Exception:
         limit, hours = 4, 72
+    seen, keys, relaxed = set(), [], set()
+    for it in items:
+        k = it.get("key")
+        if not k:
+            continue
+        if it.get("_cooldown_relaxed"):
+            relaxed.add(k)
+        if k not in seen:
+            seen.add(k)
+            keys.append(k)
+    if not keys:
+        return
     with _db_lock:
-        for it in items:
-            key = it.get("key")
-            if not key:
-                continue
-            cur = db().execute("INSERT OR IGNORE INTO item_presentation(key,request_id,presented_at) VALUES(?,?,?)",
-                               (key, request_id, now))
-            if cur.rowcount == 0:
-                continue
-            row = db().execute("SELECT run_count,cooldown_until FROM item_exposure_state WHERE key=?", (key,)).fetchone()
-            if it.get("_cooldown_relaxed"):
+        conn = db()
+        # ① 批量登记展示, RETURNING 只把"本次真正新登记"的 key 取回来
+        fresh = []
+        for i in range(0, len(keys), _SQL_CHUNK):
+            part = keys[i:i + _SQL_CHUNK]
+            ph = ",".join("(?,?,?)" for _ in part)
+            params = []
+            for k in part:
+                params.extend((k, request_id, now))
+            for r in conn.execute("INSERT OR IGNORE INTO item_presentation(key,request_id,presented_at) "
+                                  "VALUES " + ph + " RETURNING key", params):
+                fresh.append(r[0])
+        if not fresh:
+            _commit()
+            return
+        # ② 一次 IN 取回这批 key 的曝光状态
+        state = {}
+        for i in range(0, len(fresh), _SQL_CHUNK):
+            part = fresh[i:i + _SQL_CHUNK]
+            ph = ",".join("?" for _ in part)
+            for r in conn.execute("SELECT key,run_count,cooldown_until FROM item_exposure_state "
+                                  "WHERE key IN (" + ph + ")", part):
+                state[r[0]] = (r[1], r[2])
+        # ③ 一次 executemany 落库
+        rows = []
+        for k in fresh:
+            row = state.get(k)
+            if k in relaxed:
                 # 冷却期间被复用: 计数继续递增, 严格保留原冷却截止(既不清零也不续期)。
-                run = (row[0] if row else 1) + 1
-                base_cooldown = row[1] if row else 0
-                db().execute("INSERT INTO item_exposure_state(key,run_count,last_presented_at,cooldown_until) VALUES(?,?,?,?) "
-                             "ON CONFLICT(key) DO UPDATE SET run_count=excluded.run_count,last_presented_at=excluded.last_presented_at,cooldown_until=excluded.cooldown_until",
-                             (key, run, now, base_cooldown))
+                rows.append((k, (row[0] if row else 1) + 1, now, (row[1] if row else 0)))
                 continue
             run = 1 if not row or (row[1] > 0 and row[1] <= now) else row[0] + 1
             cooldown = now + hours * 3600 if hours and run >= limit else 0
-            db().execute("INSERT INTO item_exposure_state(key,run_count,last_presented_at,cooldown_until) VALUES(?,?,?,?) "
-                         "ON CONFLICT(key) DO UPDATE SET run_count=excluded.run_count,last_presented_at=excluded.last_presented_at,cooldown_until=excluded.cooldown_until",
-                         (key, run, now, cooldown))
-        db().commit()
+            rows.append((k, run, now, cooldown))
+        conn.executemany(_UPSERT_EXPOSURE, rows)
+        _commit()
 
 
 def _feed_plan(acts, new_session, gen):
@@ -7776,16 +9045,12 @@ def build_universe(quick=False):
                 "SELECT key FROM items WHERE key IN (%s)" % ph, tuple(keys))} if ph else set()
             new_n = len(set(keys) - exist)   # 只计真正新增的条目
             with _db_lock:   # 入库: 沉淀池基础 + 7天清理
-                for it in payload["items"]:
-                    old = db().execute("SELECT json FROM items WHERE key=?", (it["key"],)).fetchone()
-                    if old:
-                        try:
-                            prev = json.loads(old[0])
-                        except Exception:
-                            prev = {}
-                    db().execute("INSERT INTO items(key,json,fetched_at,score_at) VALUES(?,?,?,0) "
+                # v0.3.1.31: 旧实现每条先 SELECT json 再 UPSERT, 而取回的 old/prev **从未被使用**
+                # (UPSERT 恒以 excluded.json 覆盖) —— 纯浪费: 冷启动一次实测 61 条无用 SELECT。
+                db().executemany("INSERT INTO items(key,json,fetched_at,score_at) VALUES(?,?,?,0) "
                                  "ON CONFLICT(key) DO UPDATE SET json=excluded.json,fetched_at=excluded.fetched_at",
-                                 (it["key"], json.dumps(it, ensure_ascii=False), now))
+                                 [(it["key"], json.dumps(it, ensure_ascii=False), now)
+                                  for it in payload["items"]])
                 db().execute("DELETE FROM items WHERE fetched_at < ?", (now - 7 * 86400,))
                 db().commit()
             bump_stats(received=new_n)   # 今日收录只累计新增
@@ -8218,20 +9483,23 @@ def serve_chunk(offset=0, limit=30, q="", request_id=""):
         if s:
             slots_info[s] = slots_info.get(s, 0) + 1
     now_ts = int(time.time())
-    if chunk and not q:
-        record_feed_presentations(chunk, request_id or uuid.uuid4().hex, now_ts)
-    with _db_lock:
-        for it in chunk:
-            db().execute("INSERT OR REPLACE INTO shown(key, ts) VALUES(?,?)", (it["key"], now_ts))
-        db().execute("DELETE FROM shown WHERE ts < ?", (now_ts - 3 * 86400,))
-        db().commit()
-    if chunk:
-        set_last_feed(chunk[-1])   # “刚才那条”指代目标
-        try:   # 跨会话防重复: 记住本次会话末尾5条的一级分类(下次启动前5条避开)
-            cats = [_cat_key(it) for it in chunk[-5:]]
-            sset("last_types", json.dumps(cats, ensure_ascii=False))
-        except Exception:
-            pass
+    # v0.3.1.31: 尾部这一整段(展示登记 + shown 回写 + 刚才那条 + 会话分类)原本各自
+    # 提交一次 = 4 次 fsync(~5ms)。圈进 _batch_commit() 后只落 1 次磁盘同步。
+    with _batch_commit():
+        if chunk and not q:
+            record_feed_presentations(chunk, request_id or uuid.uuid4().hex, now_ts)
+        with _db_lock:
+            db().executemany("INSERT OR REPLACE INTO shown(key, ts) VALUES(?,?)",
+                             [(it["key"], now_ts) for it in chunk if it.get("key")])
+            db().execute("DELETE FROM shown WHERE ts < ?", (now_ts - 3 * 86400,))
+            _commit()
+        if chunk:
+            set_last_feed(chunk[-1])   # “刚才那条”指代目标
+            try:   # 跨会话防重复: 记住本次会话末尾5条的一级分类(下次启动前5条避开)
+                cats = [_cat_key(it) for it in chunk[-5:]]
+                sset("last_types", json.dumps(cats, ensure_ascii=False))
+            except Exception:
+                pass
     next_offset = consumed_end
     return {"ok": True, "items": chunk, "building": building, "gen": uni["gen"],
             "source": uni["source"], "offline": uni["offline"],
@@ -8376,6 +9644,26 @@ def ball_recall_ack(n):
 def item_by_key(key):
     row = db().execute("SELECT json FROM items WHERE key=?", (key,)).fetchone()
     return json.loads(row[0]) if row else None
+
+
+def items_by_keys(keys):
+    """v0.3.1.31: 批量版 item_by_key —— 一次 IN 取回多条, 返回 {key: item}。
+    调用方原本都是 `for k in ks: item_by_key(k)`(历史页 200 条 = 200 次往返)。"""
+    out = {}
+    ks = [k for k in keys if k]
+    for i in range(0, len(ks), _SQL_CHUNK):
+        part = ks[i:i + _SQL_CHUNK]
+        ph = ",".join("?" for _ in part)
+        try:
+            rows = db().execute("SELECT key,json FROM items WHERE key IN (" + ph + ")", part).fetchall()
+        except Exception:
+            continue
+        for k, j in rows:
+            try:
+                out[k] = json.loads(j)
+            except Exception:
+                pass
+    return out
 
 
 # ---------------------------------------------------------------- AI 悬浮窗(仅电脑版)
@@ -8596,25 +9884,66 @@ def _assist_usage_snapshot():
 
 
 class Handler(BaseHTTPRequestHandler):
+    # B站页面里的脚本跑在 https://*.bilibili.com 源上, 读 127.0.0.1 需要显式放行:
+    #   · bilibili-sr.user.js 轮询 /api/ui_settings 做超分热更新;
+    #   · bilibili-cfilter.user.js 打 /api/bili/flags 问评论作者的账号画像;
+    #   · bilibili-cfilter.user.js 用 navigator.sendBeacon 往 /api/bili/names 上报
+    #     (评论里见到的昵称, mid) 对。
+    # 只有这几个"不含任何凭据、只回开关键/布尔标记"的端点对 B 站源回显 ACAO,
+    # 其余端点(含 ai_key 的)一律不给。
+    _CORS_PATHS = ("/api/ui_settings", "/api/bili/flags", "/api/bili/dmflags",
+                   "/api/bili/dmmid", "/api/bili/names")
+
+    def _cors_headers(self):
+        """对 B站源回显 ACAO。预检(OPTIONS)与实际请求(POST)必须回同一个值,
+        否则浏览器会把请求整体判失败。"""
+        if getattr(self, "path", "").split("?")[0] not in self._CORS_PATHS:
+            return
+        try:
+            origin = self.headers.get("Origin") or ""
+            host = origin.split("://", 1)[-1].split("/", 1)[0] if "://" in origin else ""
+            if host == "bilibili.com" or host.endswith(".bilibili.com"):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+        except Exception:
+            pass
+
+    def do_OPTIONS(self):
+        """CORS 预检(v0.3.1.32 新增 —— 这个缺失导致弹幕黑名单一直是空的)。
+
+        bilibili-cfilter 从 https://www.bilibili.com 用 navigator.sendBeacon 往
+        http://127.0.0.1 上报 (昵称, mid) 对。Blob 的 type 是 application/json,
+        **不在 CORS 安全列表里** → 浏览器先发 OPTIONS 预检。此前 Handler 没有
+        do_OPTIONS, BaseHTTPRequestHandler 直接回 501, 预检失败, 整个上报被静默丢掉
+        (sendBeacon 只返回"已入队"=true, 页面完全察觉不到)。
+        实测后果: name_mid 表恒为 0 行 → dm_blocked_hashes() 恒返回 []
+        → 「屏蔽黑名单内用户…弹幕」这条规则从未真正生效过。
+        """
+        self.send_response(204)
+        self._cors_headers()
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "86400")
+        # Chrome 的 Private Network Access: 公网源(bilibili.com)访问本机(127.0.0.1)
+        # 会额外索要这个头, 否则预检过了请求仍被拦。
+        if (self.headers.get("Access-Control-Request-Private-Network") or "").lower() == "true":
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def send_json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        # 内置浏览器标签页里的超分脚本(bilibili-sr.user.js)轮询 /api/ui_settings 做热更新;
-        # 该页面跑在 https://*.bilibili.com 源上, 读 127.0.0.1 需要显式放行 ——
-        # 仅此一个只含 UI 开关的端点对 B 站源回显 ACAO, 其余端点(含 ai_key 的)一律不给
-        if getattr(self, "path", "").split("?")[0] == "/api/ui_settings":
-            try:
-                origin = self.headers.get("Origin") or ""
-                host = origin.split("://", 1)[-1].split("/", 1)[0] if "://" in origin else ""
-                if host == "bilibili.com" or host.endswith(".bilibili.com"):
-                    self.send_header("Access-Control-Allow-Origin", origin)
-                    self.send_header("Vary", "Origin")
-            except Exception:
-                pass
+        self._cors_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            # v0.3.1.31: 客户端(浏览器/curl 超时)提前断开时 socketserver 会打一整段
+            # traceback —— 这不是错误, 是正常现象, 静默忽略。
+            pass
 
     def send_file(self, name, ctype):
         try:
@@ -8746,13 +10075,15 @@ class Handler(BaseHTTPRequestHandler):
                                    "keywords": [r[1] for r in rows if r[0] == "keyword"]})
         if path == "/api/history":
             rows = db().execute("SELECT key,ts FROM history ORDER BY ts DESC LIMIT 200").fetchall()
-            items = [dict(item_by_key(k) or {"key": k, "title": "(已下架)", "platform": "-"},
+            hmap = items_by_keys([k for k, _t in rows])   # v0.3.1.31: 批量, 原本 200 次往返
+            items = [dict(hmap.get(k) or {"key": k, "title": "(已下架)", "platform": "-"},
                           **{"ts": t}) for k, t in rows]
             return self.send_json({"items": items})
         if path == "/api/saved":
             kind = qs.get("kind", ["later"])[0]
             rows = db().execute("SELECT key,ts FROM saved WHERE kind=? ORDER BY ts DESC LIMIT 200", (kind,)).fetchall()
-            items = [dict(item_by_key(k) or {"key": k, "title": "(已下架)", "platform": "-"},
+            smap = items_by_keys([k for k, _t in rows])   # v0.3.1.31: 批量, 原本 200 次往返
+            items = [dict(smap.get(k) or {"key": k, "title": "(已下架)", "platform": "-"},
                           **{"ts": t}) for k, t in rows]
             return self.send_json({"items": items})
         if path == "/api/conv":
@@ -8835,7 +10166,9 @@ class Handler(BaseHTTPRequestHandler):
             keys = ("m_min_views", "m_max_views", "m_max_duration", "m_min_duration", "m_repeat_limit", "m_repeat_cooldown_hours", "m_dedup", "m_blocklist_sync",
                     "m_max_age_months", "ser_max_age_months", "m_seen_hours", "m_emotion",
                     "m_news_fresh", "m_play_related", "xhh_comm", "xhh_topic", "bili_follow_emph", "bili_follow_months",
-                    "m_cold_start_n")
+                    "m_cold_start_n", "cf_blk_on", "cf_min_level",
+                    "m_block_mystery_bio", "m_block_lottery", "m_block_empty_space",
+                    "m_dm_multicand", "m_filter_speed", "m_dm_on")
             enabled = enabled_source_ids()
             blocked = [{"name": r[0], "ts": r[1]} for r in
                        db().execute("SELECT name, ts FROM ablock ORDER BY ts DESC").fetchall()]
@@ -9033,6 +10366,42 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({k: sget(k) for k in ("ui_bq", "ui_bq_level", "ui_sr",
                                                         "ui_fg", "ui_sr_level", "ui_sr_scale",
                                                         "ui_ownui")})
+        if path == "/api/bili/flags":
+            # 「评论筛选 · B站」那两个账号级开关用: 页面脚本(bilibili-cfilter)带着本页
+            # 评论作者的 mid 来问"谁是空简介 / 谁是抽奖号"。
+            # 只读 author_meta 缓存 + 把未知作者丢进后台限速队列, **绝不联网等待** ——
+            # 评论加载的关键路径上不能有网络查询。只回布尔标记, 不含任何凭据。
+            mids = [x.strip() for x in (qs.get("mids", [""])[0] or "").split(",") if x.strip()]
+            r = bili_author_flags(mids[:60],
+                                  want_bio=qs.get("bio", ["1"])[0] != "0",
+                                  want_lottery=qs.get("lot", ["1"])[0] != "0",
+                                  want_empty=qs.get("nodyn", ["1"])[0] != "0")
+            return self.send_json({"ok": True} | r)
+        if path == "/api/bili/dmflags":
+            # 「弹幕评论筛选」: 页面脚本(bilibili-dmfilter)带着本页弹幕发送者的 midHash
+            # 来问"谁该拦"。只读本地缓存(逆推表 + 账号画像), 绝不联网等待 ——
+            # 弹幕加载的关键路径上不能有网络查询/长计算。只回布尔标记, 不含任何凭据。
+            hs = [x.strip().lower() for x in (qs.get("hashes", [""])[0] or "").split(",") if x.strip()]
+            try:
+                _lvl = int(qs.get("lvl", ["0"])[0] or 0)
+            except Exception:
+                _lvl = 0
+            try:
+                _mc = int(sget("m_dm_multicand") or 1)
+            except Exception:
+                _mc = 1
+            r = bili_dm_flags(hs,
+                              want_bio=qs.get("bio", ["0"])[0] != "0",
+                              want_lottery=qs.get("lot", ["0"])[0] != "0",
+                              want_empty=qs.get("nodyn", ["0"])[0] != "0",
+                              lvl=max(0, min(5, _lvl)),
+                              multi=max(0, min(2, _mc)))
+            return self.send_json({"ok": True} | r)
+        if path == "/api/bili/dmmid":
+            # 弹幕列表点「发送者」→ 逆推 midHash 找主页。点击场景可以等一两秒:
+            # 完整逆推(2..10位) + card 接口验真; 多候选时原样回给前端让用户自己挑。
+            r = bili_dm_mid(qs.get("hash", [""])[0])
+            return self.send_json({"ok": True} | r)
         if path == "/api/settings":
             return self.send_json({k: sget(k) for k in ("ai_base", "ai_key", "ai_model", "mode",
                                                         "prefs_note", "dislike_note",
@@ -9041,7 +10410,7 @@ class Handler(BaseHTTPRequestHandler):
                                                         "ai_enabled", "disclaimer_version",
                                                         "ui_bq", "ui_bq_level", "ui_sr",
                                                         "ui_fg", "ui_sr_level", "ui_sr_scale",
-                                                        "ui_ownui")}
+                                                        "ui_ownui", "ui_new_window")}
                                   | {"ai_ok": ai_ok(), "ai_on": ai_on()})
         if path == "/api/floatball":
             env = float_ball_env()
@@ -9083,6 +10452,16 @@ class Handler(BaseHTTPRequestHandler):
             ok = page_lease_alive(token) if action == "alive" else page_lease_leaving(token)
             return self.send_json({"ok": ok, "grace_seconds": PAGE_LEASE_GRACE_SECONDS})
 
+        if path == "/api/bili/names":
+            # bilibili-cfilter 从评论响应里顺手收集的 (作者昵称, mid) 对 → name_mid 索引。
+            # v0.3.1.32: 页面**必须**拿到 CORS 回显, 否则预检/实际请求被浏览器拦掉,
+            # 上报静默丢失(以前这里写着"不需要回显", 正是这个误判让 name_mid 恒为空)。
+            # cfilter 已改用 text/plain 免预检, 壳端 do_OPTIONS 是双保险。
+            try:
+                n = dm_names_save(body.get("pairs") or [])
+                return self.send_json({"ok": True, "n": n})
+            except Exception as e:
+                return self.send_json({"ok": False, "error": str(e)[:100]})
         if path == "/api/login/qr":
             try:
                 return self.send_json({"ok": True, **login_qr_generate()})
@@ -9196,7 +10575,9 @@ class Handler(BaseHTTPRequestHandler):
             for k in ("m_min_views", "m_max_views", "m_max_duration", "m_min_duration", "m_repeat_limit", "m_repeat_cooldown_hours", "m_dedup", "m_blocklist_sync",
                       "m_max_age_months", "ser_max_age_months", "m_seen_hours", "m_emotion",
                       "m_news_fresh", "m_play_related", "xhh_comm", "xhh_topic", "bili_follow_emph", "bili_follow_months",
-                    "m_cold_start_n"):
+                    "m_cold_start_n", "cf_blk_on", "cf_min_level",
+                      "m_block_mystery_bio", "m_block_lottery", "m_block_empty_space",
+                      "m_dm_multicand", "m_filter_speed", "m_dm_on"):
                 if k in body:
                     sset(k, body[k])
             if "m_cold_start_n" in body:
@@ -9297,7 +10678,8 @@ class Handler(BaseHTTPRequestHandler):
             for k in ("ai_base", "ai_key", "ai_model", "mode", "prefs_note", "dislike_note",
                       "price_in", "price_out", "ai_full_scan", "ai_interest_min",
                       "ai_batch", "ai_cache_hours", "ai_enabled", "ui_bq", "ui_bq_level",
-                      "ui_sr", "ui_fg", "ui_sr_level", "ui_sr_scale", "ui_ownui"):
+                      "ui_sr", "ui_fg", "ui_sr_level", "ui_sr_scale", "ui_ownui",
+                      "ui_new_window"):
                 if k in body and body[k] is not None:
                     if k in ("ai_base", "ai_model") and not str(body[k]).strip():
                         continue   # 地址/模型不允许空值覆盖(保留默认/原值)
@@ -12643,11 +14025,18 @@ def run_server(auto_open=False):
     serve_forever 由调用方决定跑在哪个线程: CLI 主线程 / 窗口壳(app_window.py)后台线程。
     """
     global _SERVER
+    # v0.3.1.32: 自动化测试必须能关掉"自动开浏览器" —— frozen exe 的 --server 模式
+    # 恒为 auto_open=True, 会弹一个浏览器页指向隔离测试服务; 页面一关就发
+    # navigator.sendBeacon("/api/shutdown") 把测试服务杀掉(表现为后续请求全 502,
+    # 且白白在用户桌面上弹窗)。置 MIRRORSORTER_NO_OPEN=1 即完全不开。
+    if os.environ.get("MIRRORSORTER_NO_OPEN") == "1":
+        auto_open = False
     # 评分器升级(v2: 标题党判低质/挂人开团扣帽子判引战/补小黑盒口径): 只做版本标记,
     # 不整体清评分缓存(全量清缓存会让全扫模式下首屏长时间空白; 新判据随条目自然重评生效)
     if sget("scorer_v") != "3":
         sset("scorer_v", "3")
     _ensure_score_bg()   # 启动后台渐进评分守护线程(评分写库, 交互路径只读缓存不阻塞)
+    threading.Thread(target=repair_blocklist_mids, daemon=True).start()   # v0.3.1.32: 补 ablock.mid
     for port in PORTS:
         if port_busy(port):
             print("服务已在 http://127.0.0.1:%d 运行" % port)
@@ -12660,7 +14049,7 @@ def run_server(auto_open=False):
         except OSError:
             continue
     else:
-        print("端口 8000/8010/8020 均被占用, 无法启动")
+        print("端口 %s 均被占用, 无法启动" % "/".join(str(x) for x in PORTS))
         return None, None
     _SERVER = server
     print("洞鉴虚明 " + APP_VER + " 已启动: http://127.0.0.1:%d" % port)

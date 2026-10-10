@@ -4,6 +4,7 @@ desktop/_tb_login_profile/
 desktop/smoke-tmp/
 desktop/test-tmp*/
 desktop/rules-tmp/
+desktop/shell-tmp/
 
 # ===== 构建产物 =====
 desktop/build/
@@ -19,6 +20,48 @@ android/capture/
 android-sdk/
 .zcode/
 _local/
+.workbuddy/
+.workbuddy-ai/
+
+# ===== 构建工具/依赖 (本机留存, 不入库) =====
+desktop/installer/redist/
+desktop/installer/tools/
+desktop/installer/*.zip
+
+# ===== 临时探针 / 验证产物 (目录) =====
+desktop/_tmp*/
+desktop/_verify*/
+desktop/_chk_pid*/
+desktop/_acnet*/
+desktop/_bq_probe_profile/
+desktop/_bq_fixture/
+desktop/_exe_tmp/
+desktop/_ghost/
+desktop/_sr_compare/
+desktop/_x29/
+desktop/_a4k/
+desktop/_ref_bili/
+desktop/_framegen_shelf/
+desktop/_ext_variants/
+desktop/backups/
+
+# 验证报告目录: 只保留 REPORT_*.md, 其余(截图/日志)不入库
+desktop/_vis/*
+!desktop/_vis/REPORT_*.md
+
+# ===== 散落的探针产物 / 脚本 (desktop 根下, 名字以 _ 开头) =====
+desktop/_*
+!desktop/_vis/
+desktop/_vis/*
+!desktop/_vis/REPORT_*.md
+desktop/r2.txt
+desktop/r3.txt
+desktop/s2.txt
+desktop/s3.txt
+desktop/rules_out.txt
+desktop/smoke_out.txt
+desktop/build_log_*.txt
+desktop/'
 
 # ===== 常见垃圾 =====
 __pycache__/
@@ -35,3 +78,6 @@ desktop/tb_debug.jsonl
 
 # PyInstaller 生成的 spec(每次构建自动生成)
 desktop/*.spec
+
+# 清理清单等一次性产物
+_cleanup_manifest_*.txt

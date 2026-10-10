@@ -18,13 +18,19 @@ import app   # DATA_DIR(日志/用户脚本目录); 由 app_window 一并加载,
 
 NL = "\n"   # _dbg_log 落盘换行(历史上曾漏定义 → NameError 被吞, shell_debug.log 一直是空的)
 
-# 截屏黑屏根治(v0.3.1.8dsk): 新标签页控件在 home 控件参数基础上显式追加同一组开关。
-# 环境变量 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS(app_window.py 设置)已覆盖主控件路;
-# 这里是第二条路, 不依赖"属性值与环境变量谁覆盖谁"的实现语义, 重复开关无害。
-# ⚠️ 关键是 --disable-direct-composition: 只带 --disable-direct-composition-video-overlays
-# 在 Chromium 154 上挡不住视频层(实证 8/8 黑)。详见 app_window.py 顶部注释。
-MSX_WV2_CAPTURE_FLAG = ("--disable-direct-composition-video-overlays "
-                        "--disable-direct-composition")
+# 截屏黑屏根治(浏览器级冗余声明, v0.3.1.9dsk 回退): 新标签页控件在 home 控件参数
+# 基础上显式追加该开关。环境变量 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS(app_window.py
+# 设置)已覆盖主控件路; 这里是第二条路, 重复开关无害。
+# ⚠️ --disable-direct-composition-video-overlays 在 Chromium 154 上已挡不住视频层
+# (实证 8/8 黑), 真正生效的是**页内给 <video> 加 0.5px 圆角**(见下方 unconditional
+# 样式注入)。曾经加过 --disable-direct-composition(黑帧清零)但**代价是整条呈现路径
+# 退回传统合成 → 用户实测弹幕场景"特别特别卡", 已回退。详见 app_window.py 顶部注释。
+MSX_WV2_CAPTURE_FLAG = (
+    "" if (os.environ.get("MSX_NO_WV2_FLAG") or os.environ.get("MSX_BASIC") == "1")
+    else "--disable-direct-composition-video-overlays")
+
+# 用户报修(m03496)后已取消「外部页签左侧留白」: 窗口级留白会让 B站播放页顶栏左侧空出一块,
+# 且看上去像一条独立边框。「播放页左侧宽一点」改在页面内部留(bilibili-ownui.user.js)。
 
 
 # 自愈式智能深色: 脚本在页面内常驻定时器, 每1.2s重测背景亮度 ——
@@ -111,10 +117,13 @@ window.__msx_theme_mode = 'dark';
         if (n < 2) { sessionStorage.setItem('__msx_rl', String(n + 1)); location.reload(); return; }
       }
       cleanup();   // B站原生深色, 不做反色
+      // 主题已定时撤下防白闪幕布(DOM 已解析才撤, 避免页面尚在解析就露白)
+      if (document.readyState !== 'loading' && window.__msx_veil_off) window.__msx_veil_off();
       return;
     }
-    var b = lum(getComputedStyle(document.body).backgroundColor);
-    var h = lum(getComputedStyle(document.documentElement).backgroundColor);
+    var b = -1, h = -1;
+    try { if (document.body) b = lum(getComputedStyle(document.body).backgroundColor); } catch(e) {}
+    try { h = lum(getComputedStyle(document.documentElement).backgroundColor); } catch(e) {}
     var base = (b >= 0 ? b : (h >= 0 ? h : 255));
     var o = document.getElementById('__msx_dark');
     if (base < 100) {
@@ -129,6 +138,7 @@ window.__msx_theme_mode = 'dark';
       (document.head || document.documentElement).appendChild(st);
       report('invert-injected ' + location.hostname);
     }
+    if (document.readyState !== 'loading' && window.__msx_veil_off) window.__msx_veil_off();
   }
   if (!window.__msx_theme_timer) window.__msx_theme_timer = setInterval(tick, 1500);
   tick();
@@ -147,6 +157,120 @@ window.__msx_theme_mode = 'light';
     var n = +(sessionStorage.getItem('__msx_rl') || 0);
     if (n < 2) { sessionStorage.setItem('__msx_rl', String(n + 1)); location.reload(); }
   }
+  try { if (window.__msx_veil_off) window.__msx_veil_off(); } catch(e) {}
+})()
+"""
+
+# 深色模式"防白闪"幕布。外部站点(如小黑盒)自身没有深色主题, 打开时会先铺一层白底,
+# 屏幕白闪刺眼。此脚本经 AddScriptToExecuteOnDocumentCreated 在 document-start(先于
+# 页面任何渲染)执行, 立刻盖一层不透明深色幕布; 待 _THEME_DARK_JS 判定完主题(或页面
+# 加载完成)再淡出。仅深色模式生效(经 prefers-color-scheme 判定, 与 Profile.
+# PreferredColorScheme 一致)。文档创建脚本必须早于首帧, 否则白闪仍会出现。
+_NOFLASH_JS = r"""
+(function(){
+  /* ── 防闪幕布 (document-start, 先于页面首帧) ────────────────────────────
+   * 用户反馈: 打开B站/小黑盒这类站点会"闪一下" —— 我们的注入脚本(自有UI/评论
+   * 筛选/主题)需要时间改版面, 这期间半成品的原生UI先露出来了。
+   * 做法: 首帧前先盖一层与主题同色的不透明幕布(深色 #0f0f0f / 浅色 #fff, 看起来
+   * 就是一张空白页), 等"页面 + 我们的脚本"都改完再淡出。
+   *   · 我们的脚本用 __msx_veil_hold(tag, ttl) 申请"先别揭幕", 改完调
+   *     __msx_veil_release(tag); ttl 到期自动失效(脚本异常也不会永久盖住页面)。
+   *   · 揭幕条件: 无未过期的 hold + DOM 已解析 + (整页 load 已完成 / 主题已定 /
+   *     已等够 LATE 毫秒, 防止页面卡在加载中)。
+   *   · 兜底: 绝对上限 HARD 毫秒; 最短停留 MIN_ON 毫秒(防止幕布自己闪一下)。
+   *   · SPA: 同一文档内再次 hold 会重新盖幕(B站站内换视频)。
+   * 接口在本脚本最前面就定义好, 且与注入脚本共用 window.__msx_veil_holds 对象 ——
+   * 两者执行先后颠倒也不会丢 hold。 */
+  if (window.__msx_veil_api) return;
+  window.__msx_veil_api = 1;
+  /* 子框架不挂幕布: WebView2 的 document-created 脚本会下发到**每一个子框架**
+     (广告/嵌入), 幕布只该盖顶层文档; 子框架各挂一层既无意义又添开销。 */
+  try { if (window.top !== window.self) return; } catch (e) {}
+  var BG_DARK = '#0f0f0f', BG_LIGHT = '#ffffff';
+  var T0 = Date.now(), MIN_ON = 180, HARD = 6000, SETTLE = 110, LATE = 900;
+  var H = window.__msx_veil_holds || (window.__msx_veil_holds = {});
+  var veil = null, done = false, asked = false, quiet = 0, timer = null;
+
+  function mode(){
+    try {
+      if (window.__msx_theme_mode) return window.__msx_theme_mode;
+      return (window.matchMedia &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+    } catch(e){ return 'dark'; }
+  }
+  function bg(){ return mode() === 'light' ? BG_LIGHT : BG_DARK; }
+  function pending(now){
+    var n = 0, k, d;
+    for (k in H) {
+      if (!Object.prototype.hasOwnProperty.call(H, k)) continue;
+      d = H[k];
+      if (d === 0 || d > now) n++;
+    }
+    return n;
+  }
+  function mount(){
+    if (veil || done) return;
+    try {
+      var root = document.documentElement;
+      if (!root) return;
+      var old = document.getElementById('__msx_veil');
+      if (old && old.parentNode) old.parentNode.removeChild(old);
+      veil = document.createElement('div');
+      veil.id = '__msx_veil';
+      veil.setAttribute('style',
+        'position:fixed;left:0;top:0;right:0;bottom:0;margin:0;padding:0;'
+        + 'background:' + bg() + ';z-index:2147483000;pointer-events:none;'
+        + 'opacity:1;transition:opacity .12s linear');
+      root.appendChild(veil);
+    } catch(e){ veil = null; }
+  }
+  function stop(){ if (timer) { clearInterval(timer); timer = null; } }
+  function start(){ if (!timer && !done) timer = setInterval(tick, 90); }
+  function off(){
+    if (done) return;
+    done = true;
+    stop();
+    var v = veil; veil = null;
+    if (!v) return;
+    try {
+      v.style.opacity = '0';
+      setTimeout(function(){
+        try { if (v.parentNode) v.parentNode.removeChild(v); } catch(e){}
+      }, 200);
+    } catch(e){ try { if (v && v.parentNode) v.parentNode.removeChild(v); } catch(e2){} }
+  }
+  function tick(){
+    if (done) return;
+    var now = Date.now(), el = now - T0;
+    if (el >= HARD) { off(); return; }   // 页面迟迟不完成(readyState 卡 loading)也要揭
+    if (veil && veil.style.background !== bg()) veil.style.background = bg();
+    if (document.readyState === 'loading' || el < MIN_ON) return;
+    if (pending(now) > 0) { quiet = 0; return; }            // 我们的脚本还在改版面
+    if (document.readyState !== 'complete' && !asked && el < LATE) return;
+    if (!quiet) { quiet = now; return; }                    // 稳一帧再揭, 免得露出半成品
+    if (now - quiet >= SETTLE) off();
+  }
+  window.__msx_veil_hold = function(tag, ttl){
+    tag = String(tag || 'x');
+    H[tag] = ttl ? (Date.now() + ttl) : 0;
+    if (done) { done = false; quiet = 0; mount(); }         // SPA: 重新盖幕
+    start();
+    tick();
+  };
+  window.__msx_veil_release = function(tag){
+    var k;
+    if (tag === undefined || tag === null) {
+      for (k in H) { if (Object.prototype.hasOwnProperty.call(H, k)) delete H[k]; }
+    } else { delete H[String(tag)]; }
+    quiet = 0;
+    tick();
+  };
+  window.__msx_veil_off = function(){ asked = true; quiet = 0; tick(); };  // 兼容旧调用
+  mount();
+  [0, 16, 45, 100, 220, 500].forEach(function(t){ setTimeout(mount, t); });
+  window.addEventListener('load', function(){ quiet = 0; tick(); });
+  start();
+  setTimeout(off, HARD + 600);                              // 硬兜底
 })()
 """
 
@@ -311,8 +435,57 @@ def _glob_match(pattern, host):
         return True
 
 
+def _js_str(s):
+    """Python 字符串 → 可安全拼进脚本的 JS 字面量(转义引号/换行/反斜杠)。"""
+    return json.dumps(s, ensure_ascii=False)
+
+
+# ── 功能层总开关(排障用): MSX_BASIC=1 ───────────────────────────────────────
+# 让内置浏览器退化为**最基础的正常网页播放**: 不注入任何脚本(超分/画质增强/自有UI/
+# 广告过滤/圆角兜底…), 浏览器级也不加任何附加参数 —— 等同于用纯 WebView2 打开 B站,
+# 与普通浏览器行为一致。用于"先回退到最基础, 再逐层加回功能、定位是哪一层影响
+# 视频播放/截屏"。默认不开(生产走完整功能)。
+def _basic_mode():
+    return os.environ.get("MSX_BASIC") == "1"
+
+
+# 页内兜底: 让播放器 <video> 失去"独立 DComp 平面"资格。
+# 根因: Chromium 把可见视频层当 DirectComposition 独立平面(overlay)呈现时, GDI 系截屏
+# (微信/QQ/PrntScr 的 BitBlt 屏幕 DC)读不到该平面 → 播放器区域整块黑、其余 UI 正常。
+# ⚠️ 曾经的 border-radius:0.5px 方案在 Chromium 154 上**已失效**: 该内核支持"带圆角的
+# overlay"(msedge.dll 内的 `delegated.overlay.candidate_rounded_corners` /
+# `is_fast_rounded_corner` 即证), 圆角裁剪不再否决 overlay 资格 → 视频照样被提升,
+# 截屏照样黑(用户实测截图即证据)。
+# 现在改用**非不透明 + 恒等滤镜**: overlay 要求 quad 不透明, opacity<1 必然把它拉回
+# 主合成面; 再叠一道恒等 filter 兜底(带滤镜的内容必经渲染面, 不能直接扫描输出)。
+# 两者视觉无感, 也**不关 DComp**(避开 --disable-direct-composition 那种整页退传统
+# 合成的"特别特别卡")。默认启用; MSX_BASIC=1 时不注入。
+_OVERLAY_CSS_DEFAULT = "video{opacity:0.999!important;filter:brightness(1)!important}"
+_OVERLAY_CSS_VARIANTS = {   # 实验用(MSX_NO_OVERLAY_CSS_MODE=…), 默认走上面的组合
+    "radius": "video{border-radius:0.5px!important}",
+    "alpha":  "video{opacity:0.999!important}",
+    "filter": "video{filter:brightness(1)!important}",
+    "none":   "",
+}
+
+
+def _overlay_css():
+    mode = (os.environ.get("MSX_NO_OVERLAY_CSS_MODE") or "").strip()
+    return _OVERLAY_CSS_VARIANTS.get(mode, _OVERLAY_CSS_DEFAULT)
+
+
+# 画质增强(bilibili-enhance)是在 <video> 上挂 CSS 滤镜(锐化+色彩) —— 与上面那段"兜底
+# CSS"同一类风险: 施加在 <video> 上的 filter 会让视频层被提升为独立合成平面, GDI 截屏黑。
+# 取证: 正常的 2.9 对 <video> 无任何 CSS。⇒ 默认**暂停**(MSX_BQ=1 可恢复, 用于 A/B)。
+def _bq_enabled():
+    return os.environ.get("MSX_BQ", "0") == "1"
+
+
 def _build_inject_script(port):
     """组装文档创建脚本: Vue + GM垫片 + 内置净化大师 + 用户脚本。"""
+    if _basic_mode():
+        _dbg_log("build_inject: MSX_BASIC=1 -> 纯网页播放, 不注入任何脚本")
+        return ""
     vue = _read_ext_file("vue.global.prod.js")
     shim = _read_ext_file("gm-shim.js")
     # 净化大师默认禁用(其脚本环境曾干扰B站页面图片/评论加载, 用户反馈后移除);
@@ -322,11 +495,35 @@ def _build_inject_script(port):
         _dbg_log("build_inject: NO SHIM -> inject disabled")
         return ""
     parts = [
-        _DEBUG_HOOK_JS,
         "window.__MSX_PORT__ = %d;" % port,
         'try { fetch("http://127.0.0.1:" + window.__MSX_PORT__ +'
         ' "/api/shell_debug?s=userscript-env-injected", {mode: "no-cors"}); } catch (e) {}',
     ]
+    # ── 视频样式干预: **v0.3.1.11dsk 起默认全部撤销** ──────────────────────────
+    # 取证(解包 dist\洞鉴虚明v0.2.9.21dsk.exe 里内嵌的 shell_pages):
+    #   "能正常工作"的 2.9 对 <video> **没有任何 CSS** —— 没有圆角、没有 opacity、
+    #   没有 filter, 且 app_window 里**没有任何浏览器参数**。它注入的只有主题脚本、
+    #   广告过滤、赞助跳过。
+    # 而我们后来往 <video> 上挂的每一样东西(0.5px 圆角 → opacity:0.999 + filter;
+    # 以及画质增强挂在 <video> 上的 CSS 滤镜), 都让视频层**被提升为独立合成平面**,
+    # GDI 系截屏(QQ/微信/PrntScr 的 BitBlt)读不到 → 播放器区域黑、UI 正常。
+    # 用户实证: 不注入任何脚本(MSX_BASIC=1)时完全正常; 一旦注入就黑。
+    # ⇒ 结论: 对 <video> 的任何样式改动本身就是风险源, 默认回到与 2.9 一致的
+    #    "完全不碰视频样式"。
+    # 排查开关: MSX_OVERLAY_CSS=1 可重新打开本段(配合 MSX_NO_OVERLAY_CSS_MODE 选变体),
+    #           用于逐层 A/B 定位。
+    if os.environ.get("MSX_OVERLAY_CSS") == "1" and not os.environ.get("MSX_NO_OVERLAY_CSS"):
+        _css = _overlay_css()
+        if _css:
+            parts.append(
+                'if ((function(){var h=location.hostname; return h==="bilibili.com"||'
+                'h.endsWith(".bilibili.com")})()) { try {\n'
+                '  var __msxNs = document.createElement("style");\n'
+                '  __msxNs.id = "msx-nooverlay-style";\n'
+                '  __msxNs.textContent = ' + _js_str(_css) + ';\n'
+                '  (document.head || document.documentElement).appendChild(__msxNs);\n'
+                '} catch (e) {} }'
+            )
     # Vue/GM垫片只为净化大师服务 —— 它们会污染页面全局(曾致 B 站页面 Vue.use
     # 崩溃 → 评论/懒加载图片全挂), 净化大师禁用时绝不注入
     if builtin:
@@ -338,11 +535,17 @@ def _build_inject_script(port):
         parts.append(
             'if ((function(){var h=location.hostname; return h==="bilibili.com"||'
             'h.endsWith(".bilibili.com")})()) {\n' + builtin + '\n}')
+    # 页面诊断钩子: 默认**关闭**。它会在每次请求失败/资源加载失败时调一次
+    # window.open("msx-debug:...") —— 每个事件一次 NewWindowRequested IPC + 一次落盘。
+    # 实测一个普通播放页就有 ~190 次(96 FETCHFAIL + 97 RESFAIL), 明显拖慢加载、卡 UI。
+    # 排查注入链路时临时置 MSX_DEBUG=1 打开。
+    if os.environ.get("MSX_DEBUG") == "1":
+        parts.append(_DEBUG_HOOK_JS)
     bsb = "" if os.environ.get("MSX_NO_INJECT") else _read_ext_file("bilibili-sponsorblock.js")
     if bsb:
         parts.append('try {\n' + bsb + '\n} catch (e) { console.warn("[msx] sponsorblock", e); }')
     bq = _read_ext_file("bilibili-enhance.user.js")
-    if bq:
+    if bq and _bq_enabled():
         # 画质增强(锐化+色彩滤镜): 无 Vue/GM 依赖, 纯 CSS/SVG, 开关与档位走服务端设置
         bq_on = "0" if app.sget("ui_bq") == "0" else "1"
         bq_level = (app.sget("ui_bq_level") or "中").strip()[:6]
@@ -350,6 +553,62 @@ def _build_inject_script(port):
             bq_level = "中"   # 白名单化: 该值会被拼进页面脚本
         parts.append('window.__MSX_BQ__ = %s; window.__MSX_BQ_LEVEL__ = "%s";\ntry {\n'
                      % (bq_on, bq_level) + bq + '\n} catch (e) { console.warn("[msx] quality", e); }')
+    # 评论筛选(其他设置 · 评论筛选): **与「自有UI」解耦** —— 不管 ui_ownui 开关如何、
+    # 也不管页面用的是自建评论区还是 B站原生评论区, 都必须生效。
+    # 做法: extensions/bilibili-cfilter.user.js 在 document-start 劫持
+    # api.bilibili.com/x/v2/reply* 的 fetch/XHR **响应体**, 本地把该隐藏的评论摘掉。
+    # (旧实现只在"自建评论区"内过滤; 而 B站 现在的评论区根元素是 #commentapp,
+    #  自建面板的挂载选择器 #comment/.comment-container/.comment 全部落空 → 过滤从未执行。)
+    # 黑名单 = 左侧「黑白名单 → 作者」+ (已开启同步时)B站拉黑名单(ablock)。
+    # 另有两个账号级开关(都在「评论筛选 → B站」里, 默认关):
+    #   · mystery —— 无个性简介(空简介)账号的评论: 用响应自带的 member.sign 就地判定,
+    #                零请求零延迟(顶层与楼中楼实测都带 sign);
+    #   · lottery —— 动态抽奖账号的评论: 评论本身看不出, 由页面脚本问壳的
+    #                /api/bili/flags(只读 author_meta 缓存), 未命中的作者进后台限速
+    #                补图队列 —— 网络等待永远不在评论加载的关键路径上。
+    #   · empty   —— 空首页账号(个人空间一条动态都没有)的评论: 同 lottery, 走同一份缓存。
+    # 读失败注入 null → 脚本自检后不装钩子(回退现状)。
+    cf_js = "null"
+    try:
+        _cf_blk = {r[0] for r in app.db().execute(
+            "SELECT value FROM blacklist WHERE kind='author'")}
+        if app.sget("m_blocklist_sync") == "1":
+            _cf_blk |= {r[0] for r in app.db().execute("SELECT name FROM ablock")}
+        try:
+            _cf_lvl = int(app.sget("cf_min_level") or 2)
+        except Exception:
+            _cf_lvl = 2
+        # 弹幕侧黑名单: 已知 mid(B站拉黑名单接口自带 mid / 评论区见过的 name→mid 索引)
+        # 正算 crc32 得到 midHash 集合, 页面端 O(1) 查表就地摘弹幕。
+        # v0.3.1.32: 弹幕总开关关掉时连这张表都不算(省一次全名单 crc32), 页面端也拿不到。
+        _dm_on = app.sget("m_dm_on") != "0"
+        try:
+            _cf_dmhash = app.dm_blocked_hashes() if _dm_on else []
+        except Exception:
+            _cf_dmhash = []
+        cf_js = json.dumps({
+            "dm_on": _dm_on,
+            "blk_on": app.sget("cf_blk_on") != "0",
+            "blk": sorted(x for x in _cf_blk if x),
+            "dmhash": _cf_dmhash,
+            "lvl": min(5, max(0, _cf_lvl)),
+            "mystery": app.sget("m_block_mystery_bio") == "1",
+            "lottery": app.sget("m_block_lottery") == "1",
+            "empty": app.sget("m_block_empty_space") == "1",
+        }, ensure_ascii=True)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+    parts.append('window.__MSX_CF__ = %s;\n' % cf_js)
+    cfilter = "" if os.environ.get("MSX_NO_INJECT") else _read_ext_file("bilibili-cfilter.user.js")
+    if cfilter:
+        parts.append('try {\n' + cfilter + '\n} catch (e) { console.warn("[msx] cfilter", e); }')
+    # 弹幕筛选(v0.3.1.22): 劫持 x/v2/dm/web/seg.so 的 protobuf 响应体, 按「弹幕评论筛选」
+    # 同一套开关就地摘弹幕; 同时把解析出的弹幕发布到 window.__msxDanmaku 供右栏
+    # 「弹幕列表」面板渲染(含点击跳发送者主页)。与评论筛选解耦: ownui 关闭时照样过滤。
+    dmfilter = "" if os.environ.get("MSX_NO_INJECT") else _read_ext_file("bilibili-dmfilter.user.js")
+    if dmfilter:
+        parts.append('try {\n' + dmfilter + '\n} catch (e) { console.warn("[msx] dmfilter", e); }')
     # 播放页自有UI(评论区/右侧推荐替换为自建面板): 开关 ui_ownui(默认开), 环境变量
     # MSX_NO_OWNUI=1 可整体停用。脚本自身按 hostname+路径门控, 只在 /video/ 激活;
     # 播放器 DOM 一律不碰 —— 超分管线红线。
@@ -389,33 +648,14 @@ def _build_inject_script(port):
         parts.append('try {\n' + probe + '\n} catch (e) { }')
     # 内置「最高画质」脚本已下线: 用户明确说"让播放器用上账号本就有权的最高档没有意义"
     # (extensions/bilibili-quality.user.js 保留备查, 不再注入)
-    # ACNet(Anime4KCPP f8b4) WebGL2 多趟超分: 上游 GLSL 原文当字符串注入, 运行器在
-    # extensions/acnet-webgl.js。**默认开**(由超分门控决定何时真正启用: need>1.2 且输出≤4.2Mpx);
-    # 需要关掉时设环境变量 MSX_ACNET=0。
-    if os.environ.get("MSX_ACNET") != "0":
-        _acnet_js = _read_ext_file("acnet-webgl.js")
-        _acnet_glsl = _read_ext_file(os.path.join("_acnet", "acnet_f8b4.glsl"))
-        if _acnet_js and _acnet_glsl:
-            parts.append('window.__MSX_ACNET__ = 1;\nwindow.__MSX_ACNET_GLSL__ = %s;\n'
-                         % json.dumps(_acnet_glsl))
-            if os.environ.get("MSX_ACNET_DEBUG"):
-                parts.append('window.__MSX_ACNET_DEBUG__ = %s;\n'
-                             % json.dumps(os.environ["MSX_ACNET_DEBUG"]))
-            if os.environ.get("MSX_ACNET_MAXPASS"):
-                parts.append('window.__MSX_ACNET_MAXPASS__ = %s;\n'
-                             % json.dumps(os.environ["MSX_ACNET_MAXPASS"]))
-            if os.environ.get("MSX_ACNET_WANTW"):
-                parts.append('window.__MSX_ACNET_WANTW__ = %s;\n'
-                             % json.dumps(os.environ["MSX_ACNET_WANTW"]))
-            if os.environ.get("MSX_ACNET_IWMAX"):
-                parts.append('window.__MSX_ACNET_IWMAX__ = %s;\n'
-                             % json.dumps(os.environ["MSX_ACNET_IWMAX"]))
-            parts.append('try {\n' + _acnet_js + '\n} catch (e) { console.warn("[msx] acnet", e); }')
-            _dbg_log("acnet: injected glsl %d chars + runner %d chars"
-                     % (len(_acnet_glsl), len(_acnet_js)))
-    # AI补帧(Framegen)暂时下线(易出bug: document-start注入曾致渲染进程崩溃, 已改
-    # DOMContentLoaded, 但保守起见整体停用)。注入代码保留, 需要>0重新启用:
-    # 设环境变量 MSX_FG=1 并把设置键 ui_fg 置 1。
+    # ── 超分(ACNet + Anime4K 回退)注入: 宿主门控 + 按需注入 ────────────────────
+    # 2026-10-08 用户反馈"B站加载变慢" + "打开别人个人界面有概率卡很久", 取证结论:
+    #   · 超分只服务 <video>, 而播放器只在 www.bilibili.com 的播放页; 旧门控
+    #     h.endsWith(".bilibili.com") 把 space.bilibili.com(个人空间)也算了进来,
+    #     让无播放器的页面白挂一套 MutationObserver + 900ms 轮询。
+    #   · anime4k WebGPU 库(3.4MB) 只有 ACNet 关闭时的 CNN 回退路才用到; ACNet 默认开,
+    #     它在每个 B站 文档上都是纯死重(str.transfer + 解析) —— 只在 MSX_ACNET=0 时注入。
+    #   · 整包脚本还会被下发到每个子框架(见函数收尾的顶层守卫), 这里再把宿主收紧。
     fg_on = (os.environ.get("MSX_FG") == "1" and app.sget("ui_fg") == "1"
              and not os.environ.get("MSX_NO_FG"))
     sr_on = app.sget("ui_sr") == "1"
@@ -424,11 +664,45 @@ def _build_inject_script(port):
         # (设置页已做互斥, 这里防旧存档/环境变量组合出双开)
         sr_on = False
         _dbg_log("ui_fg + ui_sr both on -> sr suppressed")
+    _SR_HOST_JS = ('(function(){var h=location.hostname;'
+                   'return h==="bilibili.com"||h==="www.bilibili.com";})()')
+    # ACNet(Anime4KCPP f8b4) WebGL2 多趟超分: 上游 GLSL 原文当字符串注入, 运行器在
+    # extensions/acnet-webgl.js。默认开(由超分门控决定何时真正启用: need>1.2 且输出≤4.2Mpx);
+    # 需要关掉时设环境变量 MSX_ACNET=0。只在播放器宿主 + 超分开启时注入。
+    if sr_on and os.environ.get("MSX_ACNET") != "0":
+        _acnet_js = _read_ext_file("acnet-webgl.js")
+        _acnet_glsl = _read_ext_file(os.path.join("_acnet", "acnet_f8b4.glsl"))
+        if _acnet_js and _acnet_glsl:
+            _acnet_body = ('window.__MSX_ACNET__ = 1;\nwindow.__MSX_ACNET_GLSL__ = %s;\n'
+                           % json.dumps(_acnet_glsl))
+            if os.environ.get("MSX_ACNET_DEBUG"):
+                _acnet_body += ('window.__MSX_ACNET_DEBUG__ = %s;\n'
+                                % json.dumps(os.environ["MSX_ACNET_DEBUG"]))
+            if os.environ.get("MSX_ACNET_MAXPASS"):
+                _acnet_body += ('window.__MSX_ACNET_MAXPASS__ = %s;\n'
+                                % json.dumps(os.environ["MSX_ACNET_MAXPASS"]))
+            if os.environ.get("MSX_ACNET_WANTW"):
+                _acnet_body += ('window.__MSX_ACNET_WANTW__ = %s;\n'
+                                % json.dumps(os.environ["MSX_ACNET_WANTW"]))
+            if os.environ.get("MSX_ACNET_IWMAX"):
+                _acnet_body += ('window.__MSX_ACNET_IWMAX__ = %s;\n'
+                                % json.dumps(os.environ["MSX_ACNET_IWMAX"]))
+            _acnet_body += ('try {\n' + _acnet_js
+                            + '\n} catch (e) { console.warn("[msx] acnet", e); }')
+            parts.append('if (' + _SR_HOST_JS + ') {\n' + _acnet_body + '\n}')
+            _dbg_log("acnet: injected glsl %d chars + runner %d chars (player host only)"
+                     % (len(_acnet_glsl), len(_acnet_js)))
+    # AI补帧(Framegen)暂时下线(易出bug: document-start注入曾致渲染进程崩溃, 已改
+    # DOMContentLoaded, 但保守起见整体停用)。注入代码保留, 需要>0重新启用:
+    # 设环境变量 MSX_FG=1 并把设置键 ui_fg 置 1。
     if sr_on:
-        # AI超分(Anime4K WebGPU 实时超分): 库 3.4MB, 只在 B站页注入; 开关 ui_sr, 默认关
-        sr_lib = _read_ext_file("anime4k-webgpu.js")
+        # 超分胶水(bilibili-sr.user.js): 只在播放器宿主注入(见上方 _SR_HOST_JS 说明)。
+        # anime4k WebGPU 库(3.4MB) 只有 ACNet 关闭时的 CNN 回退路才用得到 —— 默认 ACNet 开,
+        # 它纯属死重(每文档/每框架都要传 3.4MB 并解析) ⇒ 只在 MSX_ACNET=0 时才注入。
+        sr_lib = ("" if os.environ.get("MSX_ACNET") != "0"
+                  else _read_ext_file("anime4k-webgpu.js"))
         sr_glue = _read_ext_file("bilibili-sr.user.js")
-        if sr_lib and sr_glue:
+        if sr_glue:
             # 档位: 轻/标准/高/旗舰(默认高=CNNx2UL, 与旧版一致) —— 白名单化后拼进页面脚本
             sr_level = (app.sget("ui_sr_level") or "高").strip()[:4]
             if sr_level not in ("轻", "标准", "高", "旗舰"):
@@ -488,8 +762,7 @@ def _build_inject_script(port):
                             '  if (++__srN >= 12) clearInterval(__srT);\n'
                             '}, 5000);\n')
             parts.append(
-                'if ((function(){var h=location.hostname; return h==="bilibili.com"||'
-                'h.endsWith(".bilibili.com")})()) {\nwindow.__MSX_SR__ = 1;\n'
+                'if (' + _SR_HOST_JS + ') {\nwindow.__MSX_SR__ = 1;\n'
                 'window.__MSX_SR_LEVEL__ = "%s";\n' % sr_level
                 + 'window.__MSX_SR_SCALE__ = %s;\n' % sr_scale
                 + ('window.__MSX_SR_FORCE_DISP__ = %s;\n' % os.environ["MSX_SR_FORCE_DISP"]
@@ -591,10 +864,21 @@ def _build_inject_script(port):
     for us in _user_scripts():
         parts.append('try { (function(){\n' + us + '\n})(); }'
                      ' catch (e) { console.warn("[msx] userscript", e); }')
-    return "\n;\n".join(parts)
+    body = "\n;\n".join(parts)
+    if not body:
+        return body
+    # ── 顶层守卫(Req D 核心) ─────────────────────────────────────────────────
+    # WebView2 的 document-created 脚本会下发到**每一个 top-level 与子框架文档**
+    # (官方原话: applies to all future top level document and child frame navigations)。
+    # 个人空间/首页上的广告与嵌入 iframe 会各自把整包注入(含超分资源)再解析一遍 ——
+    # 3.4MB × N 个 iframe 就是"打开别人个人界面有概率卡很久"的根源。
+    # 所有注入功能(幕布/主题/评论筛选/自有UI/超分)都只面向顶层页面, 故子框架直接跳过。
+    # 用块语句(不是函数)包住: var 仍是全局作用域, 不影响 vue.global 的全局 `var Vue`。
+    return ('if (window.top === window.self) {\n' + body + '\n}')
 
 
-def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=None):
+def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=None,
+                on_fs=None):
     """创建控件池。须在窗口壳启动后调用(任意线程, 内部自行 marshal)。
 
     on_title(tab_key, title) / on_newtab(tab_key, url): 站点控件的
@@ -602,12 +886,28 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
     on_nav(tab_key, url, can_back, can_fwd): 导航状态变化回调 —— 历史可用态/URL
     变化(含首页标签)都经这里推给 ShellApi → 导航工具栏; 非激活标签的推送由
     ShellApi 侧忽略。控件未就绪/标签已关时不上报。
+    on_fs(tab_key, on): 网页(视频)进入/退出全屏(bug6) —— 窗口壳据此隐藏标签栏与
+    导航栏; 控件本身的几何(铺满客户区/还原)由池自己改, 调用方不用管。
     返回管理器: init/create/show/hide/dispose/get_nav/push_nav/reload/goto/
     navigate_history —— 均以 tab_key 为键(key 0 = 信息流主控件); 控件对象由池内部持有。
     """
     import System.Windows.Forms as WinForms  # noqa: F401  提前加载 CLR(pythonnet)
     box = {"form": None, "theme": None, "stopping": False, "port": port,
-           "on_nav": on_nav}
+           "on_nav": on_nav, "on_fs": on_fs}
+
+    def _tab_geo(form, home, key):
+        """标签控件的常规几何(锚在信息流主控件 home 上)。创建与全屏退出都走这里。
+
+        用户报修(m03496): 之前给外部页签加了按窗口宽度比例的左留白(约 5.5%), 结果那条
+        留白既太宽又像一条独立边框 —— B站播放页顶部的横栏是页面内的元素, 控件整体右移后
+        顶栏左侧就空出一块底色。现按用户要求**取消窗口级左留白**(控件与窗口等宽, 顶栏从左缘
+        开始, 视觉连续); 「播放页左侧宽一点」改为在页面内部留(见 extensions\\bilibili-ownui.user.js)。"""
+        from System.Drawing import Point, Size
+        if home is None:
+            return (Point(0, 0),
+                    Size(max(1, form.ClientSize.Width), max(1, form.ClientSize.Height)))
+        return (Point(home.Location.X, home.Location.Y),
+                Size(max(1, home.Size.Width), max(1, home.Size.Height)))
 
     def _ui(fn):
         """marshal 到 UI 线程(窗体未绑定时直接执行, 供测试注入)。"""
@@ -631,10 +931,43 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
             import traceback
             traceback.print_exc()
 
+    def _retext_later(cc, key=None, delays=(0.35, 0.9, 1.6)):
+        """WebView2(DirectComposition) 在"宿主编排变化"的瞬间偶发打断合成层 —— 画面整块停住
+        (全黑 #0f1115, 连渲染器出图都卡住), 且不会自己恢复。本仓既有实证(app_window.tab_close
+        注释)与本次探针实测都表明: 在同一控件上补一次「隐藏→显示→置顶」立刻有画面。
+        这里延迟补几次(需要 UI 线程 → 走 _ui); 控件已被销毁/换掉就放弃。"""
+        try:
+            import threading as _th
+
+            def _tap(_cc=cc, _key=key):
+                def _do():
+                    try:
+                        if _key is not None and _Pool.ctrls.get(_key) is not _cc:
+                            return
+                        if _cc.IsDisposed:
+                            return
+                        _cc.Visible = False
+                        _cc.Visible = True
+                        _cc.BringToFront()
+                    except Exception:
+                        pass
+                _ui(_do)
+            for _d in delays:
+                _th.Timer(_d, _tap).start()
+        except Exception:
+            pass
+
     class _Pool:
         ctrls = {0: None}   # tab_key -> WebView2 控件(0 = 信息流主控件)
         _bili_reloaded = {}  # id(ctrl) -> 上次重载时的主题(B站深色cookie生效防循环)
         _dead = set()        # 已关闭标签的key: 迟到的create直接丢弃(防僵尸控件)
+        # bug6: 网页(视频)全屏状态 —— on 时当前控件铺满整个客户区(标签栏/导航栏让位)
+        fs = {"on": False, "key": None}
+        _fs_rec = None   # bug10: 进入网页全屏时的现场(宿主窗体/控件几何/被藏起来的兄弟控件)
+        float_of = {}    # bug6: 控件被迁进悬浮窗时记下宿主窗体 → 全屏回调只对主窗口壳隐藏chrome
+                         # (名字必须是 float_of: dispose/send_to_window/dock_to_main/on_fs_changed
+                         #  四处都按 float_of 读写。曾误写成 _float_of, 导致四处全部 AttributeError,
+                         #  且 dispose 里被 except 吞掉 → 控件不销毁、页面继续出声 —— 用户报修 m02020)
 
         def _is_dark(self):
             try:
@@ -666,13 +999,18 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                         else:
                             cm.DeleteCookies("theme_style", "https://www.bilibili.com")
                         src = str(c.Source or "")
-                        # 当前页在B站且该标签还没为此主题重载过 → 重载一次让原生深色生效
-                        # (防循环: 同一标签同一主题只重载一次)
-                        if ("bilibili.com" in src
-                                and self._bili_reloaded.get(id(c)) != dark):
+                        if "bilibili.com" in src:
+                            # 当前页在B站且该标签还没为此主题重载过 → 重载一次让原生
+                            # 深色生效(防循环: 同一标签同一主题只重载一次)
+                            if self._bili_reloaded.get(id(c)) != dark:
+                                self._bili_reloaded[id(c)] = dark
+                                _dbg_log("bili cookie set dark=%s -> reload" % dark)
+                                core.Reload()
+                        else:
+                            # 尚未导航(新建标签在导航前就按主题设好了 cookie): 记下状态。
+                            # 否则首个文档 NavigationCompleted 时会白做一次整页重载 ——
+                            # 那正是"点开B站闪一下"的来源之一(用户反馈)。
                             self._bili_reloaded[id(c)] = dark
-                            _dbg_log("bili cookie set dark=%s -> reload" % dark)
-                            core.Reload()
                     except Exception:
                         pass   # 关窗时序中控件可能刚好销毁, 静默即可
                     # ---- 其他站点: 智能反色兜底(自愈定时器在脚本内) ----
@@ -683,6 +1021,20 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                     traceback.print_exc()
             _ui(go)
 
+        def _apply_page_bg(self, dark):
+            """窗体底衬色 = 外部页签左侧留白露出来的那块。取 B站播放页背景色, 留白与页面
+            自身底色连成一片(用户本轮要求)。夜间 rgb(23,24,26), 白天白 —— 随主题切换。"""
+            def go():
+                try:
+                    from System.Drawing import Color as _C
+                    form = box.get("form")
+                    if form is None:
+                        return
+                    form.BackColor = _C.White if not dark else _C.FromArgb(23, 24, 26)
+                except Exception:
+                    pass
+            _ui(go)
+
         def _theme_watch(self):
             """轮询主题(主页切黑夜/白天会实时写库) → 对所有站点页面重新应用。"""
             import time as _t
@@ -691,6 +1043,7 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                     dark = self._is_dark()
                     if dark != box["theme"]:
                         box["theme"] = dark
+                        self._apply_page_bg(dark)
                         for k, c in list(_Pool.ctrls.items()):
                             if k != 0 and c is not None:
                                 self._apply_theme(c, dark)
@@ -703,7 +1056,9 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
             控件 core 未就绪时等 CoreWebView2InitializationCompleted 再挂 ——
             主控件(0号)常在 gui_ready 时早已就绪, 走立即挂分支。"""
             if not box.get("on_nav"):
-                return
+                nav_on = None
+            else:
+                nav_on = box["on_nav"]
 
             def emit(_s=None, _a=None):
                 try:
@@ -717,11 +1072,39 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                 except Exception:
                     pass
 
+            def on_fs_changed(_s=None, _a=None):
+                """bug6: 网页(视频)全屏状态变化 —— 池改控件几何, 窗口壳显隐标签栏/导航栏。"""
+                try:
+                    core = c.CoreWebView2
+                    on = bool(core.ContainsFullScreenElement) if core is not None else False
+                except Exception:
+                    on = False
+                _dbg_log("fullscreen=%s tab=%s" % (on, tab_key))
+                try:
+                    self.set_fullscreen(tab_key, on)
+                except Exception:
+                    pass
+                cb = box.get("on_fs")
+                if cb is not None:
+                    # bug6: 只有主窗口里的页面全屏才动窗口壳的标签栏/导航栏 ——
+                    # 悬浮窗里的全屏由 set_fullscreen 自己藏迷你标题栏与贴边热区,
+                    # 不该顺手把主窗口的chrome也摘掉。
+                    if _Pool.float_of.get(tab_key) is None:
+                        try:
+                            cb(tab_key, on)
+                        except Exception:
+                            _dbg_log("on_fs callback FAILED tab=%s" % tab_key)
+
             def on_core_ready(_s, _a):
                 try:
                     core = c.CoreWebView2
-                    core.HistoryChanged += emit
-                    core.SourceChanged += emit
+                    if nav_on:
+                        core.HistoryChanged += emit
+                        core.SourceChanged += emit
+                    try:   # bug6: 全屏事件与导航上报同一处挂(不依赖 on_nav 是否存在)
+                        core.ContainsFullScreenElementChanged += on_fs_changed
+                    except Exception as e:
+                        _dbg_log("wire_fs(%s) subscribe FAILED: %r" % (tab_key, e))
                 except Exception:
                     _dbg_log("wire_nav(%s) subscribe FAILED: %r" % (tab_key, _s))
 
@@ -754,7 +1137,10 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                 try:
                     import ctypes
                     from System.Drawing import Color as _C
-                    form.BackColor = _C.FromArgb(15, 17, 21)   # 控件缝隙不露窗体白底
+                    form.BackColor = (_C.FromArgb(23, 24, 26) if self._is_dark() else _C.White)
+                    # ↑ 窗体底衬 = 外部页签左侧留白露出来的那块: 取 B站播放页背景色
+                    # (夜间 rgb(23,24,26) / 白天白), 与页面底色连成一片(用户本轮要求);
+                    # 原来固定 (15,17,21) 会与 B站页面底色之间出现一条分界线。
                     u32 = ctypes.windll.user32
                     hwnd = form.Handle.ToInt32()
                     # 缩放走自建贴边热区(edge 面板), 不再用 THICKFRAME ——
@@ -765,11 +1151,28 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                             hwnd, 2, ctypes.byref(val), ctypes.sizeof(val))
                     except Exception:
                         pass
+                    try:   # Win11 无边框窗仍会被画一圈系统色边框 → 直接请求"不画边框"
+                        none_c = ctypes.c_int(-2)   # DWMWA_COLOR_NONE = 0xFFFFFFFE
+                        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                            hwnd, 34, ctypes.byref(none_c), ctypes.sizeof(none_c))   # DWMWA_BORDER_COLOR
+                    except Exception:
+                        pass
                     try:   # Win10 给所有窗口画 1px 系统色边框(浅色主题下发白) → 强制深色边框
                         on = ctypes.c_int(1)   # TRUE
                         for attr in (20, 19):   # DWMWA_USE_IMMERSIVE_DARK_MODE(新旧两个属性号)
                             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                                 hwnd, attr, ctypes.byref(on), ctypes.sizeof(on))
+                    except Exception:
+                        pass
+                    # pywebview 的无边框窗口(CreateParams 走 FormBorderStyle.None)丢了
+                    # WS_MINIMIZEBOX/WS_SYSMENU, 于是"单击 / 双击任务栏图标最小化、再点还原"
+                    # 整个失效(pywebview #1357)。补回这两个样式位: 窗口仍无边框(没有
+                    # WS_CAPTION, 不画标题栏), 只是把任务栏按钮的标准行为还回来。
+                    try:
+                        GWL_STYLE = -16
+                        WS_MINIMIZEBOX, WS_SYSMENU = 0x00020000, 0x00080000
+                        _st = u32.GetWindowLongW(hwnd, GWL_STYLE)
+                        u32.SetWindowLongW(hwnd, GWL_STYLE, _st | WS_MINIMIZEBOX | WS_SYSMENU)
                     except Exception:
                         pass
                     _Pool.ctrls[0] = form.webview
@@ -808,18 +1211,32 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                         pass
                     # 外部页签画面整体右移20px(逻辑): 左侧留空隙, 右缘与滚动条位置不变;
                     # Anchor 四边让窗口缩放时这个 inset 原样保持。home(信息流)不动。
-                    dx = int(20 * float(getattr(form, "_scale", 1.0) or 1.0)) \
-                        if tab_key != 0 else 0
-                    c.Location = Point(home.Location.X + dx, home.Location.Y)
-                    c.Size = Size(home.Size.Width - dx, home.Size.Height)
+                    # 几何算法集中在 _tab_geo —— 全屏退出时也用同一套还原。
+                    c.Location, c.Size = _tab_geo(form, home, tab_key)
                     c.Anchor = (WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Bottom |
                                 WinForms.AnchorStyles.Left | WinForms.AnchorStyles.Right)
                     c.Visible = False
 
                     def on_ready(_s, _a):
+                        try:   # 初始化失败时 CoreWebView2 为 None: 记下真实原因再退出, 否则
+                            # 后面每句都抛 NoneType 异常, 标签永远是一块黑控件(排障无据可查)
+                            _dbg_log("on_ready key=%s success=%s err=%r" % (
+                                tab_key, getattr(_a, "IsSuccess", None),
+                                getattr(_a, "InitializationException", None)))
+                        except Exception:
+                            pass
                         core = c.CoreWebView2
+                        if core is None:
+                            _dbg_log("on_ready key=%s: CoreWebView2 为 None, 放弃本次初始化" % tab_key)
+                            return
                         core.DocumentTitleChanged += lambda _s2, _a2: on_title(
                             tab_key, core.DocumentTitle)
+                        try:   # 防闪幕布(document-start 先于首帧): **先注册** ——
+                            # 注入脚本要能调到 window.__msx_veil_hold/release
+                            core.AddScriptToExecuteOnDocumentCreatedAsync(_NOFLASH_JS)
+                            _dbg_log("on_ready: AddScript(noflash) called")
+                        except Exception as e:
+                            _dbg_log("noflash register FAILED: %r" % e)
                         try:   # 内置油猴环境: 净化大师 + 用户自定义脚本(每次文档创建自动执行)
                             _dbg_log("on_ready: registering document-created script")
                             inj = _build_inject_script(box.get("port") or 8000)
@@ -844,12 +1261,30 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                             self._apply_theme(c, self._is_dark())
                         core.NavigationCompleted += on_nav_done
                         self._apply_theme(c, self._is_dark())
+                        try:   # 脚本就绪后再导航: 保证首个文档也吃到 document-created 脚本
+                            c.Source = Uri(url)
+                        except Exception as e:
+                            _dbg_log("navigate FAILED: %r" % e)
                     c.CoreWebView2InitializationCompleted += on_ready
                     self._wire_nav(c, tab_key)   # 导航状态上报(地址栏/按钮启停)
                     form.Controls.Add(c)
                     _Pool.ctrls[tab_key] = c
-                    c.EnsureCoreWebView2Async(None)
-                    c.Source = Uri(url)
+                    try:   # 排障(实测有用): EnsureCoreWebView2Async 失败时标签永远不导航,
+                        # 屏幕上就是一块黑控件 —— 日志里必须留下真实原因(如 0x80040154 没有注册类)
+                        _t = c.EnsureCoreWebView2Async(None)
+                        import threading as _thr
+
+                        def _watch(_tt=_t, _k=tab_key):
+                            try:
+                                _tt.Wait()
+                            except Exception as _e:
+                                _dbg_log("ensure key=%s FAILED: %r" % (_k, _e))
+                                for _ie in list(getattr(_e, "InnerExceptions", []) or []):
+                                    _dbg_log("  inner: %r" % (_ie,))
+                        _thr.Thread(target=_watch, daemon=True).start()
+                    except Exception as _e:
+                        _dbg_log("ensure key=%s raise: %r" % (tab_key, _e))
+                    # 首次导航延后到 on_ready 内(脚本注册完成后)再发起, 见上面
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -867,13 +1302,125 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                     pass
             return c
 
+        def _fs_restore(self, ctrl=True):
+            """还原进入网页全屏时的现场: 控件几何/锚定、被隐藏的悬浮窗 chrome、宿主窗状态。
+            ctrl=False 供「全屏标签被关掉」时用 —— 控件马上要 Dispose, 不再摆位置。"""
+            rec = _Pool._fs_rec
+            _Pool._fs_rec = None
+            if rec is None:
+                return
+            host, wstate, c, loc, size, anchor, dock, hid, is_float = rec
+            # 顺序要紧: 先还原宿主窗体状态。四边锚定的控件会在窗体「最大化 → 普通」时被
+            # 按客户区变化重新缩放(实测 980x554 会被缩成 273x130), 所以几何必须放在最后设。
+            # 悬浮窗(未动过 WindowState)不用重设, 免得把它的最大化状态也一起改掉。
+            if not is_float:
+                try:
+                    host.WindowState = wstate
+                except Exception:
+                    pass
+            for s in hid:
+                try:
+                    s.Visible = True
+                except Exception:
+                    pass
+            if ctrl and c is not None:
+                for setter in (lambda: setattr(c, "Dock", dock),
+                               lambda: setattr(c, "Anchor", anchor),
+                               lambda: setattr(c, "Location", loc),
+                               lambda: setattr(c, "Size", size)):
+                    try:
+                        setter()
+                    except Exception:
+                        pass
+
+        def set_fullscreen(self, key, on):
+            """bug6/bug10: 网页(视频)全屏 → 控件铺满客户区; **主窗口**的宿主窗体一起最大化。
+            只把控件铺满窗口是不够的: 窗口本身比屏幕小时四周(尤其左缘)会直接露出桌面,
+            用户报的「视频播放页窗口全屏时左侧有缝能看到桌面」就是这个。
+            主窗口的标签栏/导航栏由窗口壳的 on_fs 回调隐藏; 悬浮窗的迷你标题栏与贴边热区
+            是控件的兄弟控件, 这里顺手藏掉。退出时按进入前的现场原样还原。
+
+            用户报修(m03496): 在**悬浮窗**里点视频的全屏按钮时, 画布应当只铺满这个悬浮窗,
+            而不是铺满整个屏幕 —— 所以宿主是悬浮窗时**不动 WindowState**, 只把控件铺满它的
+            客户区(悬浮窗无边框, 客户区即整个悬浮窗)。"""
+            _Pool.fs["on"] = bool(on)
+            _Pool.fs["key"] = key if on else None
+
+            def go():
+                import System.Windows.Forms as WF
+                c = _Pool.ctrls.get(key)
+                if c is None:
+                    return
+                if on:
+                    host = c.Parent or box.get("form")
+                    if host is None:
+                        return
+                    try:
+                        if not isinstance(host, WF.Form):
+                            host = host.FindForm() or host
+                    except Exception:
+                        pass
+                    is_float = host is not box.get("form")
+                    if _Pool._fs_rec is None:
+                        hid = []
+                        try:
+                            if is_float:   # 悬浮窗: 迷你标题栏+贴边热区
+                                for s in list(host.Controls):
+                                    try:
+                                        if s is not c and s.Visible:
+                                            hid.append(s)
+                                            s.Visible = False
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                        # 9 项, 与 _fs_restore 的解包一一对应(几何在改 Dock 之前取快照)
+                        _Pool._fs_rec = (host, host.WindowState, c,
+                                         c.Location, c.Size, c.Anchor, c.Dock, hid, is_float)
+                    try:
+                        if is_float:
+                            # 悬浮窗内全屏: 只铺满悬浮窗自身(位置/尺寸都不变), 不最大化到屏幕
+                            c.Dock = getattr(WF.DockStyle, "None")   # None 是 Python 关键字
+                            c.Location = WF.Point(0, 0)
+                            c.Size = host.ClientSize
+                            c.Anchor = (WF.AnchorStyles.Top | WF.AnchorStyles.Left
+                                        | WF.AnchorStyles.Right | WF.AnchorStyles.Bottom)
+                        else:
+                            # 宿主窗体最大化 + 控件铺满(最大化后客户区尺寸变了, Dock=Fill 自动跟随)
+                            host.WindowState = WF.FormWindowState.Maximized
+                            c.Dock = WF.DockStyle.Fill
+                        c.BringToFront()
+                        # ---- 全屏黑屏修复(用户报修 m02002) ----
+                        # 实测(探针 _black_probe.py + 桌面 DC 抓屏): 网页一进入全屏, WebView2 的合成层
+                        # 就被打断 —— 画面整块停在上一次呈现(全黑 #0f1115, 连渲染器出图都卡住: CDP
+                        # Page.captureScreenshot 超时), 且不会自己恢复(0.7~3.1s 五次采样全黑);
+                        # 而在同一控件上补一次"隐藏→显示→置顶"立刻有画面(0.75s 起就正常)。
+                        # 与最大化/Dock/chrome 隐藏/--disable-direct-composition-video-overlays 都无关。
+                        _retext_later(c, key)
+                    except Exception:
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    self._fs_restore()
+                    c.BringToFront()
+            _ui(go)
+
         def show(self, key):
             def go():
                 try:
                     c = self._ctrl(key)
                     if c is not None:
+                        if _Pool.fs["on"]:
+                            # bug6: 全屏期间切标签 → 新控件同样铺满(否则顶部/左缘露出窗体底色)
+                            try:
+                                c.Dock = WinForms.DockStyle.Fill
+                                c.BringToFront()
+                            except Exception:
+                                pass
                         c.Visible = True
                         c.Focus()
+                        _dbg_log("show key=%s fs=%s loc=%s size=%s dock=%s"
+                                 % (key, _Pool.fs["on"], c.Location, c.Size, c.Dock))
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -885,6 +1432,8 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                     c = self._ctrl(key)
                     if c is not None:
                         c.Visible = False
+                        _dbg_log("hide key=%s loc=%s size=%s fs=%s"
+                                 % (key, c.Location, c.Size, _Pool.fs["on"]))
                 except Exception:
                     pass
             _ui(go)
@@ -893,13 +1442,114 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
             def go():
                 try:
                     _Pool._dead.add(key)   # 迟到的create看到即弃
+                    _Pool.float_of.pop(key, None)
+                    if _Pool.fs.get("key") == key:   # bug6: 全屏的那个标签被关 →
+                        _Pool.fs["on"] = False       # 标签栏/导航栏必须回来, 否则整窗没chrome
+                        _Pool.fs["key"] = None
+                        try:
+                            # bug10: 控件马上要 Dispose, 只还原宿主窗状态与被藏起来的兄弟控件
+                            self._fs_restore(False)
+                        except Exception:
+                            pass
+                        cb = box.get("on_fs")
+                        if cb is not None:
+                            try:
+                                cb(key, False)
+                            except Exception:
+                                pass
                     c = _Pool.ctrls.pop(key, None)
                     if c is not None:
                         c.Visible = False
-                        box["form"].Controls.Remove(c)
+                        # 控件可能已被迁到悬浮窗(v0.3.1.34) → 按**实际父容器**移除,
+                        # 否则 Remove 落空, 控件留在已关窗体的 Controls 里泄漏。
+                        par = c.Parent
+                        if par is not None:
+                            par.Controls.Remove(c)
+                        # 用户报修 m02020(关掉悬浮窗后后台还有声音): Dispose 之前先静音 ——
+                        # 双保险, 即使 WebView2 的销毁/回收晚一拍, 也不会再出声。
+                        try:
+                            core = c.CoreWebView2
+                            if core is not None:
+                                core.IsMuted = True
+                        except Exception:
+                            pass
                         c.Dispose()
                 except Exception:
                     pass
+            _ui(go)
+
+        def control(self, key):
+            """取控件对象(仅 UI 线程内使用; 供悬浮窗管理器迁移父容器)。"""
+            return _Pool.ctrls.get(key)
+
+        def send_to_window(self, key, form, top, after=None):
+            """把标签 key 的控件从主窗口迁进独立悬浮窗 form(顶部让出 top 像素给迷你标题栏)。
+            控件实例不变 —— 页面状态原样保留, **不重载**。after: reparent 完成后回调(UI 线程)。"""
+            def go():
+                try:
+                    from System.Drawing import Point, Size
+                    c = _Pool.ctrls.get(key)
+                    if c is None:
+                        return
+                    old = c.Parent
+                    if old is not None:
+                        old.Controls.Remove(c)
+                    form.Controls.Add(c)
+                    _Pool.float_of[key] = form   # bug6: 记下宿主, 全屏回调据此判断要不要摘主窗口chrome
+                    c.Location = Point(0, top)
+                    c.Size = Size(max(1, form.ClientSize.Width),
+                                  max(1, form.ClientSize.Height - top))
+                    c.Anchor = (WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Bottom |
+                                WinForms.AnchorStyles.Left | WinForms.AnchorStyles.Right)
+                    c.Visible = True
+                    c.BringToFront()
+                    try:
+                        c.Focus()
+                    except Exception:
+                        pass
+                    # 用户报修 m02020(悬浮窗播放黑屏): 控件被迁到另一个窗体=同一种"宿主编排变化",
+                    # 合成层同样会被打断 → 迁完补几次呈现(实例不变, 页面不重载)。
+                    _retext_later(c, key)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    if after is not None:
+                        try:
+                            after()
+                        except Exception:
+                            pass
+            _ui(go)
+
+        def dock_to_main(self, key, after=None):
+            """把悬浮窗里的控件迁回主窗口内容区(几何按信息流主控件对齐, 右侧留 20px 空隙)。
+            控件先置为隐藏, 由 ShellApi._activate 再显示(避免闪一下旧位置)。"""
+            def go():
+                try:
+                    from System.Drawing import Point, Size
+                    form = box["form"]
+                    c = _Pool.ctrls.get(key)
+                    home = self._ctrl(0)
+                    if c is None or form is None or home is None:
+                        return
+                    old = c.Parent
+                    if old is not None:
+                        old.Controls.Remove(c)
+                    form.Controls.Add(c)
+                    _Pool.float_of.pop(key, None)
+                    c.Location, c.Size = _tab_geo(form, home, key)
+                    c.Anchor = (WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Bottom |
+                                WinForms.AnchorStyles.Left | WinForms.AnchorStyles.Right)
+                    c.Visible = False
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    if after is not None:
+                        try:
+                            after()
+                        except Exception:
+                            pass
             _ui(go)
 
         def navigate_history(self, key, back):

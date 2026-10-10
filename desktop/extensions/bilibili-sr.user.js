@@ -44,7 +44,11 @@
   "use strict";
   if (window.__MSX_SR__ !== 1) return;
   if (window.__MSX_FG__) return;   // 补帧已接管画面: 超分不再注入(双画布互相打架)
-  if (!/(^|\.)bilibili\.com$/.test(location.hostname)) return;
+  /* 门控: 只在**播放器宿主**生效(www.bilibili.com / bilibili.com)。
+     旧门控 /(^|\.)bilibili\.com$/ 把 space.bilibili.com(个人空间)也算了进来 ——
+     个人空间没有 <video> 播放器, 却白挂一整套 MutationObserver + 900ms 轮询 +
+     设置轮询(用户反馈"打开别人个人界面有概率卡很久")。 */
+  if (location.hostname !== "www.bilibili.com" && location.hostname !== "bilibili.com") return;
 
   var lib = window["anime4k-webgpu"];
   var hasLib = !!(lib && lib.render && lib.CNNx2UL);
@@ -77,7 +81,8 @@
     setInterval(function () {
       try {
         /* 专用端点: 只含 UI 开关键(不含敏感项), 且服务端只对它回 CORS 头 */
-        fetch("http://127.0.0.1:" + port + "/api/ui_settings", { cache: "no-store" })
+        fetch("http://127.0.0.1:" + port + "/api/ui_settings",
+              { cache: "no-store", targetAddressSpace: "loopback" })
           .then(function (r) { if (!r.ok) throw 0; return r.json(); })
           .then(function (s) {
             if (!s) return;
@@ -246,12 +251,40 @@
       /* 2026-10(晚): 原视频**永久保持可见**(不再 opacity:0) —— 藏视频会让B站播放器
          截图(drawImage(video))间歇性黑帧。画布同框覆盖, 视频可见是预期状态, 无异常可报 */
       if (diff > 3) bad.push("画布与视频框不重合 " + info.rectDiffPx + "px");
-      if (bad.length) showDiag("SR 图层异常: " + bad.join(" | ") +
-        " || video[" + info.videoRect + "] canvas[" + info.canvasRect + "] fit=" +
-        info.videoObjectFit + " dpr=" + info.dpr + " buf=" + info.canvasBuf +
-        " src=" + info.src + " win=" + info.win);
+      if (bad.length) {
+        _layerBadRun++;
+        window.__msxSrBadRun = _layerBadRun;
+        if (_layerBadRun >= 2) {
+          showDiag("SR 图层异常: " + bad.join(" | ") +
+            " || video[" + info.videoRect + "] canvas[" + info.canvasRect + "] fit=" +
+            info.videoObjectFit + " dpr=" + info.dpr + " buf=" + info.canvasBuf +
+            " src=" + info.src + " win=" + info.win);
+        } else {
+          /* 瞬时异常只进控制台。用户反馈: 超分"暂时性画布不对"就弹报错框, 没必要 */
+          console.warn("[msx] SR 图层瞬时异常(不弹框):", bad.join(" | "));
+        }
+      } else {
+        _layerBadRun = 0;
+        hideDiag();
+      }
       return info;
     } catch (e) { return null; }
+  }
+
+  /* 与 window.__msxSrLayer / window.__msxSrBadRun 同类的诊断出口: 让离线/真机探针能直接驱动
+     一次图层自检, 验证"瞬时异常不弹框、连续 2 次才弹"(用户报修: 暂时性画布不对就弹报错框)。 */
+  try { window.__msxSrProbe = layerProbe; } catch (e) {}
+
+  /* 暂时性异常不弹框(用户反馈"没必要"): 自检只在激活/全屏切换后点 2~3 次(300/1500/4000ms),
+     而这段时间正是布局尚未落定、画布与视频框短暂错位的时候。改成**连续 2 次自检都异常**
+     (即跨过 1.5s 依然不对) 才显示面板; 一旦恢复干净立即撤掉面板。 */
+  var _layerBadRun = 0;
+
+  function hideDiag() {
+    try {
+      var d = document.getElementById("msx-sr-diag");
+      if (d && d.parentNode) d.parentNode.removeChild(d);
+    } catch (e) {}
   }
 
   function showDiag(msg) {
@@ -317,20 +350,15 @@
     st.id = "msx-sr-style";
     st.textContent =
       "canvas.msx-sr-canvas{position:absolute!important;pointer-events:none!important;" +
-      "z-index:0!important;border-radius:0.5px!important}" +
-      "video:has(+ canvas.msx-sr-canvas){border-radius:0.5px!important}" +
-      /* ⚠️ 两条 border-radius(0.5px, 视觉无感)都是故意的, 各堵一条 GDI 截屏黑屏路径:
-         不加圆角, ①超分画布 = 不透明+轴对齐+无滤镜的简单四边形、②可见的 <video> 本身,
-         都会被 Chromium 提升为 DirectComposition 硬件 overlay 平面(省电启发式, 间歇性
-         触发)。overlay 平面屏幕上可见但 GDI 系截屏(微信/QQ/PrntScr 等 BitBlt 屏幕DC)
-         取不到 → 用户实测"超分下整屏截屏, 视频区域黑屏"。圆角裁剪强制走渲染通道,
-         留在主合成面里, 截屏即画面。①画布本体现在已覆盖; ②堵的是 SR 拆管窗口期
-         (激活前/管线停滞/换 video 元素)画布不在、视频可见的那一刻(v0.3.1.6 把视频
-         改回可见后新开的口子); 画布 teardown 只是 display:none 不移除, 所以这条
-         :has 规则在该视频的全部生命周期持续生效。引擎级兜底(v0.3.1.8 修正):
-         --disable-direct-composition --disable-direct-composition-video-overlays
-         (app_window.py / shell_pages.py) —— 只带 video-overlays 那条挡不住, 必须
-         关掉 DComp 呈现; 圆角规则保留为冗余兜底。 */
+      "z-index:0!important;opacity:0.999!important;filter:brightness(1)!important}" +
+      /* ⚠️ opacity:0.999 + filter:brightness(1)(视觉无感)是故意的: 不加, 超分画布 =
+         不透明+轴对齐+无滤镜的简单四边形, 会被 Chromium 提升为 DirectComposition 独立
+         平面; overlay 平面屏幕上可见但 GDI 系截屏(微信/QQ/PrntScr 等 BitBlt 屏幕DC)取不到
+         → 播放器区域黑屏。非不透明 + 恒等滤镜强制走渲染通道, 画布留在主合成面里。
+         ⚠️ 旧方案是 border-radius:0.5px —— 在 Chromium 154 上**已失效**(该内核支持带圆角的
+         overlay, msedge.dll 内 delegated.overlay.candidate_rounded_corners 即证), 不要再改回去。
+         引擎级 --disable-direct-composition 能清零黑帧但整条呈现路径退回传统合成, 弹幕场景
+         "特别特别卡", 已弃用。 */
       /* 不写 display: 未激活时要能被内联 display:none 藏起来 */
     (document.head || document.documentElement).appendChild(st);
   }
@@ -377,6 +405,7 @@
   /* ── 拆除 ──────────────────────────────────────────────────────────────── */
   function teardown(reason) {
     try { window.__msxSrTeardown = reason || "?"; } catch (e) {}
+    _layerBadRun = 0; hideDiag();   // 拆管即清掉自检状态与诊断面板
     if (!cur) { try { window.__msxSrMode = "off"; } catch (e) {} return; }
     var v = cur.video;
     GEN++;                                // 旧 rVFC 链醒来即退出
