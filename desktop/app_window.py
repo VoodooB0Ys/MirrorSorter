@@ -526,6 +526,13 @@ class ShellApi:
             t["float"] = False
             self._active = tid
         self._activate(t)             # 显示到主窗口内容区 + 补推导航状态
+        if self._pages is not None:
+            # 从悬浮窗塞回标签页 = 又一次"宿主编排变化"(控件换回父窗体), 合成层同样会被
+            # 打断 → 补一次呈现。悬浮窗侧只负责"迁出去"那次, "迁回来"这次得在这里补。
+            try:
+                self._pages.represent(tid, "undock")
+            except Exception:
+                pass
         self._render()
         return "ok"
 

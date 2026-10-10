@@ -219,6 +219,40 @@ check("壳接线: install_floats + bind_floats + tab_detach/window_dock",
       and "def tab_detach" in _aw_src and "def window_dock" in _aw_src)
 check("shell_info 暴露悬浮窗能力", aw.ShellApi().shell_info().get("windows") is True)
 
+# ---- 悬浮窗黑屏(v0.3.1.42dsk): 补呈现看门狗(校验+重试) + 宿主编排变化触发 ----
+check("补呈现看门狗: 递进时刻表 + 旧行为时刻表(排障 A/B 用)",
+      "_REP_TAPS = (0.25, 0.6, 1.1, 1.8, 2.8, 4.0, 5.5, 7.0)" in _sp_src
+      and "_REP_LEGACY_TAPS = (0.35, 0.9, 1.6)" in _sp_src
+      and "MSX_NO_REPRESENT" in _sp_src)
+check("补呈现判据是'整块平色'而不是'是不是黑'(否则正常播放页会被误判成坏)",
+      "def _frame_flat(hwnd)" in _sp_src
+      and "len(seen) <= 2 and top >=" in _sp_src
+      and "0x00FF00FF" in _sp_src)
+check("补呈现: 校验是否真出图, 出图即收工; 还黑就继续补(不再固定三次撒手)",
+      "def _represent(" in _sp_src
+      and '_frame_flat(hb.get("h")) is False' in _sp_src
+      and "represent TIMEOUT" in _sp_src)
+check("补呈现手段逐级加重(隐藏→显示→置顶 / 强制重绘 / 摘挂父容器)",
+      "def _rep_level(i)" in _sp_src
+      and "return 1 if i < 2 else (2 if i < 4 else 3)" in _sp_src
+      and "cc.Visible = False" in _sp_src and "cc.Invalidate(True)" in _sp_src
+      and "par.Controls.Remove(cc)" in _sp_src)
+check("补呈现可取消(控件隐藏/换掉/销毁时停掉看门狗, 否则会被 toggle 出来)",
+      "def _rep_cancel(cc)" in _sp_src and "_rep_cancel(c)" in _sp_src
+      and "_rep_cancel(_Pool.ctrls.get(key))" in _sp_src)
+check("控件池公开 represent 入口(悬浮窗侧据此触发)",
+      'def represent(self, key, why="")' in _sp_src)
+check("悬浮窗: 激活/缩放/移动/DPI 变都触发补呈现(带尾部去抖, 不干扰拖动)",
+      "_wire_repaint" in _fs_src and "form.Activated +=" in _fs_src
+      and "form.Resize +=" in _fs_src and "form.LocationChanged +=" in _fs_src
+      and "form.DpiChangedAfterParent +=" in _fs_src and "rep_timer" in _fs_src)
+check("塞回标签页那次也补呈现(迁回来同样是'宿主编排变化')",
+      'self._pages.represent(tid, "undock")' in _aw_src)
+check("机器相关环境字段落盘(OS/DPI/显示器数/WebView2 内核/浏览器参数)",
+      "def _log_runtime_env()" in _sp_src
+      and "GetAvailableBrowserVersionString" in _sp_src
+      and "_log_runtime_env()" in _sp_src)
+
 
 class FakeFloatMgr:
     def __init__(self):
@@ -678,9 +712,19 @@ check("NSIS脚本: 卸载器与添加/删除程序登记",
 check("NSIS脚本: 数据目录策略(卸载不删用户数据)",
       not re.search(r'RMDir[^\n]*LocalLow', _nsi) and 'RMDir /r "$INSTDIR"' in _nsi)
 import glob
-_pkgs = glob.glob(os.path.join(PROJECT, "dist", "*安装包*.exe"))
-check("安装包产物已构建", bool(_pkgs) and os.path.getsize(_pkgs[-1]) > 100 * 1024 * 1024,
-      _pkgs[-1] if _pkgs else "missing")
+_exes = [p for p in glob.glob(os.path.join(PROJECT, "dist", "*.exe")) if os.path.isfile(p)]
+_pkgs = [p for p in _exes if "安装包" in os.path.basename(p)]
+# dist/ 是构建产物(已 gitignore)。全新检出/清理后尚未打包时不该判 FAIL ——
+# 这些检查的语义是"打好的包是对的", 不是"必须已经打过包"。
+if not _exes:
+    print("SKIP  打包产物已构建  (dist/ 未构建: 清理后未重新打包, 属预期)")
+else:
+    check("打包产物已构建(PyInstaller onefile exe)",
+          os.path.getsize(_exes[-1]) > 20 * 1024 * 1024, _exes[-1])
+if _pkgs:
+    check("安装包产物已构建", os.path.getsize(_pkgs[-1]) > 100 * 1024 * 1024, _pkgs[-1])
+else:
+    print("SKIP  安装包产物已构建  (未跑 NSIS 打包, 属预期)")
 
 print("RESULT: %s" % ("FAIL(%d)" % FAIL if FAIL else "ALL_PASS (%d checks)" % PASS))
 sys.exit(1 if FAIL else 0)

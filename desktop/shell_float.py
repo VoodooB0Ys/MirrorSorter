@@ -194,6 +194,78 @@ def install_floats(win, api, pages, bg_getter=None, accent_getter=None, tabstrip
         except Exception:
             pass
 
+    def _stop_rep(win):
+        """停掉悬浮窗上的补呈现去抖定时器(窗体销毁时)。"""
+        try:
+            t = (win or {}).get("rep_timer")
+            if t is not None:
+                t.Stop()
+        except Exception:
+            pass
+
+    def _wire_repaint(form, tid):
+        """宿主编排变化 → 补一次呈现(v0.3.1.42dsk)。
+
+        WebView2(DirectComposition) 的合成层会在这些瞬间被打断: 悬浮窗被激活(从别的应用
+        切回来)、缩放、最大化/还原、拖到另一块显示器、DPI 变化 —— 表现就是内容整块停住
+        (深色底)且**不自愈**。用户机的 GPU/驱动比开发机慢时这个窗口会长很多, 于是出现
+        "同一份代码、一台正常一台必黑"。这里把这几类事件都接上控件池的补呈现看门狗
+        (池侧自带"校验是否真出图 + 还黑就加重手段重试", 出图即收工)。
+        缩放/移动过程中事件很密 → 合并到 0.45s 尾部去抖, 只在动完了补一次。
+        """
+        def ask(why):
+            try:
+                pages.represent(tid, why)
+            except Exception:
+                pass
+
+        def debounce(why):
+            try:
+                w = win_of(tid)
+                if w is None:
+                    return
+                t = w.get("rep_timer")
+                if t is not None:
+                    t.Stop()
+                t = WinForms.Timer()
+                t.Interval = 450
+                t.Tick += lambda _s, _e, _t=t, _w=why: (_t.Stop(), ask(_w))
+                w["rep_timer"] = t
+                t.Start()
+            except Exception:
+                ask(why)
+
+        try:
+            form.Activated += lambda _s, _a: ask("float-activate")
+        except Exception:
+            pass
+
+        def on_resize(_s, _a):
+            try:
+                if form.WindowState == WinForms.FormWindowState.Minimized:
+                    return       # 最小化不算"编排变化"; 还原时 WindowState 变了会再触发
+            except Exception:
+                pass
+            debounce("float-resize")
+
+        try:
+            form.Resize += on_resize
+        except Exception:
+            pass
+        try:
+            form.LocationChanged += lambda _s, _a: debounce("float-move")
+        except Exception:
+            pass
+        # 换显示器/改缩放: DpiChangedAfterParent 是 .NET 4.7+ 才有, 两个都挂、各自 try
+        try:
+            form.DpiChangedAfterParent += lambda _s, _a: ask("float-dpi")
+        except Exception:
+            pass
+        try:
+            form.DpiChanged += lambda _s, _a: ask("float-dpi")
+        except Exception:
+            pass
+
     def _hint(on, win=None):
         """拖拽期间提示"松手即合并到标签栏"。
 
@@ -440,6 +512,7 @@ def install_floats(win, api, pages, bg_getter=None, accent_getter=None, tabstrip
                 _place(form)
                 form.Show()
                 _build_edges(win_of(tid))
+                _wire_repaint(form, tid)   # 激活/缩放/移动/DPI 变 → 补呈现(见 _wire_repaint)
                 if pages_ is not None:
                     pages_.send_to_window(tid, form, bar_h,
                                           after=lambda: _raise_chrome(win_of(tid)))
@@ -461,6 +534,7 @@ def install_floats(win, api, pages, bg_getter=None, accent_getter=None, tabstrip
         with lock:
             win = wins.pop(tid, None)
         _hint(False, win)
+        _stop_rep(win)
         if win is None:
             return False
         win["closing"] = True
@@ -484,6 +558,7 @@ def install_floats(win, api, pages, bg_getter=None, accent_getter=None, tabstrip
         with lock:
             win = wins.pop(tid, None)
         _hint(False, win)
+        _stop_rep(win)
         if win is None:
             return False
         win["closing"] = True

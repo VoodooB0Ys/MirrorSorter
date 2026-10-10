@@ -481,6 +481,245 @@ def _bq_enabled():
     return os.environ.get("MSX_BQ", "0") == "1"
 
 
+# ── 补呈现看门狗(v0.3.1.42dsk) ───────────────────────────────────────────────
+# 症状: 悬浮窗/全屏/换宿主窗的瞬间, WebView2 的合成层被"宿主编排变化"打断 —— 控件内容
+#   整块停在同一色(深色底 #0f1115), 且**不会自愈**。快机器往往 1s 内自己就好, 慢机器
+#   (WebView2 冷启动慢 / GPU 驱动初始化慢 / 多屏混合 DPI / 混合显卡)要好几秒 →
+#   于是同一份代码在两台机器上表现为"一台正常、一台必黑"。
+# 旧实现(_retext_later): 在 0.35/0.9/1.6s 三个**写死**的时间点各补一次「隐藏→显示→置顶」,
+#   **不校验是否真的出图、也不重试** ⇒ 慢机器三次全落空, 黑屏永久留下。这就是机器差异的根。
+# 现实现: 递进式看门狗 —— 到点补呈现, 补完**校验画面是否真的出图**(GDI PrintWindow 抽样,
+#   判"是否整块同一个颜色"), 出图立刻收工(快机器只花一次、零额外代价), 还黑就继续补并
+#   **逐级加重手段**, 直到出图或到 deadline。全程不重载页面, 页面状态原样保留。
+# A/B 开关(排障用):
+#   MSX_NO_REPRESENT=1 → 退回旧行为(固定三次、不校验), 用于确认新旧差异。
+_REP_TAPS = (0.25, 0.6, 1.1, 1.8, 2.8, 4.0, 5.5, 7.0)   # 递进补呈现时刻(秒, 相对触发)
+_REP_LEGACY_TAPS = (0.35, 0.9, 1.6)                     # 旧行为(仅 MSX_NO_REPRESENT=1)
+_REP_SETTLE = 0.22        # 补呈现后等画面稳定再校验
+_REP_DEADLINE = 8.0       # 硬上限(秒)
+_REP_REG = {}             # id(ctrl) -> {"ev": Event}  正在跑的看门狗(新触发会取消旧的)
+_REP_LOCK = threading.Lock()
+
+
+def _rep_level(i):
+    """第 i 次补呈现(0 起)用第几级手段: 前两次最轻, 中段加刷新, 之后摘挂父容器。"""
+    return 1 if i < 2 else (2 if i < 4 else 3)
+
+
+def _frame_flat(hwnd):
+    """GDI PrintWindow(PW_RENDERFULLCONTENT) 抓窗口内容 → 是否"整块同一个颜色"。
+
+    True = 平色(合成层没出图, 可疑) / False = 有内容(健康) / None = 判不了(当作还没好)。
+    为什么要用"平色"而不是"是不是黑": 视频层被提升为 DComp 独立平面时, GDI 本来就抓不到
+    那块(会读到黑), 但页面其余部分(播放器控件/页面底色/弹幕层)是能抓到的 ⇒ 只有**整块
+    完全同一个颜色**才是"根本没呈现"的特征, 单看黑会把正常的播放页误判成坏。
+    纯 ctypes 实现, 不依赖 PIL(打包体积/依赖都省)。
+    """
+    if not hwnd:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.windll.user32
+        g32 = ctypes.windll.gdi32
+
+        class _BIH(ctypes.Structure):
+            _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                        ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                        ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                        ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                        ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                        ("biClrImportant", wintypes.DWORD)]
+
+        rc = wintypes.RECT()
+        if not u32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rc)):
+            return None
+        w, h = rc.right - rc.left, rc.bottom - rc.top
+        if w < 32 or h < 32:
+            return None
+        hdc = u32.GetWindowDC(wintypes.HWND(hwnd))
+        mem = g32.CreateCompatibleDC(hdc)
+        bmp = g32.CreateCompatibleBitmap(hdc, w, h)
+        old = g32.SelectObject(mem, bmp)
+        # 先刷成品红: PrintWindow 若压根没画, 结果就是整片品红 → 判"抓不到"而不是"平色"
+        br = g32.CreateSolidBrush(0x00FF00FF)
+        fr = wintypes.RECT(0, 0, w, h)
+        u32.FillRect(mem, ctypes.byref(fr), br)
+        g32.DeleteObject(br)
+        u32.PrintWindow(wintypes.HWND(hwnd), mem, 2)
+        bi = _BIH()
+        bi.biSize = ctypes.sizeof(_BIH)
+        bi.biWidth, bi.biHeight, bi.biPlanes, bi.biBitCount = w, -h, 1, 32
+        buf = ctypes.create_string_buffer(w * h * 4)
+        got = g32.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(bi), 0)
+        g32.SelectObject(mem, old)
+        g32.DeleteObject(bmp)
+        g32.DeleteDC(mem)
+        u32.ReleaseDC(wintypes.HWND(hwnd), hdc)
+        if not got:
+            return None
+        raw = buf.raw
+        step = max(3, int(((w * h) / 2600.0) ** 0.5))
+        seen = {}
+        sent = n = 0
+        for yy in range(0, h, step):
+            base = yy * w * 4
+            for xx in range(0, w, step):
+                o = base + xx * 4
+                b, g, r = raw[o], raw[o + 1], raw[o + 2]
+                n += 1
+                if r > 200 and b > 200 and g < 90:
+                    sent += 1          # 预填品红 = 这一块没画出来
+                    continue
+                k = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4)
+                seen[k] = seen.get(k, 0) + 1
+        if n == 0:
+            return None
+        if sent * 100.0 / n > 97.0:
+            return None                # 基本全是预填色 → 没呈现
+        if not seen:
+            return True
+        top = max(seen.values())
+        # 量化后只有 1~2 种色、且占比 ≥98.5% ⇒ 整块平色(深色底), 判定"没出图"
+        return len(seen) <= 2 and top >= (n - sent) * 0.985
+    except Exception:
+        return None
+
+
+def _rep_cancel(cc):
+    """取消某个控件上正在跑的看门狗(控件被换掉/隐藏/销毁时调)。"""
+    try:
+        with _REP_LOCK:
+            st = _REP_REG.pop(id(cc), None)
+        if st is not None:
+            st["ev"].set()
+    except Exception:
+        pass
+
+
+def _rep_tap(ui, ctrls, cc, key, hwnd_box, level):
+    """补呈现(在 UI 线程执行)。level 越高手段越重, 全程**不重载页面**:
+      1 隐藏→显示→置顶(与旧实现一致)
+      2 加一次强制重绘(Invalidate+Update)
+      3 从父容器摘下再挂回(几何原样还原) —— 最重的一招, 逼宿主重走一遍编排
+    """
+    def _do():
+        try:
+            if key is not None and ctrls.get(key) is not cc:
+                return          # 控件已被换掉
+            if cc.IsDisposed:
+                return
+            try:
+                hwnd_box["h"] = int(cc.Handle.ToInt32())
+            except Exception:
+                pass
+            par = None
+            geo = None
+            if level >= 2:
+                try:
+                    par = cc.Parent
+                    geo = (cc.Location, cc.Size, cc.Dock, cc.Anchor)
+                except Exception:
+                    par, geo = None, None
+            if level >= 3 and par is not None and geo is not None:
+                try:
+                    par.Controls.Remove(cc)
+                    par.Controls.Add(cc)
+                    cc.Location, cc.Size, cc.Dock, cc.Anchor = geo
+                except Exception:
+                    pass
+            cc.Visible = False
+            cc.Visible = True
+            cc.BringToFront()
+            if level >= 2:
+                try:
+                    cc.Invalidate(True)
+                    cc.Update()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    ui(_do)
+
+
+def _represent(ui, ctrls, cc, key=None, why="", taps=None, settle=None):
+    """补呈现看门狗(模块级, 便于离线测试)。
+
+    到点补呈现 → 校验是否真出图 → 出图即收工; 还黑就继续补并加重手段, 直到 deadline。
+    同一控件上重复触发会取消上一个看门狗(避免两个 worker 同时 toggle 造成抖动)。
+    任意线程可调。
+    """
+    try:
+        legacy = os.environ.get("MSX_NO_REPRESENT") == "1"
+        sched = tuple(taps if taps is not None else
+                      (_REP_LEGACY_TAPS if legacy else _REP_TAPS))
+        wait = _REP_SETTLE if settle is None else settle
+        _rep_cancel(cc)
+        ev = threading.Event()
+        with _REP_LOCK:
+            _REP_REG[id(cc)] = {"ev": ev}
+        hb = {"h": 0}
+
+        def worker():
+            t0 = time.time()
+            n = 0
+            for i, at in enumerate(sched):
+                if ev.wait(max(0.0, at - (time.time() - t0))):
+                    return                       # 被取消(控件已换/已隐藏)
+                if time.time() - t0 > _REP_DEADLINE:
+                    break
+                n += 1
+                _rep_tap(ui, ctrls, cc, key, hb, _rep_level(i))
+                if ev.wait(wait):
+                    return
+                if legacy:
+                    continue
+                if _frame_flat(hb.get("h")) is False:
+                    _dbg_log("represent ok why=%s taps=%d dt=%.2f"
+                             % (why, n, time.time() - t0))
+                    return
+            if not legacy:
+                _dbg_log("represent TIMEOUT why=%s taps=%d key=%s (画面仍无出图)"
+                         % (why, n, key))
+        threading.Thread(target=worker, daemon=True,
+                         name="msx-represent").start()
+    except Exception:
+        pass
+
+
+def _log_runtime_env():
+    """把"和机器强相关"的环境字段落一次盘。
+
+    悬浮窗黑屏这类问题几乎全是机器差异(GPU/驱动/多屏 DPI/WebView2 内核版本) ——
+    没有这些字段, 远程定位就只能靠猜。用户报修时第一句该问的就是它们。
+    """
+    try:
+        import platform
+        bits = ["os=%s" % platform.platform()]
+        try:
+            import ctypes
+            u32 = ctypes.windll.user32
+            try:
+                bits.append("sysdpi=%s" % u32.GetDpiForSystem())
+            except Exception:
+                pass
+            bits.append("monitors=%s" % u32.GetSystemMetrics(80))   # SM_CMONITORS
+        except Exception:
+            pass
+        try:
+            from Microsoft.Web.WebView2.Core import CoreWebView2Environment
+            bits.append("wv2=%s"
+                        % CoreWebView2Environment.GetAvailableBrowserVersionString())
+        except Exception as e:
+            bits.append("wv2=?(%r)" % e)
+        bits.append("args=%r" % (os.environ.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") or ""))
+        bits.append("basic=%s no_represent=%s"
+                    % (_basic_mode(), os.environ.get("MSX_NO_REPRESENT") == "1"))
+        _dbg_log("env " + " ".join(bits))
+    except Exception:
+        pass
+
+
 def _build_inject_script(port):
     """组装文档创建脚本: Vue + GM垫片 + 内置净化大师 + 用户脚本。"""
     if _basic_mode():
@@ -931,31 +1170,14 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
             import traceback
             traceback.print_exc()
 
-    def _retext_later(cc, key=None, delays=(0.35, 0.9, 1.6)):
-        """WebView2(DirectComposition) 在"宿主编排变化"的瞬间偶发打断合成层 —— 画面整块停住
-        (全黑 #0f1115, 连渲染器出图都卡住), 且不会自己恢复。本仓既有实证(app_window.tab_close
-        注释)与本次探针实测都表明: 在同一控件上补一次「隐藏→显示→置顶」立刻有画面。
-        这里延迟补几次(需要 UI 线程 → 走 _ui); 控件已被销毁/换掉就放弃。"""
-        try:
-            import threading as _th
+    def _retext_later(cc, key=None, why=""):
+        """补呈现看门狗(见模块级 _represent)。
 
-            def _tap(_cc=cc, _key=key):
-                def _do():
-                    try:
-                        if _key is not None and _Pool.ctrls.get(_key) is not _cc:
-                            return
-                        if _cc.IsDisposed:
-                            return
-                        _cc.Visible = False
-                        _cc.Visible = True
-                        _cc.BringToFront()
-                    except Exception:
-                        pass
-                _ui(_do)
-            for _d in delays:
-                _th.Timer(_d, _tap).start()
-        except Exception:
-            pass
+        旧实现在 0.35/0.9/1.6s 三个写死的时间点各补一次、不校验也不重试 —— 慢机器三次
+        全落空就把黑屏永久留下(用户机 vs 开发机的差异根源)。现在改成"补完校验、还黑就
+        继续补并加重手段", 出图即收工。需要 UI 线程 → 内部走 _ui; 控件已被销毁/换掉就放弃。
+        """
+        _represent(_ui, _Pool.ctrls, cc, key, why)
 
     class _Pool:
         ctrls = {0: None}   # tab_key -> WebView2 控件(0 = 信息流主控件)
@@ -1137,6 +1359,9 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                 try:
                     import ctypes
                     from System.Drawing import Color as _C
+                    # 机器相关环境字段落一次盘(OS/DPI/显示器数/WebView2 内核版本/浏览器参数):
+                    # 悬浮窗黑屏这类问题几乎全是机器差异, 没有这些字段就只能靠猜。
+                    _log_runtime_env()
                     form.BackColor = (_C.FromArgb(23, 24, 26) if self._is_dark() else _C.White)
                     # ↑ 窗体底衬 = 外部页签左侧留白露出来的那块: 取 B站播放页背景色
                     # (夜间 rgb(23,24,26) / 白天白), 与页面底色连成一片(用户本轮要求);
@@ -1396,7 +1621,7 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                         # Page.captureScreenshot 超时), 且不会自己恢复(0.7~3.1s 五次采样全黑);
                         # 而在同一控件上补一次"隐藏→显示→置顶"立刻有画面(0.75s 起就正常)。
                         # 与最大化/Dock/chrome 隐藏/--disable-direct-composition-video-overlays 都无关。
-                        _retext_later(c, key)
+                        _retext_later(c, key, "fullscreen")
                     except Exception:
                         import traceback
                         traceback.print_exc()
@@ -1431,6 +1656,7 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                 try:
                     c = self._ctrl(key)
                     if c is not None:
+                        _rep_cancel(c)   # 控件要藏了: 停掉看门狗, 否则它会把它又 toggle 出来
                         c.Visible = False
                         _dbg_log("hide key=%s loc=%s size=%s fs=%s"
                                  % (key, c.Location, c.Size, _Pool.fs["on"]))
@@ -1438,11 +1664,21 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                     pass
             _ui(go)
 
+        def represent(self, key, why=""):
+            """公开的补呈现入口 —— 悬浮窗管理器在"宿主编排变化"(激活/缩放/最大化还原/
+            换显示器/DPI 变)时调用。任意线程可调。控件不存在时返回 False。"""
+            c = _Pool.ctrls.get(key)
+            if c is None:
+                return False
+            _represent(_ui, _Pool.ctrls, c, key, why or "represent")
+            return True
+
         def dispose(self, key):
             def go():
                 try:
                     _Pool._dead.add(key)   # 迟到的create看到即弃
                     _Pool.float_of.pop(key, None)
+                    _rep_cancel(_Pool.ctrls.get(key))   # 控件即将销毁: 停掉看门狗
                     if _Pool.fs.get("key") == key:   # bug6: 全屏的那个标签被关 →
                         _Pool.fs["on"] = False       # 标签栏/导航栏必须回来, 否则整窗没chrome
                         _Pool.fs["key"] = None
@@ -1509,7 +1745,9 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                         pass
                     # 用户报修 m02020(悬浮窗播放黑屏): 控件被迁到另一个窗体=同一种"宿主编排变化",
                     # 合成层同样会被打断 → 迁完补几次呈现(实例不变, 页面不重载)。
-                    _retext_later(c, key)
+                    # v0.3.1.42dsk 起改走**补呈现看门狗**: 补完校验是否真出图, 还黑就继续补并加重手段
+                    # (慢机器不再因为"三次补救全部落空"而永久黑)。
+                    _retext_later(c, key, "to-float")
                 except Exception:
                     import traceback
                     traceback.print_exc()
@@ -1532,6 +1770,7 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                     home = self._ctrl(0)
                     if c is None or form is None or home is None:
                         return
+                    _rep_cancel(c)   # 控件马上要被隐藏、稍后由 _activate 重新显示 → 先停旧看门狗
                     old = c.Parent
                     if old is not None:
                         old.Controls.Remove(c)
