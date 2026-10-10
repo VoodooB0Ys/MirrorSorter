@@ -255,4 +255,7 @@ else:
     print("ALL_PASS")
 print("=" * 76)
 sys.stdout.flush()
-sys.exit(1 if FAIL else 0)
+sys.stderr.flush()
+# ★ 必须 os._exit: 本进程里有个没跑消息循环的真 WinForms Form, 走正常退出路径
+#   会卡在 WinForms 的关闭流程上(表现为脚本跑完却一直不返回, 被外层 timeout 杀掉)。
+os._exit(1 if FAIL else 0)
