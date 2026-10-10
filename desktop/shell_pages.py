@@ -834,6 +834,11 @@ def _build_inject_script(port):
             "mystery": app.sget("m_block_mystery_bio") == "1",
             "lottery": app.sget("m_block_lottery") == "1",
             "empty": app.sget("m_block_empty_space") == "1",
+            # v0.3.1.43dsk 快速文本分析: 只有"总开关 + 该作用范围"都开时才注入 true,
+            # 页面端据此决定要不要把弹幕/评论文本送到本地模型 —— 关闭时连请求都不发。
+            "ft_on": app.sget("ft_on") == "1",
+            "ft_dm": app.sget("ft_on") == "1" and app.sget("ft_dm") == "1",
+            "ft_cf": app.sget("ft_on") == "1" and app.sget("ft_cf") == "1",
         }, ensure_ascii=True)
     except Exception:
         import traceback

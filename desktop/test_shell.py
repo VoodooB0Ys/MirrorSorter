@@ -657,12 +657,16 @@ check("评论占位2 屏蔽条数只在评论区最上方一处 + 「显示屏�
 check("评论占位3 数据层不再改写评论内容(原文保留) + 旧的右下角「已隐藏 N 条」浮层已彻底移除",
       "msx-cf-hint" not in _cf_src and "position:fixed" not in _cf_src
       and "function markBlocked(r)" in _cf_src
-      and "BLK_RPIDS[rpidOf(d)]" in _cf_src
+      # v0.3.1.43: sweep 改成先 rpidOf(d) 再查表 —— 顺手把"内容判定"的原因也带出来
+      and "rpidOf(d)" in _cf_src and "BLK_RPIDS[rp]" in _cf_src
       and "function rpidOf(r)" in _cf_src
       and _cf_src.count("kick();") >= 2)
 
-check("评论显示1 「显示屏蔽」时原样放出原文 + 纯 CSS「已屏蔽」角标",
-      '::before{content:"已屏蔽"' in _cf_src
+check("评论显示1 「显示屏蔽」时原样放出原文 + 纯 CSS「已屏蔽 · 原因」角标",
+      # v0.3.1.43: 角标从写死的"已屏蔽"改成 content:attr(data-msx-why) ——
+      # 内容判定命中的要能显示"到底为什么被筛"(已屏蔽 · 引战), 否则对用户是黑盒
+      "::before{content:attr(data-msx-why)" in _cf_src
+      and '"已屏蔽 · " + why' in _cf_src
       and "data-msx-blk" in _cf_src
       and "data-msx-hide" in _cf_src
       and "REDACT_TXT" not in _cf_src)   # 旧占位文案已彻底移除
@@ -673,6 +677,63 @@ check("评论翻页1 屏蔽后补泵翻页(哨兵还在视口就替组件 getLis
       and "inst.getList()" in _cf_src
       and "inst.showEnd || inst.showSpinner || inst.showContinuations" in _cf_src
       and "getBoundingClientRect" in _cf_src)
+
+# ---------- 3b. 快速文本分析(v0.3.1.43dsk) ----------
+# 产品要求: ① 内置 50MB+ 本地模型; ② 视频标题+简介 / 弹幕 / 评论 三条链路;
+#          ③ 「快速文本分析」是独立于弹幕/评论总开关的**另一个**总开关。
+_dm_src = io.open(os.path.join(PROJECT, "extensions", "bilibili-dmfilter.user.js"),
+                  encoding="utf-8").read()
+
+check("文本分析1 后端: 模型随包分发 + 纯 stdlib 推理(打包走 3.14, 官方 fasttext 无 wheel)",
+      "def _ft_path()" in _app_src
+      and 'getattr(sys, "_MEIPASS"' in _app_src
+      and "import ftrt" in _app_src
+      # 只禁止**真的** import, 注释里提到 fasttext 是解释为什么不用它
+      and re.search(r"^\s*import fasttext", _app_src, re.M) is None
+      and os.path.isfile(os.path.join(PROJECT, "ftrt.py"))
+      and os.path.getsize(os.path.join(PROJECT, "model", "ft_model.bin")) > 50 * 1024 * 1024)
+
+check("文本分析2 后端: 三条链路 kind=video/dm/cf 各自独立作用范围开关",
+      '{"video": "ft_video", "dm": "ft_dm", "cf": "ft_cf"}' in _app_src
+      and 'ft_scan([(it.get("title") or "") + " " + (it.get("desc") or "")], "video")' in _app_src
+      and 'path == "/api/textfilter"' in _app_src
+      and 'path == "/api/textfilter/probe"' in _app_src)
+
+check("文本分析3 后端: 总开关 ft_on 单独一道闸, 关掉即整批放行(绝不影响正常浏览)",
+      'if sget("ft_on") != "1":' in _app_src
+      and 'self.send_json({"ok": True, "on": False, "why": [""] * len(texts)})' in _app_src)
+
+check("文本分析4 壳侧注入三个开关, ft_dm/ft_cf 都必须先过总开关 ft_on",
+      '"ft_on": app.sget("ft_on") == "1"' in _sp_src
+      and 'app.sget("ft_on") == "1" and app.sget("ft_dm") == "1"' in _sp_src
+      and 'app.sget("ft_on") == "1" and app.sget("ft_cf") == "1"' in _sp_src)
+
+check("文本分析5 弹幕链路: 文本判定必须在改写字节流之前完成 + 关掉时零请求原样放行",
+      "var NEED_TEXT = DM_ON && !!CF.ft_dm;" in _dm_src
+      and "Promise.all([askFlags(hashes, true), askText(textsOf(top), true)])" in _dm_src
+      and "function blkWhy(o)" in _dm_src and "TXTWHY[t]" in _dm_src
+      and "text/plain" in _dm_src and "targetAddressSpace" in _dm_src)
+
+check("文本分析6 评论链路: 完全异步(标记式, 不阻塞评论加载) + 角标带原因",
+      "var NEED_TEXT = !!CF.ft_cf;" in _cf_src
+      and "BLK_WHY" in _cf_src
+      and "noteText(r)" in _cf_src
+      and "function msgOf(r)" in _cf_src)
+
+check("文本分析7 设置页: 独立页签 + 独立总开关 + 三通道 + 标签勾选 + 阈值 + 试一下",
+      'id="cfTabText"' in _idx_src and 'id="cfText"' in _idx_src
+      and 'id="ftOn"' in _idx_src and 'id="ftVideo"' in _idx_src
+      and 'id="ftDm"' in _idx_src and 'id="ftCf"' in _idx_src
+      and 'id="ftLabYy"' in _idx_src and 'id="ftThreshRow"' in _idx_src
+      and 'id="ftProbeIn"' in _idx_src and 'id="ftProbeBtn"' in _idx_src
+      and "loadFtSettings()" in _ajs_src
+      and '"/api/textfilter/probe"' in _ajs_src)
+
+check("文本分析8 训练/评测脚本随源码留在 _vis(可复现), 但**不进**打包 datas",
+      os.path.isfile(os.path.join(PROJECT, "_vis", "fasttext_demo", "build_corpus.py"))
+      and os.path.isfile(os.path.join(PROJECT, "_vis", "fasttext_demo", "train_big.py"))
+      and "_vis" not in io.open(os.path.join(PROJECT, "洞鉴虚明v0.3.1.43dsk.spec"),
+                                encoding="utf-8").read())
 
 # ---------- 4. 启动/打包脚本指向窗口壳 ----------
 gbk = lambda f: io.open(os.path.join(PROJECT, f), encoding="gbk").read()  # noqa: E731

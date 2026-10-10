@@ -81,3 +81,18 @@ desktop/*.spec
 
 # 清理清单等一次性产物
 _cleanup_manifest_*.txt
+
+# ===== 快速文本分析(v0.3.1.43dsk) =====
+# 训练管线入库(可复现), 语料/权重/工具链这些大件不入库 —— 权重另有 desktop/model/ 那份
+!desktop/_vis/fasttext_demo/
+!desktop/_vis/fasttext_demo/*.py
+desktop/_vis/fasttext_demo/_*
+desktop/_vis/fasttext_demo/*.bin
+desktop/_vis/fasttext_demo/*.txt
+desktop/_vis/fasttext_demo/*.json
+
+# 本版新增的测试 / 验收脚本入库(可重跑的回归资产);
+# 历史探针仍按上面的 desktop/_* 规则忽略, 不追加入库
+!desktop/_test_ft.py
+!desktop/_ft_ui_test.js
+!desktop/_verify_exe_43.py

@@ -57,6 +57,9 @@
   var MYSTERY = !!CF.mystery;      // 屏蔽无个性简介(空简介)账号的评论
   var LOT = !!CF.lottery;          // 屏蔽动态抽奖账号的评论
   var EMPTY = !!CF.empty;          // 屏蔽空首页(没有任何动态)账号的评论
+  /* v0.3.1.43dsk: 「快速文本分析」对评论生效(壳在总开关+作用范围都开时注入 true)。
+     与上面几条账号级规则完全独立 —— 那几条判"谁发的", 这条判"说了什么"。 */
+  var NEED_TEXT = !!CF.ft_cf;
   var BLK = null;
   if (BLK_ON && CF.blk && CF.blk.length) {
     BLK = Object.create(null);
@@ -134,6 +137,7 @@
 
   /* ---------- 数据层: 主评论只"标记"(不改写内容), 楼中楼照旧摘掉 ---------- */
   var BLK_RPIDS = Object.create(null);   // 被屏蔽的主评论 rpid_str → 1
+  var BLK_WHY = Object.create(null);     // rpid_str → 原因文案(只有内容判定会写, 账号级规则没有)
   var hidMain = 0;                       // 被屏蔽的主评论条数(去重)
   var MUTATED = 0;                       // 本轮是否真的改写了响应数据(只有楼中楼删除才算)
 
@@ -145,6 +149,11 @@
     var k = rpidOf(r);
     if (!k) return;
     if (!BLK_RPIDS[k]) { BLK_RPIDS[k] = 1; hidMain++; }
+    /* 内容判定命中时把原因带上, 渲染层好把角标写成「已屏蔽 · 引战」而不是干巴巴三个字。 */
+    if (NEED_TEXT && !BLK_WHY[k]) {
+      var t = msgOf(r);
+      if (t && TXTWHY[t]) BLK_WHY[k] = TXTWHY[t];
+    }
   }
 
   /* 过滤一层评论数组, 返回摘掉的条数。
@@ -157,6 +166,7 @@
     for (var i = 0; i < n; i++) {
       var r = arr[i];
       if (!r || typeof r !== "object") { out.push(r); continue; }
+      noteText(r);          // 登记「正文 → rpid」, 供文本判定回来时定位要拦哪几条
       if (!keep(r)) {
         cut++;
         if (isMain) { markBlocked(r); out.push(r); continue; }   // 整条交给渲染层藏, 内容不动
@@ -199,14 +209,23 @@
     if (d.replies && d.replies.length) cut += filtArr(d.replies, isMain);
     if (d.top_replies && d.top_replies.length) cut += filtArr(d.top_replies, isMain);
     if (d.hots && d.hots.length) cut += filtArr(d.hots, isMain);
-    if (d.top && typeof d.top === "object" && !Array.isArray(d.top) && d.top.rpid && !keep(d.top)) {
-      cut++;
-      if (isMain) markBlocked(d.top); else { d.top = null; MUTATED = 1; }
+    if (d.top && typeof d.top === "object" && !Array.isArray(d.top) && d.top.rpid) {
+      noteText(d.top);
+      if (!keep(d.top)) {
+        cut++;
+        if (isMain) markBlocked(d.top); else { d.top = null; MUTATED = 1; }
+      }
     }
-    if (d.upper && d.upper.top && !keep(d.upper.top)) {
-      cut++;
-      if (isMain) markBlocked(d.upper.top); else { d.upper.top = null; MUTATED = 1; }
+    if (d.upper && d.upper.top) {
+      noteText(d.upper.top);
+      if (!keep(d.upper.top)) {
+        cut++;
+        if (isMain) markBlocked(d.upper.top); else { d.upper.top = null; MUTATED = 1; }
+      }
     }
+    /* 本批评论正文已登记完 → 异步问一次本地模型(不等待, 不阻塞评论加载)。
+       命中的由 applyText 补进 BLK_RPIDS 并 kick(), 下一帧就藏好。 */
+    try { askText(); } catch (e) {}
     // 展开楼中楼的响应(/x/v2/reply/reply): 整段子回复被摘光 → 计数归零
     // (isMain 模式只用于主列表, 主列表数组长度不变, 这里不会命中)
     if (!isMain && reps0 > 0 && (!d.replies || d.replies.length === 0)) {
@@ -331,6 +350,80 @@
     });
   }
 
+  /* ---------------- 快速文本分析(本地 fastText): 按评论**内容**判定 ----------------
+   * 与弹幕侧不同, 这里**完全不需要**阻塞评论加载:
+   *   主评论本来就是"标记式"过滤 —— 命中的只把 rpid_str 记进 BLK_RPIDS, 由 sweep()
+   *   定时重扫落成 DOM 属性(见 cfApply)。所以文本判定晚几百毫秒回来也毫无影响:
+   *   拿回来补进 BLK_RPIDS, 再 kick() 一次就立刻显示出来了。
+   * 好处是评论列表的加载/翻页节奏完全不受筛选影响 —— 这是用户 2026-10-10 明确要的。
+   */
+  var TXTWHY = Object.create(null);      // 评论正文 -> 原因文案(空串=放行)
+  var TXTASKED = Object.create(null);
+  var TXT_RPID = Object.create(null);    // 评论正文 -> [rpid_str...](同一句话可能多人发)
+  var TXT_OFF = 0, TXT_N = 0, TXT_TOTAL = 6000, TXT_PER = 900;
+  var TXT_CAP = 4000;                    // TXT_RPID 条目上限, 超了就整表重来(防长会话膨胀)
+
+  function msgOf(r) {
+    try {
+      var c = r && r.content;
+      var m = c ? c.message : "";
+      m = String(m == null ? "" : m).replace(/\s+/g, " ").trim();
+      return m.length > 64 ? m.slice(0, 64) : m;   // 与壳/训练的 64 字上限一致
+    } catch (e) { return ""; }
+  }
+  function noteText(r) {
+    if (!NEED_TEXT) return;
+    var k = rpidOf(r), t = msgOf(r);
+    if (!k || !t) return;
+    if (TXT_N > TXT_CAP) { return; }
+    var a = TXT_RPID[t];
+    if (!a) { a = TXT_RPID[t] = []; }
+    if (a.length < 40 && a.indexOf(k) < 0) a.push(k);
+  }
+  function applyText(need, j) {
+    if (!j || j.ok !== true) return;
+    if (j.on !== true) { TXT_OFF = 1; return; }    // 壳侧没开 → 之后不再发请求
+    var w = j.why || [], hit = 0, i, v, k, a;
+    for (i = 0; i < need.length; i++) {
+      v = w[i] || "";
+      TXTWHY[need[i]] = v;
+      if (!v) continue;
+      a = TXT_RPID[need[i]] || [];
+      for (k = 0; k < a.length; k++) {
+        if (!BLK_RPIDS[a[k]]) { BLK_RPIDS[a[k]] = 1; hidMain++; }
+        if (!BLK_WHY[a[k]]) BLK_WHY[a[k]] = v;
+        hit++;
+      }
+    }
+    if (hit) { try { kick(); } catch (e) {} }      // 立刻落到 DOM, 不等下一次 900ms 巡检
+  }
+  function askText() {
+    if (!NEED_TEXT || TXT_OFF) return;
+    if (TXT_N > TXT_CAP) {                         // 长会话: 整表重置, 重新开始记
+      TXT_RPID = Object.create(null);
+      TXTASKED = Object.create(null);
+      TXT_N = 0;
+    }
+    var need = [], t;
+    for (t in TXT_RPID) {
+      if (need.length >= TXT_PER) break;
+      if (TXTASKED[t]) continue;
+      TXTASKED[t] = 1; TXT_N++; need.push(t);
+    }
+    if (!need.length) return;
+    var port = String(window.__MSX_PORT__ || "8000");
+    try {
+      fetch("http://127.0.0.1:" + port + "/api/textfilter", {
+        method: "POST", cache: "no-store", credentials: "omit",
+        targetAddressSpace: "loopback",
+        headers: { "Content-Type": "text/plain;charset=UTF-8" },
+        body: JSON.stringify({ kind: "cf", texts: need })
+      }).then(function (r) { return r.json(); })
+        .then(function (j) { applyText(need, j); })
+        .catch(function () { for (var k = 0; k < need.length; k++) delete TXTASKED[need[k]]; });
+    } catch (e) {}
+  }
+
   /* 单条评论是否保留 */
   function keep(r) {
     var m = r && r.member;
@@ -348,6 +441,12 @@
       var li = m.level_info;
       var cur = li ? Number(li.current_level) : NaN;
       if (isFinite(cur) && cur <= LV) return false;   // 取不到等级 → 放行
+    }
+    /* 内容判定放最后(账号级规则更硬): 只有这一句文本已经拿到标记时才拦。
+       首次遇到的句子这里是查不到的 —— 那种情况交给 askText 异步补, 见 applyText。 */
+    if (NEED_TEXT) {
+      var t = msgOf(r);
+      if (t && TXTWHY[t]) return false;
     }
     return true;
   }
@@ -407,22 +506,27 @@
       st.textContent =
         'bili-comment-thread-renderer[data-msx-blk="1"][data-msx-hide="1"]{display:none !important;}'
         + 'bili-comment-thread-renderer[data-msx-blk="1"]{box-shadow:inset 3px 0 0 0 #fb7299;}'
-        + 'bili-comment-thread-renderer[data-msx-blk="1"]::before{content:"已屏蔽";display:block;'
+        + 'bili-comment-thread-renderer[data-msx-blk="1"]::before{content:attr(data-msx-why);display:block;'
         + 'width:max-content;margin:8px 0 2px 4px;padding:0 8px;border-radius:4px;'
         + 'font:12px/18px "PingFang SC","Microsoft YaHei",sans-serif;color:#fff;background:#fb7299;}';
       root.appendChild(st);
       root.__msxCfStyle = st;
     } catch (e) {}
   }
-  function cfApply(el, blk) {
+  function cfApply(el, blk, why) {
     try {
       if (blk) {
         if (el.getAttribute("data-msx-blk") !== "1") el.setAttribute("data-msx-blk", "1");
+        /* 角标文案: 有原因就写「已屏蔽 · 引战」, 没有就是「已屏蔽」。
+           纯 CSS content:attr() 取值 —— 绝不碰评论内容本身。 */
+        var w = why ? ("已屏蔽 · " + why) : "已屏蔽";
+        if (el.getAttribute("data-msx-why") !== w) el.setAttribute("data-msx-why", w);
         if (showBlocked) el.removeAttribute("data-msx-hide");
         else el.setAttribute("data-msx-hide", "1");
       } else if (el.getAttribute("data-msx-blk") === "1") {
         el.removeAttribute("data-msx-blk");
         el.removeAttribute("data-msx-hide");
+        el.removeAttribute("data-msx-why");
       }
     } catch (e) {}
   }
@@ -442,9 +546,10 @@
       for (j = 0; j < nodes.length; j++) {
         var el = nodes[j], d = null;
         try { d = el.data; } catch (e) {}
-        var blk = !!(d && BLK_RPIDS[rpidOf(d)]);
+        var rp = (d ? rpidOf(d) : "");
+        var blk = !!(rp && BLK_RPIDS[rp]);
         if (blk) found.push(el);
-        cfApply(el, blk);
+        cfApply(el, blk, blk ? BLK_WHY[rp] : "");
       }
     }
     for (i = 0; i < BLK_HOSTS.length; i++) {
@@ -552,6 +657,10 @@
       if (location.href === lastHref) return;
       lastHref = location.href;
       BLK_RPIDS = Object.create(null);
+      BLK_WHY = Object.create(null);
+      TXT_RPID = Object.create(null);
+      TXTASKED = Object.create(null);
+      TXT_N = 0;
       hidMain = 0; hid = 0;
       BLK_HOSTS = []; pumpStall = 0; pumpLastLen = -1;
     } catch (e) {}

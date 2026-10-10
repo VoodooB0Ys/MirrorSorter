@@ -63,7 +63,7 @@ if _PORT_ENV:
         PORTS = (int(_PORT_ENV),)
     except Exception:
         pass
-APP_VER = "v0.3.1.42dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.3.1.43dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -119,7 +119,8 @@ _IO_IMPORTABLE = ({"mode", "ai_base", "ai_key", "ai_model", "ai_enabled", "ai_fu
                    "xhh_weight", "bili_follow_emph", "bili_follow_months",
                    "prefs_note", "dislike_note", "cf_blk_on", "cf_min_level",
                    "m_block_mystery_bio", "m_block_lottery",
-                   "m_block_empty_space", "m_dm_on"} | _IO_CRED_KEYS) - _IO_STATE_KEYS
+                   "m_block_empty_space", "m_dm_on",
+                   "ft_on", "ft_video", "ft_dm", "ft_cf", "ft_thresh", "ft_labels"} | _IO_CRED_KEYS) - _IO_STATE_KEYS
 # 脱敏导出白名单(白名单, 不是黑名单): 只有列在这里的键才会进「只导出设置」的文件。
 # 将来新增设置项默认**不导出**, 必须显式加进来 —— 避免新字段悄悄把敏感信息带出去。
 _IO_SHAREABLE = frozenset(_IO_IMPORTABLE - _IO_CRED_KEYS)
@@ -342,6 +343,15 @@ DEFAULTS = {
     # v0.3.1.32 弹幕屏蔽总开关: 0=完全不筛弹幕(原样播放, 不查发送者资料, 注入端连哈希表都不建)。
     # 只影响弹幕; 评论筛选(mystery/lottery/empty/level/黑名单)照常。
     "m_dm_on": "1",
+    # ---- v0.3.1.43dsk 快速文本分析(fastText 本地小模型) ----
+    # 与 m_dm_on / cf_* 相互独立的总开关: 上面那两组管"谁发的"(账号身份),
+    # 这里管"发了什么"(文本内容)。两边各自开关, 互不牵连。
+    "ft_on": "0",          # 总开关: 0=关闭(默认), 1=启用(加载本地模型做内容分拣)
+    "ft_video": "1",       # 作用范围: 信息筛选(视频标题+简介/贴吧标题+摘要)
+    "ft_dm": "1",          # 作用范围: 弹幕
+    "ft_cf": "1",          # 作用范围: 评论
+    "ft_thresh": "70",     # 判定阈值(%), 越高越宽松(70=概率≥0.70 才拦)
+    "ft_labels": "flame,spam,clickbait,yy",   # 启用哪些标签(逗号分隔)
     # v0.3.1.34 信息打开方式(桌面窗口壳): 1=点开信息弹独立悬浮窗(默认; 悬浮窗可塞回标签页,
     # 标签页也能拖出成悬浮窗) 0=旧的标签页内打开。仅桌面壳生效, 安卓/浏览器忽略。
     "ui_new_window": "1",
@@ -466,6 +476,7 @@ _funnel = {"day": today(), "counts": {}}
 _FUNNEL_LABELS = {
     "fetched": "抓回候选", "partition": "分区不符", "age": "超时间窗", "news": "资讯保鲜",
     "views": "播放量窗口", "duration": "时长窗口", "emotion": "情绪/广告过滤", "dislike": "厌恶词",
+    "ft": "快速文本分析",
     "blocklist": "拉黑名单", "help": "求助帖", "xhh": "小黑盒筛选", "dedup": "重复标题",
     "follow_window": "关注超强调窗", "cooldown": "展示冷却", "cooldown_relaxed": "冷却不足复用", "ai_gate": "AI门禁", "kept": "最终入池",
     "pref_fetch": "偏好·搜到", "pref_kept": "偏好·入池", "pref_drop": "偏好·被拦",
@@ -7519,6 +7530,14 @@ def machine_filter(items):
             if why:
                 _funnel_bump("emotion")
                 continue   # 情绪过滤器: 轰炸/引战/标题党(标题) + 广告引流(简介), 纯规则零token
+        # v0.3.1.43dsk 快速文本分析: 规则层没抓到的语义垃圾(引战/低质/标题党/阴阳怪气)
+        # 交给本地 fastText 兜一遍。词表命中的上面已经拦了, 这里只处理"词表覆盖不到"的。
+        # 只在 m_emotion 之后跑 —— 省一次模型调用, 也让漏斗计数各归各的。
+        if ft_enabled() and sget("ft_video") == "1":
+            _w = ft_scan([(it.get("title") or "") + " " + (it.get("desc") or "")], "video")[0]
+            if _w:
+                _funnel_bump("ft")
+                continue
         if dedup:
             fp = _title_fp(it["title"])
             if fp in seen_titles:
@@ -8523,6 +8542,235 @@ def _ad_bad(it):
     if any(k in d for k in AD_HARD):
         return True
     return sum(1 for k in AD_SOFT if k in d) >= 2
+
+
+# ---------------------------------------------------------------- 快速文本分析(fastText 本地小模型)
+# v0.3.1.43dsk: 内置一个约 60MB 的中文 fastText 多标签分类模型, 在**本地**判断
+# "这条文本是不是引战/低质/标题党/阴阳怪气" —— 零 token、零联网、纯 CPU。
+#
+# 定位(与既有两层的关系):
+#   · 账号身份层(弹幕/评论筛选: 黑名单/等级/简介/抽奖号) 判"谁发的" —— 本模块不参与。
+#   · 规则层(_emo_bad 词表/正则) 判"命中没命中固定词" —— 覆盖不到的就漏。
+#   · 本模块判"语义像不像垃圾话" —— 补规则层的漏, 且不烧 token(补 AI 层的贵)。
+# 总开关 ft_on 与 m_dm_on / cf_* 相互独立: 那两组关掉不影响这里, 反之亦然。
+_FT = {"m": None, "err": "", "path": "", "loaded_at": 0, "tried": False}
+_FT_LOCK = threading.Lock()
+_FT_WS = re.compile(r"\s+")
+# 标签 → 用户看得懂的原因文案(面板「显示屏蔽」拿它做行内标签)
+_FT_WHY = {"flame": "引战", "spam": "低质", "clickbait": "标题党",
+           "yy": "阴阳怪气", "neg": "负面"}
+_FT_ALL = ("flame", "spam", "clickbait", "yy", "neg")
+_FT_MAXLEN = 64          # ★ 必须与 build_corpus.py 的 MAXLEN 一致
+_FT_CACHE = {}           # 文本 → 原因(空串=放行)。弹幕/评论重复率极高, 这一层最省 CPU。
+_FT_CACHE_CAP = 40000
+_FT_CACHE_SIG = [None]   # 缓存对应的配置签名(标签集合+阈值); 配置一变就整表作废
+
+
+def _ft_path():
+    """定位模型文件: 兼容 PyInstaller onefile(_MEIPASS 解包目录) 与源码运行。"""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    for p in (os.path.join(base, "model", "ft_model.bin"),
+              os.path.join(base, "ft_model.bin"),
+              os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "ft_model.bin"),
+              os.path.join(DATA_DIR, "ft_model.bin")):
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def ft_load():
+    """惰性加载模型(线程安全)。失败不抛异常, 只记 err —— 绝不能让筛选功能拖垮主流程。
+
+    ★ 用自研的纯 stdlib 运行时 ftrt, 不用官方 fasttext 包:
+      本产品打包走 Python 3.14, 而 fasttext 只有源码包(要 MSVC), 社区预编译 wheel
+      最高 cp311 —— 在 exe 里 import fasttext 必然失败。详见 ftrt.py 顶部说明。
+    """
+    with _FT_LOCK:
+        if _FT["m"] is not None:
+            return _FT["m"]
+        if _FT["tried"] and _FT["err"]:
+            return None
+        _FT["tried"] = True
+        p = _ft_path()
+        _FT["path"] = p
+        if not p:
+            _FT["err"] = "模型文件缺失(未随包分发?)"
+            return None
+        try:
+            import ftrt
+            _FT["m"] = ftrt.FastTextLite(p, maxlen=_FT_MAXLEN, temp=3.0)
+            _FT["loaded_at"] = int(time.time())
+            _FT["err"] = ""
+        except Exception as e:
+            _FT["err"] = "%s: %s" % (type(e).__name__, str(e)[:160])
+        return _FT["m"]
+
+
+def ft_enabled():
+    """总开关 + 模型可用。任何一步不满足都当作"不启用", 调用方直接放行。"""
+    if sget("ft_on") != "1":
+        return False
+    return ft_load() is not None
+
+
+def _ft_tok(t):
+    """与训练脚本 build_corpus.py 的 tok() 必须逐字一致: **整句不切字**, 只折叠空白。
+
+    中文靠模型自带的字符级 n-gram(minn=2..maxn=4)自动切, 手工分词反而更差。
+    """
+    t = _FT_WS.sub(" ", str(t or "")).strip()
+    t = t.replace("\u200b", "").replace("\ufeff", "")
+    return t[:_FT_MAXLEN]
+
+
+def ft_labels_on():
+    """启用中的标签集合(设置里可勾)。非法/空 → 退回默认四个。"""
+    raw = (sget("ft_labels") or "").strip()
+    got = set(x.strip() for x in raw.split(",") if x.strip()) & set(_FT_ALL)
+    return got or set(("flame", "spam", "clickbait", "yy"))
+
+
+def ft_scan(texts, kind="video"):
+    """批量判定。返回与 texts 等长的列表, 元素为命中原因(空串=放行)。
+
+    kind: video / dm / cf —— 各自有独立的作用范围开关, 关掉则整批放行。
+    """
+    n = len(texts)
+    blank = [""] * n
+    if n == 0:
+        return blank
+    if sget("ft_on") != "1":
+        return blank
+    scope = {"video": "ft_video", "dm": "ft_dm", "cf": "ft_cf"}.get(kind, "ft_video")
+    if sget(scope) != "1":
+        return blank
+    m = ft_load()
+    if m is None:
+        return blank
+    want = ft_labels_on()
+    try:
+        thr = max(0.05, min(0.99, float(sget("ft_thresh") or 70) / 100.0))
+    except Exception:
+        thr = 0.70
+
+    out = list(blank)
+    labels = m.labels
+    if not (set(labels) & want):
+        return out
+    # ★ 缓存键只含文本, 所以判定口径一变(勾选的标签/阈值)必须整表作废,
+    #   否则用户改了设置却看不到变化 —— 这是实测踩到的坑。
+    sig = (",".join(sorted(want)), round(thr, 4))
+    if _FT_CACHE_SIG[0] != sig:
+        _FT_CACHE.clear()
+        _FT_CACHE_SIG[0] = sig
+    for i, raw in enumerate(texts):
+        t = _ft_tok(raw)
+        if len(t) < 3:            # 空/纯标点不进模型
+            continue
+        hit = _FT_CACHE.get(t)
+        if hit is None:
+            try:
+                sc = m.scores(t)
+            except Exception:
+                continue
+            best, bestp = "", 0.0
+            for li, name in enumerate(labels):
+                if name in want and sc[li] > bestp:
+                    best, bestp = name, sc[li]
+            hit = _FT_WHY.get(best, best) if (best and bestp >= thr) else ""
+            if len(_FT_CACHE) < _FT_CACHE_CAP:
+                _FT_CACHE[t] = hit
+        if hit:
+            out[i] = hit
+    return out
+
+
+def ft_probe(text):
+    """单条文本的**原始**判定结果 —— 给设置页「试一下」用。
+
+    与 ft_scan 的区别: ft_scan 只回"拦不拦", 这里回完整的标签概率排名。
+    用户能直接看见模型到底怎么想, 调阈值/勾标签时心里有数 —— 否则这功能
+    对用户就是个黑盒(调了阈值却不知道为什么拦/不拦)。
+    """
+    if sget("ft_on") != "1":
+        return {"ok": False, "reason": "快速文本分析总开关未开启"}
+    m = ft_load()
+    if m is None:
+        return {"ok": False, "reason": _FT["err"] or "模型未加载"}
+    t = _ft_tok(text)
+    if len(t) < 3:
+        return {"ok": False, "reason": "文本太短(不足 3 个字, 不进模型)"}
+    try:
+        sc = m.scores(t)
+    except Exception as e:
+        return {"ok": False, "reason": "%s: %s" % (type(e).__name__, str(e)[:80])}
+    labels = m.labels
+    rows = sorted(((sc[i], labels[i]) for i in range(len(labels))), reverse=True)
+    if not rows:
+        return {"ok": False, "reason": "模型标签表为空"}
+    want = ft_labels_on()
+    try:
+        thr = max(0.05, min(0.99, float(sget("ft_thresh") or 70) / 100.0))
+    except Exception:
+        thr = 0.70
+    best_p, best_l = rows[0]
+    hit = bool(best_l in want and best_p >= thr)
+    return {"ok": True,
+            "text": t,
+            "label": best_l,
+            "name": _FT_WHY.get(best_l, best_l),
+            "score": round(best_p, 4),
+            "hit": hit,
+            "picked": best_l in want,
+            "thresh": round(thr, 4),
+            "why": (_FT_WHY.get(best_l, best_l) if hit else ""),
+            "top": [{"label": l, "name": _FT_WHY.get(l, l), "score": round(p, 4)}
+                    for p, l in rows[:5]]}
+
+
+def ft_status():
+    """给设置页显示的状态(不触发加载, 只看已加载状态 + 文件是否存在)。"""
+    p = _FT["path"] or _ft_path()
+    size = os.path.getsize(p) if p and os.path.isfile(p) else 0
+    labels = []
+    m = _FT["m"]
+    if m is not None:
+        try:
+            labels = list(m.labels)
+        except Exception:
+            labels = []
+    return {"on": sget("ft_on") == "1",
+            "ready": m is not None,
+            "path": p,
+            "size_mb": round(size / 1048576.0, 1),
+            "err": _FT["err"],
+            "labels": labels,
+            "loaded_at": _FT["loaded_at"],
+            "has_module": _ft_module_ok(),
+            "cache": len(_FT_CACHE)}
+
+
+def _ft_module_ok():
+    """运行期 ftrt 这个模块本身能不能用(和模型文件是否存在是两回事)。"""
+    try:
+        import ftrt
+        return hasattr(ftrt, "FastTextLite")
+    except Exception:
+        return False
+
+
+def ft_warmup():
+    """后台预热: 打开开关后立刻把模型读进内存, 免得第一次筛选卡一下。"""
+    def _run():
+        try:
+            if sget("ft_on") == "1":
+                ft_load()
+        except Exception:
+            pass
+    try:
+        threading.Thread(target=_run, name="ft-warmup", daemon=True).start()
+    except Exception:
+        pass
 
 
 def tmp_block_kws():
@@ -9892,7 +10140,7 @@ class Handler(BaseHTTPRequestHandler):
     # 只有这几个"不含任何凭据、只回开关键/布尔标记"的端点对 B 站源回显 ACAO,
     # 其余端点(含 ai_key 的)一律不给。
     _CORS_PATHS = ("/api/ui_settings", "/api/bili/flags", "/api/bili/dmflags",
-                   "/api/bili/dmmid", "/api/bili/names")
+                   "/api/bili/dmmid", "/api/bili/names", "/api/textfilter")
 
     def _cors_headers(self):
         """对 B站源回显 ACAO。预检(OPTIONS)与实际请求(POST)必须回同一个值,
@@ -10168,11 +10416,13 @@ class Handler(BaseHTTPRequestHandler):
                     "m_news_fresh", "m_play_related", "xhh_comm", "xhh_topic", "bili_follow_emph", "bili_follow_months",
                     "m_cold_start_n", "cf_blk_on", "cf_min_level",
                     "m_block_mystery_bio", "m_block_lottery", "m_block_empty_space",
-                    "m_dm_multicand", "m_filter_speed", "m_dm_on")
+                    "m_dm_multicand", "m_filter_speed", "m_dm_on",
+                    "ft_on", "ft_video", "ft_dm", "ft_cf", "ft_thresh", "ft_labels")
             enabled = enabled_source_ids()
             blocked = [{"name": r[0], "ts": r[1]} for r in
                        db().execute("SELECT name, ts FROM ablock ORDER BY ts DESC").fetchall()]
             return self.send_json({"settings": {k: sget(k) for k in keys},
+                                   "ft": ft_status(),
                                    "source_groups": [{"id": g[0], "name": g[1], "on": g[0] in enabled}
                                                      for g in SOURCE_GROUPS],
                                    "blocked": blocked,
@@ -10397,6 +10647,8 @@ class Handler(BaseHTTPRequestHandler):
                               lvl=max(0, min(5, _lvl)),
                               multi=max(0, min(2, _mc)))
             return self.send_json({"ok": True} | r)
+        if path == "/api/textfilter/status":
+            return self.send_json({"ok": True} | ft_status())
         if path == "/api/bili/dmmid":
             # 弹幕列表点「发送者」→ 逆推 midHash 找主页。点击场景可以等一两秒:
             # 完整逆推(2..10位) + card 接口验真; 多候选时原样回给前端让用户自己挑。
@@ -10451,6 +10703,32 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": False, "error": "无效的页面租约请求"}, 400)
             ok = page_lease_alive(token) if action == "alive" else page_lease_leaving(token)
             return self.send_json({"ok": ok, "grace_seconds": PAGE_LEASE_GRACE_SECONDS})
+
+        if path == "/api/textfilter":
+            # v0.3.1.43dsk 快速文本分析: 页面脚本(弹幕/评论筛选)把本页的**文本**送过来,
+            # 问"这几条该不该拦"。纯本地 fastText 前向, 零联网、零 token。
+            # 关键路径约束: 这是弹幕/评论加载路径上的一次同步等待, 必须快 ——
+            # 纯 Python 运行时实测 5,000~9,000 条/秒(带缓存更快), 500 条 ≈ 50ms。
+            # 未开启/模型缺失 → on=False, 前端原样放行(绝不因为筛选功能坏掉而卡住页面)。
+            kind = (body.get("kind") or "dm")
+            if kind not in ("video", "dm", "cf"):
+                kind = "dm"
+            texts = body.get("texts")
+            if not isinstance(texts, list):
+                texts = []
+            texts = [str(t)[:_FT_MAXLEN] for t in texts[:1200]]
+            if not ft_enabled():
+                return self.send_json({"ok": True, "on": False, "why": [""] * len(texts)})
+            whys = ft_scan(texts, kind)
+            return self.send_json({"ok": True, "on": True, "why": whys})
+
+        if path == "/api/textfilter/probe":
+            # v0.3.1.43dsk 设置页「试一下」: 输入一句话, 看模型判成什么、多少概率。
+            # 同源(127.0.0.1 设置页)调用, 不需要 CORS。
+            try:
+                return self.send_json({"ok": True, **ft_probe(body.get("text") or "")})
+            except Exception as e:
+                return self.send_json({"ok": False, "reason": "%s: %s" % (type(e).__name__, str(e)[:100])})
 
         if path == "/api/bili/names":
             # bilibili-cfilter 从评论响应里顺手收集的 (作者昵称, mid) 对 → name_mid 索引。
@@ -10577,11 +10855,14 @@ class Handler(BaseHTTPRequestHandler):
                       "m_news_fresh", "m_play_related", "xhh_comm", "xhh_topic", "bili_follow_emph", "bili_follow_months",
                     "m_cold_start_n", "cf_blk_on", "cf_min_level",
                       "m_block_mystery_bio", "m_block_lottery", "m_block_empty_space",
-                      "m_dm_multicand", "m_filter_speed", "m_dm_on"):
+                      "m_dm_multicand", "m_filter_speed", "m_dm_on",
+                      "ft_on", "ft_video", "ft_dm", "ft_cf", "ft_thresh", "ft_labels"):
                 if k in body:
                     sset(k, body[k])
             if "m_cold_start_n" in body:
                 persist_cold_cache(force=True)   # 上限改动立即重存当前池快照
+            if "ft_on" in body:
+                ft_warmup()                      # 开关一动就在后台把模型读进来(或确认不需要)
             if "m_sources" in body:   # 允许的来源/分区 id 列表
                 sset("m_sources", json.dumps(body["m_sources"]))
                 n = purge_items_by_parts(enabled_source_ids())   # 切分区后清旧池

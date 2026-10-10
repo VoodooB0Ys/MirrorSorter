@@ -27,7 +27,7 @@ set /p "APPNAME=" < web\_appname.txt
 del web\_appname.txt >nul 2>nul
 if not defined APPNAME set "APPNAME=洞鉴虚明"
 echo 版本名: %APPNAME%
-%PYCMD% -m PyInstaller --noconfirm --clean --onefile --noconsole --add-data "web;web" --add-data "extensions;extensions" --add-data "WebView2Runtime;WebView2Runtime" --icon djxm_icon_128x128.ico --name %APPNAME% app_window.py
+%PYCMD% -m PyInstaller --noconfirm --clean --onefile --noconsole --add-data "web;web" --add-data "extensions;extensions" --add-data "WebView2Runtime;WebView2Runtime" --add-data "model;model" --hidden-import ftrt --icon djxm_icon_128x128.ico --name %APPNAME% app_window.py
 if errorlevel 1 (
   echo.
   echo [错误] 打包失败，请把上面的报错信息截图反馈。

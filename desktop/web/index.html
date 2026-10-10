@@ -241,7 +241,7 @@
         </div>
       </details>
 
-      <footer>洞鉴虚明 v0.3.1.42dsk<br>数据只存本机</footer>
+      <footer>洞鉴虚明 v0.3.1.43dsk<br>数据只存本机</footer>
     </div>
   </aside>
 
@@ -590,6 +590,7 @@
     <div class="acct-tabs">
       <button id="cfTabGeneral" class="tab on">通用</button>
       <button id="cfTabBili" class="tab">B站</button>
+      <button id="cfTabText" class="tab">快速文本分析</button>
     </div>
     <div class="modal-body">
       <!-- 通用页（预留） -->
@@ -645,6 +646,58 @@
           </div>
           <p class="tip">后台「逆推哈希」「补账号画像」的并行档位。<b>快速</b>（默认）比旧版快 8～13 倍。<b>并发只掩盖网络延迟，真正限速的是每秒请求数</b>；撞风控自动砍半，5 分钟恢复。<b>极速</b>请求量约默认两倍，风险自评。</p>
           <button id="cfSave" class="row-btn">保存弹幕评论筛选设置</button>
+        </div>
+      </div>
+      <!-- 快速文本分析页 -->
+      <div id="cfText" class="hidden">
+        <div class="m-group">
+          <label class="m-row"><input type="checkbox" id="ftOn"><span><b>快速文本分析总开关</b></span></label>
+          <p class="tip">
+            用<b>内置的本地小模型</b>判断「这条内容说了什么」——引战、低质、标题党、阴阳怪气。
+            纯本地运行，<b>不联网、不消耗 AI 额度</b>，也不看发送者是谁。
+            <br>与上面的「弹幕屏蔽总开关」「评论筛选」<b>完全独立</b>：上面管「谁发的」，这里管「发了什么」，各开各的。
+          </p>
+          <p class="tip" id="ftStatus">模型状态：读取中…</p>
+        </div>
+        <div class="m-group">
+          <div class="m-row"><span><b>试一下</b></span></div>
+          <div id="ftProbeRow">
+            <input type="text" id="ftProbeIn" maxlength="64"
+                   placeholder="例：赢麻了，又是魂游 / 震惊！99%的人不知道">
+            <button id="ftProbeBtn" type="button">判定</button>
+          </div>
+          <p class="tip" id="ftProbeOut">模型只按「这句话说了什么」判断，跟谁发的无关。改完上面的设置后先点保存，再试。</p>
+        </div>
+        <div class="m-group">
+          <div class="m-row"><span>作用范围</span></div>
+          <label class="m-row"><input type="checkbox" id="ftVideo" checked><span>信息筛选（视频标题 + 简介 / 帖子标题 + 摘要）</span></label>
+          <label class="m-row"><input type="checkbox" id="ftDm" checked><span>弹幕</span></label>
+          <label class="m-row"><input type="checkbox" id="ftCf" checked><span>评论</span></label>
+          <p class="tip">三个通道各自独立勾选。不勾的通道完全不受影响。</p>
+        </div>
+        <div class="m-group">
+          <div class="m-row"><span>判定标签</span></div>
+          <label class="m-row"><input type="checkbox" id="ftLabFlame" checked><span>引战 / 辱骂（攻击性语言）</span></label>
+          <label class="m-row"><input type="checkbox" id="ftLabSpam" checked><span>低质 / 广告（垃圾营销、无信息量）</span></label>
+          <label class="m-row"><input type="checkbox" id="ftLabClickbait" checked><span>标题党（震惊体、悬念体、数字党）</span></label>
+          <label class="m-row"><input type="checkbox" id="ftLabYy" checked><span>阴阳怪气（赢麻了 / 典 / 急了 / 又是X）</span></label>
+          <label class="m-row"><input type="checkbox" id="ftLabNeg"><span>负面情绪（纯抱怨、贩卖焦虑）</span></label>
+          <p class="tip">勾上的标签才参与拦截。默认不勾「负面情绪」——正常吐槽也会被它命中，误伤偏多。</p>
+        </div>
+        <div class="m-group">
+          <div class="m-row"><span>判定阈值</span>
+            <div class="row" id="ftThreshRow">
+              <button data-v="50" class="seg">50 宽松</button>
+              <button data-v="70" class="seg on">70 标准</button>
+              <button data-v="85" class="seg">85 严格</button>
+              <button data-v="93" class="seg">93 极严</button>
+            </div>
+          </div>
+          <p class="tip">
+            模型给出的概率超过该值才拦。<b>70</b>（默认）平衡最好；
+            调低拦得多但会误伤正常内容，调高更保守但漏得多。
+          </p>
+          <button id="ftSave" class="row-btn">保存快速文本分析设置</button>
         </div>
       </div>
     </div>

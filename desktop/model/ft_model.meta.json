@@ -1,0 +1,24 @@
+{
+  "labels": [
+    "ok",
+    "yy",
+    "clickbait",
+    "flame",
+    "spam",
+    "neg"
+  ],
+  "dim": 100,
+  "bucket": 140000,
+  "nwords": 12131,
+  "minn": 2,
+  "maxn": 4,
+  "eos_id": 0,
+  "epoch": 25,
+  "lr": 0.05,
+  "minCount": 5,
+  "maxlen": 64,
+  "note": "自研紧凑格式, 只能由 ftrt.py 读取, 不是 fastText 官方 .bin",
+  "source": "ft_big.bin",
+  "source_size_mb": 58.45,
+  "export_size_mb": 58.38
+}

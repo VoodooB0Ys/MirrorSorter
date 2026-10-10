@@ -928,3 +928,15 @@ body.hide-reason .card .reason { display:none !important; }
   .card, .card h3, .card .desc, .card .meta-text { user-select:none; -webkit-user-select:none;
                                                    -webkit-touch-callout:none; }
 }
+
+/* ---- 快速文本分析 · 「试一下」 ---- */
+#ftProbeRow { display:flex; gap:8px; align-items:center; }
+#ftProbeIn { flex:1 1 auto; min-width:0; background:var(--input); border:1px solid var(--line);
+             color:var(--txt); border-radius:6px; padding:6px 8px; font-size:12px; }
+#ftProbeIn:focus { outline:none; border-color:var(--accent); }
+#ftProbeBtn { flex:0 0 auto; background:var(--soft); border:1px solid var(--accent);
+              color:var(--accent); border-radius:6px; padding:6px 12px; font-size:12px; cursor:pointer; }
+#ftProbeBtn:disabled { opacity:.5; cursor:default; }
+#ftProbeOut { white-space:pre-wrap; }
+#ftProbeOut .hit { color:#e35d5d; font-weight:600; }
+#ftProbeOut .pass { color:#3aa76d; font-weight:600; }

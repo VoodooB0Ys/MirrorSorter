@@ -64,6 +64,9 @@
   var LOT = DM_ON && !!CF.lottery;
   var EMPTY = DM_ON && !!CF.empty;
   var NEED_FLAGS = MYSTERY || LOT || EMPTY || LV > 0;
+  /* v0.3.1.43dsk: 「快速文本分析」对弹幕生效(CF.ft_dm, 由壳在总开关+作用范围都开时注入 true)。
+     与账号画像完全独立 —— 那是"谁发的", 这是"说了什么"。两者可以各自单独开。 */
+  var NEED_TEXT = DM_ON && !!CF.ft_dm;
   var BLKH = null;                       // 黑名单用户的 midHash 集合(O(1) 查表, 不是逐条扫描)
   if (DM_ON && CF.blk_on && CF.dmhash && CF.dmhash.length) {
     BLKH = Object.create(null);
@@ -257,6 +260,80 @@
     }, RETRY_GAP);
   }
 
+  /* ---------------- 快速文本分析(本地 fastText): 按弹幕**内容**判定 ----------------
+   * 壳里跑着一个约 58MB 的中文多标签模型(引战/低质/标题党/阴阳怪气/负面), 纯本地前向,
+   * 零联网零 token。这里只负责把本段弹幕的**文本**批量送过去, 拿回"该拦的原因标签"。
+   *
+   * 关键路径约束与 askFlags 完全一致:
+   *   · 用 text/plain 免 CORS 预检(否则 OPTIONS 往返会把等待翻倍);
+   *   · 最多等 TXT_WAIT, 超时就降级成"只预热不等" —— 之后的段仍然会命中壳的缓存,
+   *     而且 refilter() 会把新拿到的标记补到「弹幕列表」上, 不会永久漏筛;
+   *   · 壳端未开启/模型缺失 → on:false, 这里直接停发(绝不因为筛选功能坏掉拖慢页面)。
+   */
+  var TXTWHY = Object.create(null);      // 弹幕文本 -> 原因标签(空串=放行)
+  var TXTASKED = Object.create(null);
+  var TXT_OFF = 0, TXT_FAST = 1, TXT_WAIT = 400;
+  var TXT_N = 0, TXT_OID = "", TXT_TOTAL = 4000, TXT_PER = 700;   // 每视频配额 / 单次上限
+
+  function applyText(need, j) {
+    if (!j || j.ok !== true) return;
+    if (j.on !== true) { TXT_OFF = 1; return; }     // 壳侧没开 → 之后不再发请求
+    var w = j.why || [], got = false, k, v;
+    for (k = 0; k < need.length; k++) {
+      v = w[k] || "";
+      if (TXTWHY[need[k]] !== v) { TXTWHY[need[k]] = v; got = true; }
+    }
+    if (got) refilter();      // 内容标记变了 → 列表立刻重算(保留/屏蔽两边都动)
+  }
+  function askText(texts, wait) {
+    if (!NEED_TEXT || TXT_OFF || !texts || !texts.length) return Promise.resolve();
+    if (TXT_OID !== FEED.oid) { TXT_OID = FEED.oid; TXT_N = 0; }
+    var need = [], i, t;
+    for (i = 0; i < texts.length && need.length < TXT_PER; i++) {
+      t = texts[i];
+      if (!t) continue;
+      if (t.length > 64) t = t.slice(0, 64);        // 与壳/训练的 64 字上限一致
+      if (TXTASKED[t]) continue;
+      if (TXT_N >= TXT_TOTAL) break;
+      TXTASKED[t] = 1; TXT_N++; need.push(t);
+    }
+    if (!need.length) return Promise.resolve();
+    var port = String(window.__MSX_PORT__ || "8000");
+    var req = {
+      method: "POST", cache: "no-store", credentials: "omit",
+      targetAddressSpace: "loopback",
+      headers: { "Content-Type": "text/plain;charset=UTF-8" },
+      body: JSON.stringify({ kind: "dm", texts: need })
+    };
+    function undo() { for (var k = 0; k < need.length; k++) delete TXTASKED[need[k]]; }
+    if (!wait || !TXT_FAST) {                       // 只预热, 不等(不影响当次)
+      try {
+        fetch("http://127.0.0.1:" + port + "/api/textfilter", req)
+          .then(function (r) { return r.json(); })
+          .then(function (j) { applyText(need, j); })
+          .catch(undo);
+      } catch (e) { undo(); }
+      return Promise.resolve();
+    }
+    return new Promise(function (res) {
+      var done = 0, tm = 0;
+      var back = function (ok) {
+        if (done) return;
+        done = 1;
+        if (tm) { try { clearTimeout(tm); } catch (e) {} }
+        if (!ok) { TXT_FAST = 0; undo(); }
+        res();
+      };
+      tm = setTimeout(function () { back(false); }, TXT_WAIT);
+      try {
+        fetch("http://127.0.0.1:" + port + "/api/textfilter", req)
+          .then(function (r) { return r.json(); })
+          .then(function (j) { applyText(need, j); back(true); })
+          .catch(function () { back(false); });
+      } catch (e) { back(false); }
+    });
+  }
+
   /* 单条弹幕被屏蔽的原因(空串 = 保留)。面板「显示屏蔽」拿它做行内标签,
      让用户看得见"这条到底为什么被筛掉了" —— 否则筛选设置对用户就是个黑盒。 */
   function blkWhy(o) {
@@ -275,6 +352,12 @@
         var n = Number(f.multi) || 1;
         return n > 1 ? (w + "·" + n + "候选") : w;
       }
+    }
+    /* 内容判定放最后: 账号级规则(黑名单/画像)是铁证, 优先显示; 都没有才看文本。
+       TXTWHY 里存的就是壳端给的中文原因(引战/低质/标题党/阴阳怪气/负面)。 */
+    if (NEED_TEXT) {
+      var t = o.text ? String(o.text).slice(0, 64) : "";
+      if (t && TXTWHY[t]) return TXTWHY[t];
     }
     return "";
   }
@@ -479,7 +562,18 @@
     return { out: out, hashes: hashes, rows: rows, hrows: hrows, raw: raw };
   }
 
-  /* fetch 路径: 先问壳要标记(最多等 ASK_WAIT, 超时过就 0 等待), 再同步过滤改写 */
+  /* fetch 路径: 先问壳要标记(最多等 ASK_WAIT/TXT_WAIT, 超时过就 0 等待), 再同步过滤改写 */
+  function textsOf(top) {
+    var out = [], seen = {}, i, t;
+    for (i = 0; i < top.elems.length; i++) {
+      t = top.elems[i].o.text;
+      if (!t) continue;
+      if (t.length > 64) t = t.slice(0, 64);
+      if (seen[t]) continue;
+      seen[t] = 1; out.push(t);
+    }
+    return out;
+  }
   function processAsync(u8) {
     var top = pbTop(u8);
     if (!top) return Promise.resolve({ out: null, hashes: [], rows: [], hrows: [], raw: [] });
@@ -488,9 +582,12 @@
       var h = top.elems[i].o.h;
       if (h && !hseen[h]) { hseen[h] = 1; hashes.push(String(h).toLowerCase()); }
     }
-    return askFlags(hashes, true).then(function () {
-      return process(u8);
-    });
+    /* 两条请求并行等: 账号画像最多 100ms, 文本最多 400ms。任一条超时都只是"这一轮先不筛",
+       绝不卡住播放器 —— 拿不到的部分之后会被 refilter() 补上, 不会永久漏筛。 */
+    return Promise.all([askFlags(hashes, true), askText(textsOf(top), true)])
+      .then(function () {
+        return process(u8);
+      });
   }
 
   /* ---------------- 自取缺失分段(补全弹幕列表) ----------------
@@ -575,10 +672,15 @@
         .then(function (buf) {
           if (!buf) return;
           if (SELF.gen !== myGen || FEED.oid !== myOid) return;   // 换视频了 → 丢弃这批
-          var r = process(new Uint8Array(buf));
+          var u8 = new Uint8Array(buf);
+          var top = pbTop(u8);
+          var r = process(u8);
           markSeg(si);                                             // 解析完成才记账
           feedAdd(r.raw);
           askFlags(r.hashes, false);
+          /* 自取分段只喂「弹幕列表」, 不参与播放器字节流 → 文本判定走**非阻塞**预热,
+             拿回来由 applyText → refilter() 更新列表, 不拖慢补段节奏。 */
+          askText(top ? textsOf(top) : [], false);
         })
         .catch(function () {})
         .then(function () {

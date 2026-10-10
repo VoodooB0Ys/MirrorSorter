@@ -2671,6 +2671,7 @@ async function loadCommentFilter() {
   if ($("#cfSpeedRow")) $("#cfSpeedRow").querySelectorAll(".seg").forEach((b) =>
     b.classList.toggle("on", b.dataset.v === sp));
   cfDmGate();
+  loadFtSettings();   // 快速文本分析是独立一组，跟这里一起刷新
 }
 /* 弹幕总开关关掉时, 把"只对弹幕生效"的那几行置灰(仍可点, 只是提示当前不生效) */
 function cfDmGate() {
@@ -2693,11 +2694,14 @@ try { $("#commentFilterModal").addEventListener("click", (e) => {
 function cfTab(name) {
   $("#cfTabGeneral").classList.toggle("on", name === "general");
   $("#cfTabBili").classList.toggle("on", name === "bili");
+  $("#cfTabText").classList.toggle("on", name === "text");
   $("#cfGeneral").classList.toggle("hidden", name !== "general");
   $("#cfBili").classList.toggle("hidden", name !== "bili");
+  $("#cfText").classList.toggle("hidden", name !== "text");
 }
 try { $("#cfTabGeneral").onclick = () => cfTab("general"); } catch (_e) { _bmiss("#cfTabGeneral", _e); }
 try { $("#cfTabBili").onclick = () => cfTab("bili"); } catch (_e) { _bmiss("#cfTabBili", _e); }
+try { $("#cfTabText").onclick = () => cfTab("text"); } catch (_e) { _bmiss("#cfTabText", _e); }
 try { $("#cfLvlRow").querySelectorAll(".seg").forEach((b) => b.addEventListener("click", () => {
   $("#cfLvlRow").querySelectorAll(".seg").forEach((x) => x.classList.toggle("on", x === b));
 })); } catch (_e) { _bmiss("#cfLvlRow", _e); }
@@ -2751,6 +2755,131 @@ try { $("#cfSave").onclick = async () => {
   }
   loadCommentFilter();
 }; } catch (_e) { _bmiss("#cfSave", _e); }
+
+/* ---------- 快速文本分析（本地 fastText 小模型；独立于弹幕/评论总开关） ---------- */
+const FT_LABS = [["flame", "#ftLabFlame"], ["spam", "#ftLabSpam"],
+                 ["clickbait", "#ftLabClickbait"], ["yy", "#ftLabYy"], ["neg", "#ftLabNeg"]];
+function ftRenderStatus(ft) {
+  const el = $("#ftStatus");
+  if (!el) return;
+  ft = ft || {};
+  const parts = [];
+  if (ft.size_mb) parts.push("模型 " + ft.size_mb + " MB");
+  if (ft.labels && ft.labels.length) parts.push("标签 " + ft.labels.join("/"));
+  if (ft.ready) parts.push("已加载");
+  let txt = "模型状态：" + (parts.length ? parts.join(" · ") : "未加载");
+  if (ft.err) txt += "　⚠️ " + ft.err;
+  else if (!ft.has_module) txt += "　⚠️ 缺少本地推理模块（ftrt.py 未随包分发）";
+  el.textContent = txt;
+}
+async function loadFtSettings() {
+  let d = {};
+  try { d = await api("/api/machine"); } catch (_e) { d = {}; }
+  const s = d.settings || {};
+  if ($("#ftOn")) $("#ftOn").checked = s.ft_on === "1";
+  if ($("#ftVideo")) $("#ftVideo").checked = s.ft_video !== "0";
+  if ($("#ftDm")) $("#ftDm").checked = s.ft_dm !== "0";
+  if ($("#ftCf")) $("#ftCf").checked = s.ft_cf !== "0";
+  const labs = String(s.ft_labels == null || s.ft_labels === ""
+    ? "flame,spam,clickbait,yy" : s.ft_labels).split(",");
+  FT_LABS.forEach(([k, sel]) => {
+    if ($(sel)) $(sel).checked = labs.indexOf(k) >= 0;
+  });
+  const th = String(s.ft_thresh == null || s.ft_thresh === "" ? "70" : s.ft_thresh);
+  if ($("#ftThreshRow")) $("#ftThreshRow").querySelectorAll(".seg").forEach((b) =>
+    b.classList.toggle("on", b.dataset.v === th));
+  ftRenderStatus(d.ft);
+  ftGate();
+}
+/* 总开关关掉时把下面的细项置灰（仍可点，只是提示当前不生效） */
+function ftGate() {
+  const on = !$("#ftOn") || $("#ftOn").checked;
+  const box = $("#cfText");
+  if (!box) return;
+  box.querySelectorAll(".m-group").forEach((g, i) => {
+    if (i === 0) return;                  // 第一组就是总开关本身，不置灰
+    g.style.opacity = on ? "" : "0.45";
+    g.style.pointerEvents = on ? "" : "none";
+  });
+}
+try { $("#ftOn").addEventListener("change", ftGate); } catch (_e) { _bmiss("#ftOn", _e); }
+try { $("#ftThreshRow").querySelectorAll(".seg").forEach((b) => b.addEventListener("click", () => {
+  $("#ftThreshRow").querySelectorAll(".seg").forEach((x) => x.classList.toggle("on", x === b));
+})); } catch (_e) { _bmiss("#ftThreshRow", _e); }
+try { $("#ftSave").onclick = async () => {
+  const thOn = $("#ftThreshRow .seg.on");
+  const wantTh = String((thOn && thOn.dataset.v) || 70);
+  const wantLabs = FT_LABS.filter(([k, sel]) => $(sel) && $(sel).checked).map(([k]) => k).join(",");
+  const payload = {
+    ft_on: $("#ftOn").checked ? "1" : "0",
+    ft_video: $("#ftVideo").checked ? "1" : "0",
+    ft_dm: $("#ftDm").checked ? "1" : "0",
+    ft_cf: $("#ftCf").checked ? "1" : "0",
+    ft_thresh: wantTh,
+    ft_labels: wantLabs,
+  };
+  try {
+    await api("/api/machine", { method: "POST", body: payload });
+    // 回读校验：以前后端不可达 / 键被白名单吞掉时会静默失败，界面照样弹"已保存"
+    const d = await api("/api/machine");
+    const s = (d && d.settings) || {};
+    const okTh = String(s.ft_thresh == null || s.ft_thresh === "" ? "70" : s.ft_thresh) === wantTh;
+    const okLab = String(s.ft_labels == null ? "" : s.ft_labels) === wantLabs;
+    const okOn = (s.ft_on === "1" ? "1" : "0") === payload.ft_on;
+    if (!okTh || !okLab || !okOn) {
+      toast("保存未生效：后端没有写入（请重启软件后重试）");
+    } else if (payload.ft_on === "1") {
+      toast("快速文本分析已开启（打开 / 刷新播放页生效）");
+    } else {
+      toast("快速文本分析已关闭");
+    }
+  } catch (e) {
+    toast("保存失败：" + (e && e.message ? e.message : e));
+  }
+  loadFtSettings();
+}; } catch (_e) { _bmiss("#ftSave", _e); }
+
+/* 「试一下」: 输入一句话 → 直接看模型判成什么标签、多少概率。
+   存在的意义: 让用户调阈值/勾标签时**看得见依据**, 而不是对着黑盒猜。 */
+async function ftProbe() {
+  const inp = $("#ftProbeIn"), out = $("#ftProbeOut"), btn = $("#ftProbeBtn");
+  if (!inp || !out) return;
+  const t = String(inp.value || "").trim();
+  if (!t) { out.textContent = "先输入一句话。"; return; }
+  if (btn) btn.disabled = true;
+  out.textContent = "判定中…";
+  let d = null;
+  try {
+    d = await api("/api/textfilter/probe", { method: "POST", body: { text: t } });
+  } catch (e) {
+    out.textContent = "判定失败：" + (e && e.message ? e.message : e);
+    if (btn) btn.disabled = false;
+    return;
+  }
+  if (btn) btn.disabled = false;
+  if (!d || d.ok !== true) {
+    out.textContent = "无法判定：" + ((d && d.reason) || "未知原因");
+    return;
+  }
+  const pct = Math.round((d.score || 0) * 100);
+  const tv = Math.round((d.thresh || 0) * 100);
+  const line = d.hit
+    ? "拦下（" + d.name + " " + pct + "% ≥ 阈值 " + tv + "%）"
+    : (d.picked
+        ? "放行（最高 " + d.name + " " + pct + "% < 阈值 " + tv + "%）"
+        : "放行（最高是「" + d.name + "」，但这个标签没勾选）");
+  const top = (d.top || []).map((r) => r.name + " " + Math.round(r.score * 100) + "%").join("　");
+  out.innerHTML = "";
+  const b = document.createElement("span");
+  b.className = d.hit ? "hit" : "pass";
+  b.textContent = "判定：" + line;
+  out.appendChild(b);
+  out.appendChild(document.createTextNode("\n各标签： " + top));
+}
+try { $("#ftProbeBtn").onclick = ftProbe; } catch (_e) { _bmiss("#ftProbeBtn", _e); }
+try { $("#ftProbeIn").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); ftProbe(); }
+}); } catch (_e) { _bmiss("#ftProbeIn", _e); }
 
 /* ---------- 初始化 ---------- */
 (async function init() {
