@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""v0.3.1.43dsk 打包产物验收：静态(归档里到底装了什么) + 运行期(exe 里模型真的能跑)。
+"""打包产物验收：静态(归档里到底装了什么) + 运行期(exe 里模型真的能跑)。
+
+版本号从 exe 文件名反推, 所以这个脚本**不用每版改一遍**:
+    python _verify_exe.py                     # 自动取 dist 下最新的 洞鉴虚明v*.exe
+    python _verify_exe.py <某个 exe 的路径>
 
 静态部分回答"模型有没有被打进去":
   · CArchive 的 TOC 里有没有 model/ft_model.bin, 字节数对不对;
@@ -22,9 +26,24 @@ import urllib.request
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-VER = "v0.3.1.43dsk"
-EXE = sys.argv[1] if len(sys.argv) > 1 else \
-    r"D:\Information Sorter\desktop\dist\洞鉴虚明" + VER + ".exe"
+
+def _pick_exe():
+    """默认取 dist 下最新的 洞鉴虚明v*.exe。"""
+    d = r"D:\Information Sorter\desktop\dist"
+    try:
+        cand = [os.path.join(d, f) for f in os.listdir(d)
+                if f.startswith("洞鉴虚明v") and f.endswith(".exe")]
+        cand.sort(key=os.path.getmtime)
+        if cand:
+            return cand[-1]
+    except Exception:
+        pass
+    return os.path.join(d, "洞鉴虚明.exe")
+
+
+EXE = sys.argv[1] if len(sys.argv) > 1 else _pick_exe()
+_m = re.search(r"(v[\d.]+dsk)", os.path.basename(EXE))
+VER = _m.group(1) if _m else "v0.0.0dsk"
 FAIL = []
 
 
@@ -78,10 +97,10 @@ if idx_key:
     for token in ('id="cfTabText"', 'id="ftOn"', 'id="ftDm"', 'id="ftCf"',
                   'id="ftVideo"', 'id="ftThreshRow"', 'id="ftProbeIn"', 'id="ftProbeBtn"'):
         chk(token in html, "index.html 含 %s" % token)
-    chk("v0.3.1.43dsk" in html, "index.html 页脚版本 = v0.3.1.43dsk")
+    chk(VER in html, "index.html 页脚版本 = %s" % VER)
 
 pyz_name = next((n for n in toc if n.endswith(".pyz")), None)
-tmp = os.path.join(tempfile.gettempdir(), "msx_verify_43.pyz")
+tmp = os.path.join(tempfile.gettempdir(), "msx_verify_exe.pyz")
 with open(tmp, "wb") as f:
     b = rd.extract(pyz_name)
     f.write(b[1] if isinstance(b, tuple) else b)
@@ -125,7 +144,27 @@ if g:
     strs = {x for x in consts if isinstance(x, str)}
     for fn in ("ft_scan", "ft_probe", "ft_load", "ft_status", "_ft_path"):
         chk(fn in funcs, "app 里定义了 %s" % fn)
-    chk(any("v0.3.1.43dsk" in s for s in strs), "app 常量里有版本号 v0.3.1.43dsk")
+    chk(any(VER in s for s in strs), "app 常量里有版本号 %s" % VER)
+
+# v0.3.1.44dsk: 标签栏"往下拖才撕出悬浮窗"的修复必须在包里
+g = grab("shell_tabstrip")
+if g is None:
+    chk(False, "PYZ 里有 shell_tabstrip")
+else:
+    consts, funcs = g
+    chk("detach_verdict" in funcs, "shell_tabstrip 里定义了 detach_verdict(可单测的向下拖判据)")
+    chk("on_mouse_up" in funcs and "on_capture_changed" in funcs,
+        "拖拽收尾处理器在位(on_mouse_up / on_capture_changed)")
+    chk("on_mouse_move" in funcs and "on_mouse_down" in funcs, "鼠标处理器在位")
+    # ★ 不能查 co_consts 找小整数: Python 3.12+ 起 26/8 这类值走 LOAD_SMALL_INT,
+    #   值直接编码在 oparg 里, 根本不进常量表(踩过 —— 查常量表会误判成"没打进去")。
+    import dis as _dis
+    obj = z.extract("shell_tabstrip")
+    if isinstance(obj, tuple):
+        obj = obj[-1]
+    small = {ins.argval for ins in _dis.get_instructions(obj)
+             if ins.opname == "LOAD_SMALL_INT" and isinstance(ins.argval, int)}
+    chk({26, 8} <= small, "阈值常量 DETACH_DY=26 / HINT_DY=8 在包里 (LOAD_SMALL_INT %s)" % sorted(small))
 
 # ---------------------------------------------------------------- 运行期
 print()
@@ -135,7 +174,10 @@ print("=" * 76)
 print("  验收端口: %d (MIRRORSORTER_PORT 隔离, 不动用户正在用的 8000)" % PORT)
 
 flags = 0x08000000 if os.name == "nt" else 0
-env = dict(os.environ, MIRRORSORTER_PORT=str(PORT))
+# ★ MIRRORSORTER_NO_OPEN=1 是必须的: frozen exe 的 --server 模式默认 auto_open=True,
+#   会**真的在用户桌面上弹一个浏览器页**; 而那个页面一关就 sendBeacon("/api/shutdown")
+#   把测试服务杀掉 —— 表现为跑到一半突然 RemoteDisconnected(踩过), 还会骚扰用户。
+env = dict(os.environ, MIRRORSORTER_PORT=str(PORT), MIRRORSORTER_NO_OPEN="1")
 proc = subprocess.Popen([EXE, "--server"], creationflags=flags, env=env,
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 try:

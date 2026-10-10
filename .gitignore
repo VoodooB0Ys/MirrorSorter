@@ -95,4 +95,5 @@ desktop/_vis/fasttext_demo/*.json
 # 历史探针仍按上面的 desktop/_* 规则忽略, 不追加入库
 !desktop/_test_ft.py
 !desktop/_ft_ui_test.js
-!desktop/_verify_exe_43.py
+!desktop/_test_tabstrip_drag_gui.py
+!desktop/_verify_exe.py

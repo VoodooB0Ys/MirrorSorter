@@ -493,7 +493,7 @@ document.addEventListener("click", (e) => {
     document.querySelectorAll("#openModeRow .seg").forEach((x) => x.classList.toggle("on", x === om));
     api("/api/settings", { method: "POST", body: { ui_new_window: om.dataset.open } }).catch(() => {});
     toast(om.dataset.open === "1"
-      ? "已开启：信息以新窗口形式打开（可塞回标签页；标签页可拖出成悬浮窗）"
+      ? "已开启：信息以新窗口形式打开（可塞回标签页；标签页向下拖可撕出成悬浮窗）"
       : "已关闭：信息仍在标签页内打开");
   }
   if (e.target.closest("#bgResetBtn")) {

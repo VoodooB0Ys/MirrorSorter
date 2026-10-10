@@ -14,6 +14,33 @@ import re
 import threading
 
 
+# ---------------------------------------------------------------- 撕出悬浮窗的拖拽判定
+# ★ 提到模块级是为了**可单测**。旧版把判据内联在 MouseMove 里:
+#     abs(dx) + abs(dy) > 22
+#   —— 任意方向的曼哈顿距离, 于是"点一下标签"手抖二十来像素就被拽成悬浮窗(用户反馈);
+#   而"往下拽"因为标签栏只有 ~32px 高、拖出去立刻触发 MouseLeave 被取消, 反而永远
+#   拽不出来。方向语义整个是反的, 而内联写法在无 GUI 环境下没法回归测试。
+DETACH_DY = 26     # 向下拖出的阈值(逻辑像素 × scale); 标签栏高 ≈ 32 × scale
+HINT_DY = 8        # 到这个位移先给视觉提示(还没到撕出阈值)
+
+
+def detach_verdict(dx, dy, scale=1.0):
+    """按住可关闭标签时的位移 → 处置。
+
+    返回 "detach"(撕出为悬浮窗) / "hint"(只给视觉提示) / ""(什么也不做)。
+
+    判据: **只认向下**的拖拽 —— dy > 0 且 dy > |dx|(明显偏纵向)。
+    横向拖 / 往上拖 / 原地手抖一律不撕出。
+    """
+    if dy <= 0 or dy <= abs(dx):
+        return ""
+    if dy >= DETACH_DY * scale:
+        return "detach"
+    if dy >= HINT_DY * scale:
+        return "hint"
+    return ""
+
+
 def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=None):
     """在窗口顶部安装原生标签栏并下移 WebView2 内容区。须在 GUI 就绪后调用(GUI 线程之外
     调用安全, 内部已 marshal)。返回 update(tabs, active) —— 传入
@@ -43,6 +70,9 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
           "bar": Color.FromArgb(10, 12, 16), "tab_active": Color.FromArgb(22, 25, 32),
           "tab_hover": Color.FromArgb(30, 34, 44), "fg_on": Color.FromArgb(226, 230, 238),
           "fg_off": Color.FromArgb(150, 158, 172), "sep": Color.FromArgb(52, 57, 68)}
+    # v0.3.1.44 撕出悬浮窗的拖拽可视态: 正在被拖的标签 id / 是否已进入"向下拖"提示
+    st["drag_tid"] = None
+    st["drag_hint"] = False
     lock = threading.Lock()
     form = win.native
 
@@ -108,6 +138,17 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
                            float(x - int(2 * scale)), float(ty + th * 0.75))
             g.FillPath(SolidBrush(st["tab_active"] if act else (st["tab_hover"] if hov else st["bar"])),
                        _rounded_path(x, ty, tw, th, rad))
+            # v0.3.1.44: 正在往下拖这个标签 → 染强调色, 让用户看得见"再往下就是悬浮窗"
+            # (旧版一点就撕出, 用户根本不知道有拖拽手势; 现在手势变严了, 必须给反馈)
+            if st.get("drag_hint") and st.get("drag_tid") == t["id"]:
+                try:
+                    ac = st["accent"]
+                    g.FillPath(SolidBrush(Color.FromArgb(64, ac.R, ac.G, ac.B)),
+                               _rounded_path(x, ty, tw, th, rad))
+                    g.DrawPath(Pen(ac, max(1.0, 2.0 * scale)),
+                               _rounded_path(x, ty, tw, th, rad))
+                except Exception:
+                    pass
             fg = st["fg_on"] if act else st["fg_off"]
             close_w = int(20 * scale) if t.get("closable") else int(6 * scale)
             rect = RectangleF(float(x + int(8 * scale)), float(ty),
@@ -255,13 +296,41 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
         except Exception:
             pass
 
-    # 拖出成悬浮窗(v0.3.1.34): 在可关闭标签上按下并拖动超过阈值 → api.tab_detach。
-    # fired 标记用于吞掉随后的 MouseClick, 避免"拖出后顺手把标签切了/关了"。
-    drag = {"tid": None, "x": 0, "y": 0, "armed": False, "fired": False}
+    # 拖出成悬浮窗(v0.3.1.34; 触发方式 v0.3.1.44 修正):
+    #   判定在模块级 detach_verdict() 里(可单测), 这里只负责"按住/捕获/吞点击"。
+    #   ★ 按住期间必须用鼠标捕获跟住指针 —— 往下拖会立刻离开这 32px 高的标签栏,
+    #     不捕获就收不到后续 MouseMove, "往下拽"永远拽不出来。
+    #   ★ 按下状态用**自己的** drag["down"] 记, 不查 Control.MouseButtons ——
+    #     那是全局物理鼠标状态, 既不适合做局部手势判定, 也让这段逻辑没法脱离真鼠标测试。
+    #   fired 标记用于吞掉随后的 MouseClick, 避免"拖出后顺手把标签切了/关了"。
+    drag = {"tid": None, "x": 0, "y": 0, "armed": False, "down": False, "fired": False}
+
+    def _drag_capture(on):
+        """按住标签期间抓住鼠标 —— 往下拖必然离开这 30px 高的标签栏,
+        不捕获就收不到后续 MouseMove, "往下拽"永远拽不出来。"""
+        try:
+            if bool(strip.Capture) != bool(on):
+                strip.Capture = bool(on)
+        except Exception:
+            pass
+
+    def _drag_visual(tid, hint):
+        """把"正在被拖的标签"同步给绘制层(状态没变就不重绘)。"""
+        if st.get("drag_tid") == tid and st.get("drag_hint") == bool(hint):
+            return
+        st["drag_tid"] = tid
+        st["drag_hint"] = bool(hint)
+        try:
+            strip.Invalidate()
+        except Exception:
+            pass
 
     def on_mouse_down(_sender, args):
         if args.Button != WinForms.MouseButtons.Left:
             return
+        drag["down"] = True
+        # 每次左键按下都复位: 上一次"撕出后吞掉点击"的标记不该跨手势残留
+        drag["fired"] = False
         if _btn_at(args.X) is not None:
             return
         t = _hit_tab(args.X, args.Y)
@@ -271,7 +340,7 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
                 drag["x"] = args.X
                 drag["y"] = args.Y
                 drag["armed"] = True
-                drag["fired"] = False
+                _drag_capture(True)
             return
         if (args.Y <= int(4 * scale) and
                 form.WindowState != WinForms.FormWindowState.Maximized):
@@ -281,18 +350,31 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
 
     def on_mouse_move(_sender, args):
         if drag["armed"]:
-            if WinForms.Control.MouseButtons & WinForms.MouseButtons.Left:
-                if abs(args.X - drag["x"]) + abs(args.Y - drag["y"]) > int(22 * scale):
+            if not drag["down"]:        # 按钮已松开却没收到 MouseUp(极罕见) → 复位
+                drag["armed"] = False
+                _drag_capture(False)
+                _drag_visual(None, False)
+            else:
+                dx = args.X - drag["x"]
+                dy = args.Y - drag["y"]
+                v = detach_verdict(dx, dy, scale)
+                if v == "detach":
                     drag["armed"] = False
                     drag["fired"] = True
+                    _drag_visual(None, False)
                     tid = drag["tid"]
                     if tid is not None:
                         try:
                             api.tab_detach(tid)   # 标签 → 独立悬浮窗(控件实例不变)
                         except Exception:
                             pass
-            else:
-                drag["armed"] = False
+                    # ⚠️ 这里**不放开**鼠标捕获: 放开后 MouseUp 会落到 WebView2 上,
+                    #    on_mouse_click 不触发 → fired 标记没人消费 → 下一次真点击被误吞。
+                    #    统一交给 on_mouse_up 收尾。
+                elif v == "hint":
+                    _drag_visual(drag["tid"], True)
+                else:
+                    _drag_visual(drag["tid"], False)   # 横向/向上 → 明确不给提示
         name = _btn_at(args.X)
         if name != st["hover_btn"]:
             st["hover_btn"] = name
@@ -303,8 +385,21 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
             st["hover_tab"] = hid
             strip.Invalidate()
 
-    def on_mouse_leave(_sender, _args):
+    def on_mouse_up(_sender, args):
+        """松手收尾: 放开鼠标捕获 + 清掉拖拽可视态。"""
+        if args.Button != WinForms.MouseButtons.Left:
+            return
+        drag["down"] = False
         drag["armed"] = False
+        _drag_capture(False)
+        _drag_visual(None, False)
+
+    def on_mouse_leave(_sender, _args):
+        # ★ 按住左键时**不**取消 armed: 往下拖必然立刻离开这 30px 高的标签栏,
+        #   而那正是"撕出悬浮窗"要的动作 —— 旧实现恰恰在这里 armed=False,
+        #   所以往下拽永远拽不出来。真正的收尾走 on_mouse_up。
+        if drag["armed"]:
+            return
         ch = False
         if st["hover_btn"]:
             st["hover_btn"] = None
@@ -347,9 +442,23 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
                         api.tab_switch(t["id"])
                     return
 
+    def on_capture_changed(_sender, _args):
+        """捕获被意外抢走(Alt+Tab / 系统弹窗 / 别的窗口抢焦点) → 拖拽状态必须复位。
+        否则 armed 会永远停在 True, on_mouse_leave 一直提前返回 → 悬停高亮卡死。"""
+        try:
+            if strip.Capture:
+                return
+            if drag["armed"]:
+                drag["armed"] = False
+            _drag_visual(None, False)
+        except Exception:
+            pass
+
     strip.MouseDown += on_mouse_down
     strip.MouseMove += on_mouse_move
+    strip.MouseUp += on_mouse_up
     strip.MouseLeave += on_mouse_leave
+    strip.MouseCaptureChanged += on_capture_changed
     def set_accent(hex_str):
         try:
             h = str(hex_str or "").strip()

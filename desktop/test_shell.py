@@ -212,8 +212,48 @@ check("设置键 ui_new_window 默认开(1) 且入读写白名单",
 check("设置行: 开关 + 回显 + 保存接线",
       'id="openModeRow"' in _idx_src and "openModeRow" in _ajs_src
       and "ui_new_window" in _ajs_src)
-check("标签栏拖出接线(拖拽阈值 + 吞掉误点击)",
-      "tab_detach" in _st_src and "drag[" in _st_src and "fired" in _st_src)
+check("标签栏拖出接线(鼠标捕获 + 吞掉误点击 + 捕获丢失复位)",
+      "tab_detach" in _st_src and "drag[" in _st_src and "fired" in _st_src
+      and "strip.Capture = bool(on)" in _st_src
+      and "strip.MouseUp += on_mouse_up" in _st_src
+      and "strip.MouseCaptureChanged += on_capture_changed" in _st_src)
+
+# ---- 撕出悬浮窗的触发方式(v0.3.1.44dsk) ----
+# 用户反馈: "点一下选项卡就被拽出来变成悬浮窗口, 我设定的是把它往下拽下去才能变成悬浮窗口"。
+# 旧判据 abs(dx)+abs(dy) > 22 是任意方向的曼哈顿距离 → 手抖就撕出; 而往下拖因为标签栏
+# 只有 ~32px 高、拖出去立刻触发 MouseLeave 把 armed 清掉 → 反而永远拽不出来。方向是反的。
+check("撕出判据已改成'只认向下'(旧的无方向曼哈顿距离判据必须彻底消失)",
+      "def detach_verdict(dx, dy, scale=1.0)" in _st_src
+      and "detach_verdict(dx, dy, scale)" in _st_src
+      and "abs(args.X - drag[" not in _st_src
+      # 剥掉注释再查: 注释里正当地记录了旧判据长什么样(便于日后回溯)
+      and "abs(dx) + abs(dy)" not in "\n".join(l.split("#", 1)[0] for l in _st_src.splitlines()))
+check("按住标签期间不因 MouseLeave 取消(否则往下拖永远拖不出去)",
+      'if drag["armed"]:\n            return' in _st_src)
+try:
+    import shell_tabstrip as _ts
+    _dv = _ts.detach_verdict
+    _drag_ok = (
+        # ★ 核心: 往下拖够深 → 撕出
+        _dv(0, 30) == "detach" and _dv(2, 40) == "detach" and _dv(-3, 28) == "detach"
+        # ★ 核心: 点一下标签的手抖(几像素)绝不撕出
+        and _dv(0, 0) == "" and _dv(3, 4) == "" and _dv(-4, 5) == ""
+        # 横向拖 → 不撕出(不管拖多远)
+        and _dv(120, 5) == "" and _dv(-200, 10) == "" and _dv(60, 30) == ""
+        # 往上拖 → 不撕出(上缘 4px 是窗口缩放带)
+        and _dv(0, -60) == "" and _dv(5, -40) == ""
+        # 斜向: 纵向必须明显大于横向才认
+        and _dv(10, 30) == "detach" and _dv(45, 30) == ""
+        # 阈值边界
+        and _dv(0, 25) == "hint" and _dv(0, 26) == "detach"
+        # 150% DPI: 阈值同步放大(26*1.5=39)
+        and _dv(0, 38, 1.5) == "hint" and _dv(0, 40, 1.5) == "detach"
+        # 提示态: 拖了但还不够深 → 给视觉反馈而不是撕出
+        and _dv(0, 8) == "hint" and _dv(0, 7) == ""
+    )
+    check("撕出判据行为: 只认向下 / 手抖与横竖斜向都不撕出 / 阈值随 DPI 缩放", _drag_ok)
+except Exception as _e:
+    check("撕出判据行为: 只认向下 / 手抖与横竖斜向都不撕出 / 阈值随 DPI 缩放", False, _e)
 check("壳接线: install_floats + bind_floats + tab_detach/window_dock",
       "install_floats" in _aw_src and "bind_floats" in _aw_src
       and "def tab_detach" in _aw_src and "def window_dock" in _aw_src)
@@ -732,7 +772,7 @@ check("文本分析7 设置页: 独立页签 + 独立总开关 + 三通道 + 标
 check("文本分析8 训练/评测脚本随源码留在 _vis(可复现), 但**不进**打包 datas",
       os.path.isfile(os.path.join(PROJECT, "_vis", "fasttext_demo", "build_corpus.py"))
       and os.path.isfile(os.path.join(PROJECT, "_vis", "fasttext_demo", "train_big.py"))
-      and "_vis" not in io.open(os.path.join(PROJECT, "洞鉴虚明v0.3.1.43dsk.spec"),
+      and "_vis" not in io.open(os.path.join(PROJECT, "洞鉴虚明%s.spec" % app.APP_VER),
                                 encoding="utf-8").read())
 
 # ---------- 4. 启动/打包脚本指向窗口壳 ----------
