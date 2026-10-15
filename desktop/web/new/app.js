@@ -1436,23 +1436,85 @@
     if (i < 0 || j <= i) throw new Error("没找到配置内容");
     return JSON.parse(t.slice(i, j + 1));
   }
+  // 导入按类别勾选：解析出内容后先列出有哪些类别、各几项，用户自己决定导哪几类。
+  // 类别表按后端可导入白名单写全 —— 不在表里的键归到「其他设置」，别让它们悄悄消失。
+  const IO_CATS = [
+    ["AI 配置", ["ai_base", "ai_key", "ai_model", "ai_enabled", "ai_full_scan",
+                 "ai_interest_min", "ai_batch", "ai_cache_hours", "price_in", "price_out"]],
+    ["筛选规则", ["m_min_views", "m_max_views", "m_max_duration", "m_min_duration",
+                  "m_max_age_months", "m_seen_hours", "m_repeat_limit",
+                  "m_repeat_cooldown_hours", "m_dedup", "m_blocklist_sync", "m_emotion",
+                  "m_news_fresh", "ser_max_age_months", "m_sources", "tb_allow_help",
+                  "tb_bars", "xhh_comm", "xhh_topic", "m_play_related", "m_cold_start_n"]],
+    ["评论 / 弹幕筛选", ["cf_blk_on", "cf_min_level", "m_block_mystery_bio", "m_block_lottery",
+                         "m_block_empty_space", "m_dm_on", "m_dm_multicand", "m_filter_speed"]],
+    ["快速文本分析", ["ft_on", "ft_video", "ft_dm", "ft_cf", "ft_thresh", "ft_labels"]],
+    ["平台权重", ["bili_weight", "tb_weight", "xhh_weight"]],
+    ["B站关注强调", ["bili_follow_emph", "bili_follow_months"]],
+    ["偏好备注", ["prefs_note", "dislike_note"]],
+    ["基础", ["mode"]],
+  ];
+  const IO_CRED_CAT = "账号与密钥";
+  const IO_CRED_KEYS = ["ai_key", "bili_cookie", "tb_cookie", "tb_user", "tb_avatar", "xhh_cookie",
+                        "xhh_heybox_id", "xhh_pkey", "xhh_user", "xhh_avatar",
+                        "acct_nickname", "acct_profile", "bili_follow_mids", "bili_follow_names"];
+  const IO_OTHER_CAT = "其他设置";
+  function ioCatOf(key) {
+    for (let i = 0; i < IO_CATS.length; i++) if (IO_CATS[i][1].indexOf(key) >= 0) return IO_CATS[i][0];
+    return IO_CRED_KEYS.indexOf(key) >= 0 ? IO_CRED_CAT : IO_OTHER_CAT;
+  }
+  function ioRenderPreview(p) {
+    const box = $("#ioImpPreview");
+    const keys = Object.keys(p.settings || {});
+    const order = IO_CATS.map((c) => c[0]).concat([IO_CRED_CAT, IO_OTHER_CAT]);
+    const counts = {};
+    keys.forEach((k) => { const c = ioCatOf(k); counts[c] = (counts[c] || 0) + 1; });
+    const bl = p.blacklist || {};
+    const blN = ((bl.authors || []).length) + ((bl.keywords || []).length);
+    let h = '<label class="lbl">解析成功，勾选要导入的部分：</label>';
+    order.forEach((name) => {
+      if (!counts[name]) return;
+      const warn = name === IO_CRED_CAT
+        ? ' <span class="tip-inline">含 aiKey / 登录 Cookie，导入后免扫码直接登录</span>' : "";
+      h += '<label class="mCheck"><input type="checkbox" data-cat="' + esc(name) + '" checked>' +
+           "<span>" + esc(name) + "（" + counts[name] + " 项）" + warn + "</span></label>";
+    });
+    if (blN) h += '<label class="mCheck"><input type="checkbox" data-cat="黑白名单" checked>' +
+                  "<span>黑白名单（" + blN + " 条）</span></label>";
+    if (p.sanitized) h += '<p class="tip">此文件已脱敏（导出时没勾「包含平台登录凭证」），不含 aiKey 与登录账号。</p>';
+    box.innerHTML = h;
+    box.style.display = "";
+  }
   function ioRunParse(text) {
     const el = $("#ioImpConfirm");
+    const box = $("#ioImpPreview");
     try {
       const p = ioExtractJson(text);
       if (!p || typeof p.settings !== "object") throw new Error("这不是本软件的导出内容");
       ioParsed = p;
-      const bl = p.blacklist || {};
-      $("#ioImpHint").textContent = "可导入 " + Object.keys(p.settings).length + " 项设置 · 名单 " +
-        (((bl.authors || []).length) + ((bl.keywords || []).length)) + " 条（点「确认导入」生效）";
+      ioRenderPreview(p);
+      $("#ioImpHint").textContent = "导出时间 " +
+        (p.ts ? new Date(p.ts * 1000).toLocaleString() : "未知") + "（点「确认导入」生效）";
       el.disabled = false;
     } catch (e) {
       ioParsed = null;
+      box.style.display = "none";
+      box.innerHTML = "";
       $("#ioImpHint").textContent = "解析失败：" + e.message;
       el.disabled = true;
     }
   }
   $("#ioImpParse").onclick = () => ioRunParse($("#ioImpText").value);
+  $("#ioImpClip").onclick = async () => {
+    let text = "";
+    try { text = await navigator.clipboard.readText(); } catch (e) {
+      $("#ioImpHint").textContent = "浏览器不给读剪贴板，请手动粘贴到上面的输入框";
+      return;
+    }
+    if (!text || !text.trim()) { $("#ioImpHint").textContent = "剪贴板是空的"; return; }
+    $("#ioImpText").value = text;
+    ioRunParse(text);
+  };
   $("#ioImpFile").onclick = () => $("#ioImpFileInput").click();
   $("#ioImpFileInput").addEventListener("change", () => {
     const f = $("#ioImpFileInput").files && $("#ioImpFileInput").files[0];
@@ -1464,8 +1526,18 @@
   });
   $("#ioImpConfirm").onclick = async () => {
     if (!ioParsed) { toast("请先解析", true); return; }
+    // 只送勾上的类别；没勾的键原样留在文件里，本机设置不受影响
+    const picked = new Set(Array.prototype.slice.call($("#ioImpPreview").querySelectorAll("input:checked"))
+      .map((c) => c.dataset.cat));
+    const settings = {};
+    Object.keys(ioParsed.settings || {}).forEach((k) => {
+      if (picked.has(ioCatOf(k))) settings[k] = ioParsed.settings[k];
+    });
+    const bl = ioParsed.blacklist || {};
+    const blacklist = picked.has("黑白名单") ? bl : {};
+    if (!Object.keys(settings).length && !Object.keys(blacklist).length) { toast("什么都没勾", true); return; }
     if (!confirm("导入会覆盖本机对应的设置项（不影响已收录的内容池）。继续？")) return;
-    const r = await save("/api/settings/import", { settings: ioParsed.settings, blacklist: ioParsed.blacklist }, "导入设置");
+    const r = await save("/api/settings/import", { settings: settings, blacklist: blacklist }, "导入设置");
     if (!r) return;
     const prefs0 = (ioParsed.io_prefs || {})[PREF_KEY];
     if (prefs0) { try { localStorage.setItem(PREF_KEY, prefs0); } catch (e) {} }

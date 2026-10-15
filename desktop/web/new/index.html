@@ -514,11 +514,13 @@
             <label class="lbl">导入（粘贴配置文本，或选择导出的文件）</label>
             <textarea id="ioImpText" rows="4" placeholder="把导出的配置文本粘到这里"></textarea>
             <div class="row" style="margin-top:8px">
+              <button id="ioImpClip" class="alt">读取剪贴板</button>
               <button id="ioImpParse" class="alt">解析文本</button>
               <button id="ioImpFile" class="alt">选择文件</button>
               <input type="file" id="ioImpFileInput" accept=".json,.txt,application/json,text/plain" hidden>
               <button id="ioImpConfirm" disabled>确认导入</button>
               <span class="lbl" id="ioImpHint"></span></div>
+            <div class="mGroup" id="ioImpPreview" style="display:none"></div>
           </div>
           <div class="fld"><span class="lbl">你自己的记录（不可恢复，不含已收录的内容池）</span>
             <button id="btnClearData">清空历史 / 收藏 / 聊天</button></div>
