@@ -83,6 +83,9 @@ _PAGE_LEASE_LAST = {}    # token -> 最后一次存活心跳时间(看门狗据�
 _PAGE_LEASE_LOCK = threading.Lock()
 _PAGE_LEASE_GENERATION = 0
 CACHE_TTL = 300          # B站数据缓存 5 分钟
+PREWARM_TICK = 20        # 常驻预热巡检间隔(秒)
+PREWARM_IDLE = 900       # 池子超过这么久没有新内容 → 后台提前抓一轮(15分钟)
+PREWARM_MIN = 120        # 池内可用条目少于这个数 → 后台提前补池
 SCORE_TTL_DEFAULT = 86400        # AI 评分缓存 24 小时(可经 ai_cache_hours 设置 24/48)
 AI_BATCH_DEFAULT = 15            # 每次 AI 评分的条目数(省钱法: 可设 30)
 SPAM_CUT = 7             # 低质/营销分 ≥7 一律剔除
@@ -1731,8 +1734,17 @@ def xhh_thread_content(link_id):
             images.append(u)
     comments = []
     for w in (res.get("comments") or [])[:20]:
-        c = (w or {}).get("comment") or {}
-        u = c.get("user") or {}
+        # 防御: 这个接口的 comments 元素有时把 comment 包成一层数组, 有时 w 本身不是 dict。
+        # 原实现直接 (w or {}).get("comment") 后当 dict 用, 遇到这两种就 AttributeError,
+        # HTTP 处理器异常会把连接掐断 —— 前端只看到网络错误, 站内阅读直接不可用。
+        if not isinstance(w, dict):
+            continue
+        c = w.get("comment")
+        if isinstance(c, list):
+            c = c[0] if c and isinstance(c[0], dict) else {}
+        if not isinstance(c, dict):
+            continue
+        u = c.get("user") if isinstance(c.get("user"), dict) else {}
         txt = re.sub(r"\[\w+\]|\[cube_[^\]]*\]", "", c.get("description") or c.get("text") or c.get("content") or "")
         txt = html.unescape(txt).strip()
         cimgs = [i for i in (c.get("imgs") or c.get("pics") or []) if i]
@@ -5527,6 +5539,40 @@ def _ensure_score_bg():
             return
         _score_bg_started = True
     threading.Thread(target=_score_bg_loop, daemon=True).start()
+
+
+_prewarm_lock = threading.Lock()
+_prewarm_started = False
+_prewarm_gen = [0]        # 预热线程自己发起的构建世代, 便于诊断
+
+
+def _prewarm_loop():
+    """常驻预热: 让内容池始终有货 —— 打开界面、滚到底、点刷新都不必干等构建。
+    只在"池子空 / 条目太少 / 太久没有新内容"时才抓, 且同一时刻只有一个构建
+    (build_universe 自带 building 门, 重复进入直接返回 None), 因此不会打并发抓取。"""
+    time.sleep(10)        # 让启动路径与首屏构建先跑, 不与它抢网络
+    while not _SHUTDOWN_REQUESTED.is_set():
+        try:
+            with _uni_lock:
+                n = len(_universe["items"])
+                building = _universe["building"]
+                built_at = _universe["built_at"]
+            if not building and (n == 0 or n < PREWARM_MIN
+                                 or time.time() - built_at > PREWARM_IDLE):
+                _prewarm_gen[0] += 1
+                build_universe(quick=False)
+        except Exception:
+            pass
+        time.sleep(PREWARM_TICK)
+
+
+def _ensure_prewarm():
+    global _prewarm_started
+    with _prewarm_lock:
+        if _prewarm_started:
+            return
+        _prewarm_started = True
+    threading.Thread(target=_prewarm_loop, daemon=True).start()
 
 
 # ---------------------------------------------------------------- 封面缩略播放(B站预览)
@@ -9435,6 +9481,10 @@ def build_universe(quick=False):
         payload = fetch_pool(quick=quick)
         if not payload["offline"]:
             now = time.time()
+            # 真实抓取路径就在这里: 状态面板的"上次抓取"必须由这里写。
+            # 唯一另一处写入点在 get_feed_raw(), 而它当前没有任何调用方 —— 不在这里写,
+            # 状态面板的"上次抓取"永远是"未抓取"。
+            sset("fetch_last", int(now))
             keys = [it["key"] for it in payload["items"]]
             ph = ",".join("?" * len(keys)) if keys else ""
             exist = {r[0] for r in db().execute(
@@ -9705,12 +9755,17 @@ def _cold_start_preheat():
     return True
 
 
-def serve_chunk(offset=0, limit=30, q="", request_id=""):
+def serve_chunk(offset=0, limit=30, q="", request_id="", plat=""):
     """取当前世代的 [offset:offset+limit]; 到底时自动触发新生代构建。"""
     with _uni_lock:
         uni = dict(_universe)
         items = list(_universe["items"])
         building = _universe["building"]
+    # 平台筛选在**服务端**做: 前端只是把别的平台的卡片 display:none 藏起来时,
+    # 那些"看不见的卡片"照样占着会话额度与 DOM, 真正要看的那一路被稀释 ——
+    # 缓冲和流对不上, 快速滑动时很快就没得看。放在这里过滤, 流里就只有这一个平台。
+    if plat:
+        items = [it for it in items if (it.get("platform") or "B站") == plat]
     if not items and not building:
         # 冷启动预缓存: 有缓存 → 注入空池并立即吐出(后台同时构建完整池); 没有才纯等待
         preheated = _cold_start_preheat()
@@ -9995,7 +10050,8 @@ def ui_version():
     """前端文件指纹(内容hash): 前端据此检测服务端已更新并自动刷新页面。"""
     import hashlib
     h = hashlib.md5()
-    for name in ("index.html", "app.js", "style.css"):
+    for name in ("index.html", "app.js", "style.css",
+                 "new/index.html", "new/app.js", "new/style.css"):
         try:
             with open(web_path(name), "rb") as f:
                 h.update(f.read())
@@ -10264,6 +10320,8 @@ def _server_port():
 
 # 前端图标贴图(web/icons/*.svg 与 web/icons/png/*.png)的静态白名单: 只放行这两种形状的路径, 杜绝目录穿越
 _ICON_PATH_RE = re.compile(r"^/icons/(?:png/[a-z]+-(?:24|48|96|192)\.png|[a-z]+\.svg)$")
+# 新版界面(web/new/)的静态资源: 只允许 new/ 下、无子目录、白名单扩展名的文件, 防目录穿越
+_NEW_ASSET_RE = re.compile(r"^/new/[A-Za-z0-9_.-]+\.(?:js|css|png|svg|jpg|jpeg|ico|webp)$")
 
 
 def _assist_usage_snapshot():
@@ -10369,6 +10427,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_file("qrcode.js", "application/javascript")
         if path == "/style.css":
             return self.send_file("style.css", "text/css")
+        # ---- 新版界面(web/new/): 与旧版共用同一个后端与同一份数据, 两边可并排对比 ----
+        if path in ("/new", "/new/"):
+            return self.send_file("new/index.html", "text/html")
+        if path == "/ui":
+            return self.send_file("ui.html", "text/html")
+        if _NEW_ASSET_RE.match(path):
+            _ext = path.rsplit(".", 1)[-1].lower()
+            _ct = {"js": "application/javascript", "css": "text/css", "png": "image/png",
+                   "svg": "image/svg+xml", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                   "webp": "image/webp", "ico": "image/x-icon"}.get(_ext, "application/octet-stream")
+            return self.send_file(path[1:], _ct)
         if _ICON_PATH_RE.match(path):
             return self.send_file(path[1:], "image/svg+xml" if path.endswith(".svg") else "image/png")
         if path == "/api/search":
@@ -10386,15 +10455,22 @@ class Handler(BaseHTTPRequestHandler):
             offset = int(qs.get("offset", ["0"])[0] or 0)
             limit = min(int(qs.get("limit", ["30"])[0] or 30), 50)
             request_id = qs.get("rid", [""])[0][:128]
+            plat = qs.get("plat", [""])[0][:32]
             if refresh:
                 global _uni_token
-                with _uni_lock:   # 作废旧世代并清空, 交给 serve_chunk 异步重建(不阻塞HTTP)
+                # "刷新"= 后台立刻去补一批新的, 同时**照常用当前池把这一屏发回去**。
+                # 两个关键点:
+                #  ① 不清空池子(旧实现先把 items 清空, 前端只能干等重建, 屏上直接空掉);
+                #  ② 用 quick 而不是 full: 全量要 10-30 秒, 刷新应该立刻有反馈。
+                #     quick 只取少量源, 且 build_universe 末尾会自动接力一次全量。
+                # _uni_token +1 同时作废旧构建、并让 _feed_plan 的缓存 key 失效 → 重新规划顺序。
+                with _uni_lock:
                     _uni_token += 1
                     _universe["building"] = False
-                    _universe["items"] = []
-                    _fp_clear()   # 指纹阻止的是"进池资格", 清池后必须失效, 否则重建永远为空;
-                                  # 刷新后的去重由 shown 窗口 + 随机页/源 + 新会话已返回集合承担
-            return self.send_json(serve_chunk(offset, limit, q, request_id=request_id))
+                _fp_clear()   # 指纹拦的是"进池资格", 补池后要失效, 否则新内容进不来;
+                              # 去重由 shown 窗口 + 随机页/源 + 新会话已返回集合承担
+                threading.Thread(target=build_universe, kwargs={"quick": True}, daemon=True).start()
+            return self.send_json(serve_chunk(offset, limit, q, request_id=request_id, plat=plat))
         if path == "/api/messages":
             bili_logged_in = bili_is_logged_in()
             bili_unread = bili_unread_messages() if bili_logged_in else None
@@ -10440,13 +10516,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"ok": True,
                                    "ack": ball_recall_ack(qs.get("n", ["0"])[0])})
         if path == "/api/status":
-            last = sget("fetch_last")
+            last = int(sget("fetch_last") or 0)
             st = day_stats()
             tb_bars_n = len(tb_users())
             tb_login = tb_login_check()
             tb_last = int(sget("tb_last_fetch") or 0)
-            sources = [{"name": "B站", "status": "正常" if last else "未抓取",
-                        "last_fetch": int(last or 0), "fetched_today": st["received"],
+            # "正常"= 最近一小时内真的抓过; 只判"抓过没有"会把一小时前的陈旧数据也报成正常。
+            bili_status = ("未抓取" if not last
+                           else "正常" if time.time() - last < 3600 else "久未更新")
+            with _uni_lock:
+                pool_n = len(_universe["items"])
+            sources = [{"name": "B站", "status": bili_status,
+                        "last_fetch": last, "fetched_today": st["received"],
                         "filtered_today": st["filtered"], "error": sget("fetch_error")}]
             tb_status = ("未配置吧列表" if not tb_bars_n
                          else "正常" if tb_last else "未抓取")
@@ -10463,6 +10544,7 @@ class Handler(BaseHTTPRequestHandler):
                             "error": sget("xhh_error") or "",
                             "logged_in": bool(sget("xhh_heybox_id"))})
             return self.send_json({"ai": ai_ok(), "ai_on": ai_on(), "sources": sources,
+                                   "items": pool_n,
                                    "summary": st, "ai_scoring": dict(_score_progress),
                                    "funnel": {"labels": _FUNNEL_LABELS, "counts": funnel_stats()}})
         if path == "/api/blacklist":
@@ -11634,9 +11716,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"ok": True, "cid": cid})
 
         if path == "/api/reset":
-            db().execute("DELETE FROM feedback; DELETE FROM history; DELETE FROM saved; "
-                         "DELETE FROM chat; DELETE FROM conv")
-            db().commit()
+            # 必须用 executescript: sqlite3 的 execute() 一次只接受一条语句,
+            # 原来把 5 条 DELETE 用分号连成一条传给 execute() → 必然抛
+            # ProgrammingError("You can only execute one statement at a time"),
+            # 处理器异常把连接掐断, 前端只看到 NetworkError —— 这个功能从来没成功过。
+            with _db_lock:
+                db().executescript("DELETE FROM feedback; DELETE FROM history; DELETE FROM saved; "
+                                   "DELETE FROM chat; DELETE FROM conv")
+                db().commit()
             conv_create(set_cur=True)
             return self.send_json({"ok": True})
 
@@ -14462,6 +14549,7 @@ def run_server(auto_open=False):
     if sget("scorer_v") != "3":
         sset("scorer_v", "3")
     _ensure_score_bg()   # 启动后台渐进评分守护线程(评分写库, 交互路径只读缓存不阻塞)
+    _ensure_prewarm()    # 启动常驻预热线程(池子薄/过久没新内容就后台提前抓, 用户不必等)
     threading.Thread(target=repair_blocklist_mids, daemon=True).start()   # v0.3.1.32: 补 ablock.mid
     for port in PORTS:
         if port_busy(port):
