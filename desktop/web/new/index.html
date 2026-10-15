@@ -126,9 +126,11 @@
       <div class="railSec grow">
         <button class="svItem on" data-sec="general"><svg class="ic"><use href="#i-sliders"/></svg>常规</button>
         <button class="svItem" data-sec="look"><svg class="ic"><use href="#i-bulb"/></svg>外观</button>
+        <button class="svItem" data-sec="bili"><svg class="ic"><use href="#i-play"/></svg>B站增强</button>
         <button class="svItem" data-sec="sources"><svg class="ic"><use href="#i-video"/></svg>平台账号</button>
         <button class="svItem" data-sec="ai"><svg class="ic"><use href="#i-spark"/></svg>AI 配置</button>
         <button class="svItem" data-sec="filter"><svg class="ic"><use href="#i-filter"/></svg>筛选</button>
+        <button class="svItem" data-sec="text"><svg class="ic"><use href="#i-chats"/></svg>文本分析</button>
         <button class="svItem" data-sec="lists"><svg class="ic"><use href="#i-ban"/></svg>黑白名单</button>
         <button class="svItem" data-sec="data"><svg class="ic"><use href="#i-trash"/></svg>数据</button>
         <button class="svItem" data-sec="disclaimer"><svg class="ic"><use href="#i-inbox"/></svg>免责声明</button>
@@ -171,6 +173,15 @@
               <button id="accentCustomApply" class="mini">用这个颜色</button>
               <span class="lbl">调色盘里没有的颜色用这个</span>
             </div></div>
+          <div class="fld"><span class="lbl">背景颜色</span><div class="row" id="bgRow"></div>
+            <div class="row" style="margin-top:6px">
+              <input id="bgColor" type="color" value="#f2f4f9" title="自定义背景颜色">
+              <button id="bgColorApply" class="mini">用这个颜色</button>
+              <button id="bgReset" class="mini alt">恢复默认</button>
+            </div></div>
+          <div class="fld"><span class="lbl">颜色深度（1 = 白天深度，10 = 黑夜深度；不调就跟随界面模式）</span>
+            <div class="row"><input id="bgDepth" type="range" min="1" max="10" step="1" style="flex:1">
+              <span class="lbl" id="bgDepthVal">跟随模式</span></div></div>
           <div class="fld"><span class="lbl">信息流显示</span>
             <div class="row" id="layoutRow">
               <button class="seg" data-layout="single">单栏</button>
@@ -187,6 +198,48 @@
               <button class="seg" data-cover="s">小</button><button class="seg" data-cover="m">中</button>
               <button class="seg" data-cover="l">大</button><button class="seg" data-cover="xl">特大</button>
             </div></div>
+          <div class="fld"><span class="lbl">字体大小（整界面缩放，排版随动）</span>
+            <div class="row" id="fontRow">
+              <button class="seg" data-font="small">小</button>
+              <button class="seg" data-font="medium">中</button>
+              <button class="seg" data-font="large">大</button>
+            </div></div>
+          <div class="fld"><span class="lbl">推荐理由（AI 给的那句「为什么推给你」，会占卡片高度）</span>
+            <div class="row" id="reasonRow">
+              <button class="seg" data-reason="hide">隐藏</button>
+              <button class="seg" data-reason="show">显示</button>
+            </div></div>
+          <div class="fld"><span class="lbl">信息以新窗口形式打开（桌面窗口壳；标签页向下拖可撕出成悬浮窗）</span>
+            <div class="row" id="openModeRow">
+              <button class="seg" data-v="1">开启</button>
+              <button class="seg" data-v="0">关闭</button>
+            </div></div>
+        </section>
+
+        <section class="svPanel" data-sec="bili">
+          <h3>B站增强</h3>
+          <p class="tip">作用于内置浏览器里打开的 B站标签页。切换后对新打开的标签页生效；已打开的页面刷新后生效。</p>
+          <div class="mGroup">
+            <label class="lbl">AI 超分（Anime4K/ACNet 实时超分，档位越高越清晰、越吃显卡）</label>
+            <div class="segRow" id="srLevelRow">
+              <button class="seg" data-v="关">关</button><button class="seg" data-v="轻">轻</button>
+              <button class="seg" data-v="标准">标准</button><button class="seg" data-v="高">高</button>
+              <button class="seg" data-v="旗舰">旗舰</button></div>
+            <p class="tip">画面 1:1（无需放大）时不启动超分，避免先缩再重建反而更糊。任何档位都不会比关超分更糊或更暗。</p>
+            <label class="lbl">超分倍率（网络输入档位：倍数越高重建越清晰、越吃显卡）</label>
+            <div class="segRow" id="srScaleRow">
+              <button class="seg" data-v="1">1×</button><button class="seg" data-v="1.25">1.25×</button>
+              <button class="seg" data-v="1.5">1.5×</button><button class="seg" data-v="2">2×</button></div>
+            <p class="tip">1× 最省，2×（默认）最清晰。</p>
+            <label class="lbl">增强强度（锐化 + 色彩饱和 / 对比微增）</label>
+            <div class="segRow" id="bqLevelRow">
+              <button class="seg" data-v="关闭">关闭</button><button class="seg" data-v="轻">轻</button>
+              <button class="seg" data-v="中">中</button><button class="seg" data-v="强">强</button></div>
+            <label class="lbl">播放页自有 UI（用自建界面替换 B站评论区与右侧推荐，无广告无引流；播放器 / 弹幕 / 三连与超分保持原生）</label>
+            <div class="segRow" id="ownuiRow">
+              <button class="seg" data-v="0">关闭</button><button class="seg" data-v="1">开启</button></div>
+            <p class="tip">都即时保存，不用点「保存」。</p>
+          </div>
         </section>
 
         <section class="svPanel" data-sec="sources">
@@ -196,12 +249,19 @@
             <button id="accSync" class="alt">同步账号数据</button>
             <button id="accBiliQr">扫码登录</button>
             <button id="accBiliOpen" class="alt" title="只在浏览器里打开 B站，登录结果不会回到本机（本机登录请用扫码）">浏览器里打开</button></div>
+          <div id="accProfile" class="disc"></div>
           <div class="srcRow"><b>贴吧</b><span class="ava sm" id="avaTb"></span><span id="accTbState" class="lbl">未登录</span>
+            <button id="accTbQr">一键登录贴吧</button>
             <button id="accTbCookie" class="alt">手动粘 Cookie</button></div>
+          <div class="row" id="tbLoginRow" style="display:none">
+            <span class="lbl" id="tbLoginState">未启动</span>
+            <button id="accTbLoginStop" class="mini alt">关闭窗口</button></div>
           <div class="fld" style="padding:10px 0 4px;border-bottom:1px solid var(--line)">
             <span class="lbl">要看的贴吧（一行一个，如：apex英雄）—— 不填就没得抓</span>
             <textarea id="tbBars" rows="3" placeholder="apex英雄&#10;显卡"></textarea>
-            <div class="row"><button id="tbBarsSave" class="mini">保存吧列表</button></div>
+            <div class="row"><button id="tbBarsSave" class="mini">保存吧列表</button>
+              <button id="tbImport" class="mini alt" title="需要已登录贴吧账号">导入我关注的吧</button>
+              <span class="lbl" id="tbImportHint"></span></div>
           </div>
           <div class="srcRow"><b>小黑盒</b><span class="ava sm" id="avaXhh"></span><span id="accXhhState" class="lbl">未登录</span>
             <button id="accXhhQr" class="alt">生成二维码</button></div>
@@ -221,8 +281,17 @@
               <span id="aiState" class="lbl" style="margin:0"></span></div></div>
           <div class="fld"><span class="lbl">API 地址</span><input id="aiBase" placeholder="https://api.deepseek.com/v1"></div>
           <div class="fld"><span class="lbl">API Key</span><input id="aiKey" type="password" placeholder="sk-..."></div>
-          <div class="fld"><span class="lbl">模型</span><input id="aiModel" placeholder="deepseek-chat"></div>
+          <div class="fld"><span class="lbl">模型（可直接输入，或从下拉里选预置）</span>
+            <input id="aiModel" list="modelPresets" placeholder="deepseek-chat" autocomplete="off">
+            <datalist id="modelPresets"></datalist></div>
           <button id="aiSave">保存</button>
+          <div class="mGroup" style="margin-top:14px">
+            <label class="lbl">单价（用于估算顶栏的成本，元 / 百万 token）</label>
+            <div class="mRow"><span class="lbl">输入</span><input id="priceIn" type="number" min="0" step="0.1" class="num"><span class="lbl">元 / 百万</span></div>
+            <div class="mRow"><span class="lbl">输出</span><input id="priceOut" type="number" min="0" step="0.1" class="num"><span class="lbl">元 / 百万</span></div>
+            <div class="row"><button id="priceSave" class="mini">保存单价</button></div>
+            <p class="tip">按你所用模型的价目表填。留空或填 0 表示不估算。</p>
+          </div>
           <div class="mGroup" style="margin-top:14px">
             <label class="lbl">推荐标准（兴趣分门槛，低于门槛不推送）</label>
             <div class="segRow" id="aiminRow">
@@ -239,6 +308,13 @@
             <div class="segRow" id="aicacheRow">
               <button class="seg" data-v="24">24 小时</button><button class="seg" data-v="48">48 小时</button></div>
             <p class="tip">都即时保存。选「全部候选」会明显增加 token 消耗。</p>
+            <div class="row"><button id="aiReset" class="mini alt">恢复默认设置</button></div>
+          </div>
+          <div class="mGroup" style="margin-top:14px" id="floatBallSec">
+            <label class="lbl">屏幕悬浮球（单击展开 AI 助手：验证真实性 / 生成回怼。仅 Windows 电脑版可用）</label>
+            <div class="row"><button id="floatBallToggle">开启悬浮窗</button>
+              <button id="floatBallFind" class="alt">找不到球？点这里定位</button></div>
+            <p class="tip" id="floatBallState">状态：读取中…</p>
           </div>
         </section>
 
@@ -288,6 +364,8 @@
               <label class="mCheck"><input type="checkbox" id="mDedup"><span>相似标题去重（同一事件只保留播放最高的一条）</span></label>
               <label class="mCheck"><input type="checkbox" id="mEmotion"><span>情绪过滤器：拦截感叹号轰炸 / 引战黑话 / 标题党句式（不耗 AI）</span></label>
               <label class="mCheck"><input type="checkbox" id="mNewsFresh"><span>资讯保鲜：热点/资讯类只推 24 小时内（教程/干货不受影响）</span></label>
+              <label class="mCheck"><input type="checkbox" id="mPlayRel"><span>播放页右栏推荐视频也按上面的规则筛选</span></label>
+              <p class="tip">开启后，视频播放页右栏推荐按上面的机器筛选规则（播放量/时长/时间窗/情绪/厌恶词/拉黑）过滤，并按 相关:探索=7:3 混入泛热门视频（带「探索」标）；关闭则显示 B站原始推荐。对新打开的播放页生效。</p>
             </div>
             <div class="mGroup">
               <label class="lbl">B站账号拉黑名单</label>
@@ -295,6 +373,36 @@
               <p class="tip" id="mBlStatus"></p>
               <div class="row" style="margin:6px 0"><button id="mBlSync" class="alt">立即同步拉黑名单</button></div>
               <div id="mBlList" class="chips"></div>
+            </div>
+            <div class="mGroup">
+              <label class="lbl">评论 / 弹幕筛选（作用于内置浏览器里打开的 B站播放页）</label>
+              <label class="mCheck"><input type="checkbox" id="cfDmOn"><span><b>弹幕屏蔽总开关</b>：关掉后「按发送者身份」的弹幕规则（黑名单 / 抽奖账号 / 空首页 / 无简介）全部停止；评论筛选不受影响</span></label>
+              <label class="mCheck"><input type="checkbox" id="cfBlkOn"><span>屏蔽黑名单内用户的评论 / 弹幕（名单 = 黑白名单→作者 + 已同步的 B站拉黑）</span></label>
+              <label class="mCheck"><input type="checkbox" id="cfBlkMystery"><span>屏蔽无简介账号的评论 / 弹幕（空简介，多为机器人）</span></label>
+              <label class="mCheck"><input type="checkbox" id="cfBlkLottery"><span>屏蔽抽奖账号的评论 / 弹幕（近 3 条动态含抽奖转发）</span></label>
+              <label class="mCheck"><input type="checkbox" id="cfBlkEmpty"><span>屏蔽空首页账号的评论 / 弹幕（一条动态都没有）</span></label>
+              <p class="tip">简介项本地即时判定；后两项需登录 B站，按作者查资料（缓存 24 小时，只读缓存、不拖慢加载）。查不到的先放行，补上即生效。默认都关。</p>
+              <div class="mRow"><span class="lbl">屏蔽 ≤</span>
+                <span class="segRow" id="cfLvlRow">
+                  <button class="seg" data-v="0">关</button><button class="seg" data-v="1">1</button>
+                  <button class="seg" data-v="2">2</button><button class="seg" data-v="3">3</button>
+                  <button class="seg" data-v="4">4</button><button class="seg" data-v="5">5</button></span>
+                <span class="lbl">级的用户评论（默认 2）</span></div>
+              <p class="tip">只作用于评论 —— 评论接口自带等级，本地即时判定；弹幕接口不带等级，判等级必须联网查发送者资料，会把账号打进风控，因此弹幕侧不提供等级筛选。对打开 / 刷新的播放页生效。</p>
+              <label class="lbl">弹幕发送者的哈希对上多个账号时</label>
+              <div class="segRow" id="cfMultiRow">
+                <button class="seg" data-v="0">放行</button>
+                <button class="seg" data-v="1">全命中才拦</button>
+                <button class="seg" data-v="2">任一命中即拦</button></div>
+              <p class="tip">弹幕接口只给发送者 ID 的 8 位哈希（crc32 有损），一个哈希常对上 2～8 个账号。全命中才拦（默认）绝不误杀但拦得少；任一命中即拦拦得狠但会误伤无辜；放行 = 不拦。多候选标「·N候选」。</p>
+              <label class="lbl">筛选加速（后台逆推哈希 / 补账号画像的并行档位）</label>
+              <div class="segRow" id="cfSpeedRow">
+                <button class="seg" data-v="0">兼容</button>
+                <button class="seg" data-v="1">标准</button>
+                <button class="seg" data-v="2">快速</button>
+                <button class="seg" data-v="3">极速</button></div>
+              <p class="tip">快速（默认）比旧版快 8～13 倍。并发只掩盖网络延迟，真正限速的是每秒请求数；撞风控自动砍半，5 分钟恢复。极速请求量约默认两倍，风险自评。</p>
+              <div class="row"><button id="cfSave">保存评论 / 弹幕筛选</button></div>
             </div>
             <div class="mGroup">
               <label class="lbl">关注的人</label>
@@ -337,6 +445,46 @@
               <div class="row"><button id="xhhSave">保存小黑盒筛选</button><span class="lbl" id="xhhStatus"></span></div>
               <p class="tip">社区=帖子归属板块（topics），话题=帖子附带标签（hashtags）。都留空=不筛选；任一填写即按白名单过滤。</p>
             </div>
+          </div>
+        </section>
+
+        <section class="svPanel" data-sec="text">
+          <h3>文本分析</h3>
+          <p class="tip">用内置的本地小模型判断「这条内容说了什么」——引战、低质、标题党、阴阳怪气。纯本地运行，不联网、不消耗 AI 额度，也不看发送者是谁。</p>
+          <div class="mGroup">
+            <label class="mCheck"><input type="checkbox" id="ftOn"><span><b>快速文本分析总开关</b></span></label>
+            <p class="tip">与「弹幕屏蔽总开关」「评论筛选」完全独立：上面管「谁发的」，这里管「发了什么」，各开各的。上面关掉不影响这里，反之亦然。</p>
+            <p class="tip" id="ftStatus">模型状态：读取中…</p>
+          </div>
+          <div class="mGroup">
+            <label class="lbl">试一下</label>
+            <div class="row"><input id="ftProbeIn" style="flex:1" maxlength="64"
+              placeholder="例：赢麻了，又是魂游 / 震惊！99%的人不知道">
+              <button id="ftProbeBtn" class="alt">判定</button></div>
+            <p class="tip" id="ftProbeOut">模型只按「这句话说了什么」判断，跟谁发的无关。改完上面的设置后先点保存，再试。</p>
+          </div>
+          <div class="mGroup">
+            <label class="lbl">作用范围（三个通道各自独立勾选，不勾的通道完全不受影响）</label>
+            <label class="mCheck"><input type="checkbox" id="ftVideo"><span>信息筛选（视频标题 + 简介 / 帖子标题 + 摘要）</span></label>
+            <label class="mCheck"><input type="checkbox" id="ftDm"><span>弹幕</span></label>
+            <label class="mCheck"><input type="checkbox" id="ftCf"><span>评论</span></label>
+          </div>
+          <div class="mGroup">
+            <label class="lbl">判定标签（勾上的标签才参与拦截）</label>
+            <label class="mCheck"><input type="checkbox" id="ftLabFlame"><span>引战 / 辱骂（攻击性语言）</span></label>
+            <label class="mCheck"><input type="checkbox" id="ftLabSpam"><span>低质 / 广告（垃圾营销、无信息量）</span></label>
+            <label class="mCheck"><input type="checkbox" id="ftLabClickbait"><span>标题党（震惊体、悬念体、数字党）</span></label>
+            <label class="mCheck"><input type="checkbox" id="ftLabYy"><span>阴阳怪气（赢麻了 / 典 / 急了 / 又是X）</span></label>
+            <label class="mCheck"><input type="checkbox" id="ftLabNeg"><span>负面情绪（纯抱怨、贩卖焦虑）</span></label>
+            <p class="tip">默认不勾「负面情绪」——正常吐槽也会被它命中，误伤偏多。</p>
+          </div>
+          <div class="mGroup">
+            <label class="lbl">判定阈值（模型给出的概率超过该值才拦）</label>
+            <div class="segRow" id="ftThreshRow">
+              <button class="seg" data-v="50">50 宽松</button><button class="seg" data-v="70">70 标准</button>
+              <button class="seg" data-v="85">85 严格</button><button class="seg" data-v="93">93 极严</button></div>
+            <p class="tip">70（默认）平衡最好；调低拦得多但会误伤正常内容，调高更保守但漏得多。</p>
+            <div class="row"><button id="ftSave">保存文本分析设置</button></div>
           </div>
         </section>
 

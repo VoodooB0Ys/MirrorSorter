@@ -25,7 +25,10 @@ html[data-theme="dark"]{color-scheme:dark}
 html[data-theme="light"]{color-scheme:light}
 *{box-sizing:border-box}
 html,body{height:100%}
-body{margin:0;background:var(--bg);color:var(--fg);overflow:hidden;height:100vh;
+body{margin:0;background:var(--bg);color:var(--fg);overflow:hidden;
+  /* 字体大小靠 body 的 zoom 缩放；zoom 下 100vh 会被乘大，布局高度要除回来，
+     否则全屏时界面比视口高一截，侧栏底部永远滚不到 */
+  height:calc(100vh / var(--ui-zoom, 1));
   display:flex;flex-direction:column;
   font:13px/1.5 -apple-system,"Segoe UI","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
 button{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);
@@ -174,6 +177,8 @@ html[data-theme="light"] .pb.xhh,html[data-theme="light"] .mark.xhh{color:#8a641
   font-size:11.5px;color:var(--accent-ink);background:var(--accent-soft);border-radius:6px;padding:2px 8px}
 .reason .ic{stroke-width:1.6}
 .reason span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 设置 → 外观 → 推荐理由：隐藏时不删节点，卡片布局不会因此跳动 */
+#list.noreason .reason{display:none}
 .acts{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
 .acts button{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;padding:3px 9px;
   background:transparent;border-color:var(--line);color:var(--fg2)}

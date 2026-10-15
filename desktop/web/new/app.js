@@ -87,7 +87,8 @@
   const PREF_KEY = "ms-new-prefs";
   const prefs = Object.assign(
     { theme: "dark", accent: "#fb7299", layout: "single", cover: "m", pv: 2,
-      leftW: 238, rightW: 235, le: false, re: false },
+      leftW: 238, rightW: 235, le: false, re: false,
+      bgHex: "", bgDepth: 0, font: "small", reason: "show" },
     JSON.parse(localStorage.getItem(PREF_KEY) || "{}")
   );
   const savePrefs = () => localStorage.setItem(PREF_KEY, JSON.stringify(prefs));
@@ -107,14 +108,82 @@
     } catch (e) {}
   }
   const SEG_ROWS = [["#themeRow", "theme"], ["#layoutRow", "layout"], ["#coverRow", "cover"],
-                    ["#pvRow", "pv"]];
+                    ["#pvRow", "pv"], ["#fontRow", "font"], ["#reasonRow", "reason"]];
   const CUSTOM_ACCENT_KEY = "ms-new-custom-accent";
   const ACCENTS = ["#fb7299", "#4a9eff", "#67c23a", "#a06bff", "#ff9f43", "#22c3c3", "#8a94a6", "#e8c341"];
+  // 背景颜色家族：空串 = 标准（蓝灰底）。选了颜色就整界面底色跟着它走，色相全程保持，深度只推明度。
+  const BGS = [{ hex: "", name: "标准" }, { hex: "#f7f1e6", name: "米白" }, { hex: "#eaf5f6", name: "淡青" },
+               { hex: "#ecf6ee", name: "淡绿" }, { hex: "#f3f0fa", name: "淡紫" }, { hex: "#f9eff3", name: "淡粉" }];
+  const BG_CUSTOM_KEY = "ms-new-custom-bg";
+  function hexToHsl(hex) {
+    const t = rgbTriple(hex);
+    if (!t) return null;
+    const r = t[0] / 255, g = t[1] / 255, b = t[2] / 255;
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+    let h = 0;
+    if (d) {
+      if (mx === r) h = ((g - b) / d) % 6;
+      else if (mx === g) h = (b - r) / d + 2;
+      else h = (r - g) / d + 4;
+      h = Math.round(h * 60); if (h < 0) h += 360;
+    }
+    const l = (mx + mn) / 2;
+    const s = d ? d / (1 - Math.abs(2 * l - 1)) : 0;
+    return { h: h, s: Math.round(s * 100) };
+  }
+  function hslToHex(h, s, l) {
+    s /= 100; l /= 100;
+    const k = (n) => (n + h / 30) % 12;
+    const a = s * Math.min(l, 1 - l);
+    const f = (n) => Math.round(255 * (l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1))));
+    return "#" + [f(0), f(8), f(4)].map((v) => Math.max(0, Math.min(255, v)).toString(16).padStart(2, "0")).join("");
+  }
+  // 深度 1（白天最亮）～ 10（黑夜最暗）。0 = 跟随界面模式（白天 1 / 黑夜 10）。
+  const bgDepthNow = () => {
+    const d = parseInt(prefs.bgDepth, 10);
+    if (d >= 1 && d <= 10) return d;
+    return prefs.theme === "light" ? 1 : 10;
+  };
+  const bgHslAt = (depth) => {
+    const t = (depth - 1) / 9;
+    const c = hexToHsl(prefs.bgHex);
+    const h = c ? c.h : 220;
+    const s1 = c ? c.s : 44, s2 = c ? c.s : 18;
+    return { h: h, s: Math.round(s1 + (s2 - s1) * t), t: t };
+  };
+  function applyBg() {
+    const el = document.documentElement;
+    const { h, s, t } = bgHslAt(bgDepthNow());
+    const set = (k, a, b) => el.style.setProperty(k, "hsl(" + h + ", " + s + "%, " +
+      (Math.round((a + (b - a) * t) * 10) / 10) + "%)");
+    set("--bg", 96, 7);      set("--panel", 100, 11);
+    set("--card", 100, 13);  set("--panel2", 93, 14);
+    set("--hover", 93, 14);  set("--line", 91, 19);
+  }
+  function renderBgRow() {
+    const box = $("#bgRow");
+    if (!box) return;
+    const depth = bgDepthNow();
+    // 拖动分割线时 applyPrefs 会被逐帧调用，色卡没变就别重建 DOM
+    const key = depth + "|" + prefs.bgHex;
+    if (box.dataset.key === key) return;
+    box.dataset.key = key;
+    const customs = (() => { try { return JSON.parse(localStorage.getItem(BG_CUSTOM_KEY) || "[]"); } catch (e) { return []; } })();
+    const all = BGS.concat((Array.isArray(customs) ? customs : []).map((c) => ({ hex: c, name: c })));
+    box.innerHTML = all.map((x) => {
+      const preview = x.hex ? (() => { const c = hexToHsl(x.hex); return c ? hslToHex(c.h, c.s, Math.round(96 + (7 - 96) * ((depth - 1) / 9))) : x.hex; })() : "";
+      return '<span class="sw ' + (prefs.bgHex === x.hex ? "on" : "") + '" data-hex="' + esc(x.hex) +
+        '" title="' + esc(x.name) + '"' + (preview ? ' style="background:' + preview + '"' : "") + "></span>";
+    }).join("");
+  }
 
   function applyPrefs() {
     const html = document.documentElement;
-    const dark = prefs.theme === "dark";
-    html.setAttribute("data-theme", prefs.theme);
+    // 底色深度就是明暗轴（1 = 白天深度，10 = 黑夜深度），所以正文配色跟着深度走 ——
+    // 否则在「黑夜」模式下把深度拉到 3 会得到浅底 + 浅字，什么都看不见。
+    // 深度选「跟随模式」时由界面模式决定深度，两者不会打架。
+    const dark = bgDepthNow() >= 6;
+    html.setAttribute("data-theme", dark ? "dark" : "light");
     html.style.setProperty("--accent", prefs.accent);
     html.style.setProperty("--accent-soft", rgba(prefs.accent, dark ? 0.13 : 0.12));
     html.style.setProperty("--accent-soft2", rgba(prefs.accent, dark ? 0.22 : 0.2));
@@ -141,10 +210,69 @@
     const listEl = $("#list");
     listEl.classList.remove("single", "dual", "big");
     listEl.classList.add(prefs.layout);
-    SEG_ROWS.forEach(([sel, key]) =>
-      $$(sel + " .seg").forEach((b) => b.classList.toggle("on", String(b.dataset[key]) === String(prefs[key]))));
+    SEG_ROWS.forEach(([sel, key]) => {
+      // 界面模式那一行显示的是「当前实际是深还是浅」——深度可能已经把它带过去了
+      const val = key === "theme" ? (dark ? "dark" : "light") : prefs[key];
+      $$(sel + " .seg").forEach((b) => b.classList.toggle("on", String(b.dataset[key]) === String(val)));
+    });
     $$("#accentRow .sw").forEach((b) => b.classList.toggle("on", b.dataset.c === prefs.accent));
+    applyBg();
+    renderBgRow();
+    const sl = $("#bgDepth");
+    if (sl) {
+      const d = parseInt(prefs.bgDepth, 10);
+      sl.value = (d >= 1 && d <= 10) ? d : (prefs.theme === "light" ? 1 : 10);
+      $("#bgDepthVal").textContent = (d >= 1 && d <= 10) ? String(d)
+        : ("跟随模式 · " + (prefs.theme === "light" ? 1 : 10));
+    }
+    // 字体大小 = 整界面缩放。100vh 在 zoom 下会被乘大，布局高度要除回来
+    // （否则全屏时界面比视口高一截，侧栏底部永远滚不到）
+    const z = prefs.font === "medium" ? 1.15 : prefs.font === "large" ? 1.3 : 1;
+    document.body.style.zoom = z === 1 ? "" : String(z);
+    html.style.setProperty("--ui-zoom", String(z));
+    listEl.classList.toggle("noreason", prefs.reason !== "show");
+    pushTheme();
   }
+  // 把当前主题/强调色推给服务端：桌面窗口壳与悬浮球读这份，页面重开也能恢复。
+  // 拖动分割线会逐帧走 applyPrefs，这里必须合并请求，否则一拖动就是一串 POST。
+  let pushTimer = null;
+  function pushTheme() {
+    if (!themeReady) return;
+    if (pushTimer) return;
+    pushTimer = setTimeout(function () { pushTimer = null; pushThemeNow(); }, 300);
+  }
+  function pushThemeNow() {
+    const d = bgDepthNow();
+    const { h, s, t } = bgHslAt(d);
+    const dark = d >= 6;
+    const L = (a, b) => Math.round((a + (b - a) * t) * 10) / 10;
+    fetch("/api/floatball", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ theme: {
+        accent: prefs.accent, light: !dark, accent_id: prefs.accent,
+        bg: { bar: hslToHex(h, s, L(92, 3)), active: hslToHex(h, s, L(100, 11)),
+              hover: hslToHex(h, s, L(93, 15)), fgon: dark ? "#e8eaf0" : "#20242f",
+              fgoff: dark ? "#969eac" : "#5d6675", sep: dark ? "#343944" : "#dfe3ec" },
+      } }),
+    }).catch(function () {});
+  }
+  // 桌面壳内 WebView2 的 localStorage 与常用浏览器相互独立：壳内首次启动（本地无偏好）时
+  // 从服务端设置恢复主题/强调色。恢复必须先于「把主题推回服务端」，否则开机那一下
+  // 会把默认主题推上去，把要恢复的值盖掉。
+  let themeReady = !!localStorage.getItem(PREF_KEY);
+  (function restoreThemeFromServer() {
+    if (themeReady) return;
+    fetch("/api/ui_theme", { cache: "no-store" }).then((r) => r.json()).then((d) => {
+      if (d && d.theme) {
+        prefs.theme = d.theme;
+        if (d.accent_hex) prefs.accent = d.accent_hex;
+        savePrefs();
+      }
+    }).catch(function () {}).then(function () {
+      themeReady = true;
+      applyPrefs();
+    });
+  })();
 
   /* ================= 信息流 ================= */
   const S = { view: "feed", lastList: "feed", q: "", sort: "default", offset: 0, src: "",
@@ -562,7 +690,7 @@
   // 信息流上还要换一池新的：先立刻返回当前内容（不白屏），新一代落地后自动换上。
   async function refreshFeed() {
     if (S.view === "msg") { renderMsgPane(); loadMessages(); return; }
-    if (S.view === "settings") { loadSettings(); loadBlacklist(); loadAccount(); loadStatus(); return; }
+    if (S.view === "settings") { loadSettings(); loadBlacklist(); loadAccount(); loadStatus(); refreshFloatBall(); return; }
     if (S.view !== "feed") { S.offset = 0; S.done = false; await loadFeed(false); loadStatus(); return; }
     // 信息流：立刻换一屏 —— 不等后台重建（全量要 10-30 秒，旧实现就是在这儿干等）。
     const gen0 = S.gen;
@@ -695,6 +823,18 @@
       set("#accBiliState", d.ok ? "已登录：" + name : "未登录");
       if (d.ok) setAva("#avaBili", "/api/avatar?t=" + Date.now(), name.slice(0, 1));
       else $("#avaBili").textContent = "";
+      // 账号画像（旧版在个人中心里显示）：知道它到底拿你的历史学到了什么，同步才不是黑盒
+      const p = $("#accProfile");
+      if (p) {
+        if (!d.ok) p.innerHTML = "";
+        else {
+          const line = (label, list) => "<b>" + label + "</b>：" + (list.length ? list.join("、") : "暂无");
+          p.innerHTML = "<div>" +
+            line("常看作者", (d.authors || []).map((a) => esc(a.name))) + "<br>" +
+            line("高频关键词", (d.keywords || []).map(esc)) + "<br>" +
+            line("收藏夹", (d.favs || []).map((f) => esc(f.title) + " (" + f.count + ")")) + "</div>";
+        }
+      }
     } catch (e) {}
     try {                                   // 贴吧/小黑盒的状态依赖慢接口, 单独走
       const m = await api("/api/messages");
@@ -749,12 +889,35 @@
       segPick("#aifullRow", s.ai_full_scan || "0");
       segPick("#aibatchRow", s.ai_batch || "15");
       segPick("#aicacheRow", s.ai_cache_hours || "24");
+      const pi = $("#priceIn"), po = $("#priceOut");
+      if (pi) pi.value = s.price_in || "";
+      if (po) po.value = s.price_out || "";
+      // B站增强：超分用「开关 + 档位」两个键存，档位=关 时开关为 0（旧版同做法）
+      segPick("#srLevelRow", s.ui_sr === "0" ? "关" : (s.ui_sr_level || "关"));
+      segPick("#srScaleRow", s.ui_sr_scale || "2");
+      segPick("#bqLevelRow", s.ui_bq === "0" ? "关闭" : (s.ui_bq_level || "中"));
+      segPick("#ownuiRow", s.ui_ownui || "1");
+      segPick("#openModeRow", s.ui_new_window === "0" ? "0" : "1");
     } catch (e) { toast("读取设置失败：" + e, true); }
   }
   // 分段选择器：读取时点亮当前档，点击即保存（旧版同做法，省一次"保存"点击）
   function segPick(sel, val) {
     $$(sel + " .seg").forEach((b) => b.classList.toggle("on", b.dataset.v === String(val)));
   }
+  // 只改高亮、不落库的那种档位行（所在分组自己有「保存」按钮）
+  function segSelect(sel) {
+    const box = $(sel);
+    if (!box) return;
+    box.addEventListener("click", (e) => {
+      const b = e.target.closest(".seg");
+      if (!b) return;
+      $$(sel + " .seg").forEach((x) => x.classList.toggle("on", x === b));
+    });
+  }
+  segSelect("#cfLvlRow");
+  segSelect("#cfMultiRow");
+  segSelect("#cfSpeedRow");
+  segSelect("#ftThreshRow");
   function segBind(sel, key, label) {
     const box = $(sel);
     if (!box) return;
@@ -771,6 +934,90 @@
   segBind("#aifullRow", "ai_full_scan", "保存评分范围");
   segBind("#aibatchRow", "ai_batch", "保存批大小");
   segBind("#aicacheRow", "ai_cache_hours", "保存缓存时长");
+  segBind("#srScaleRow", "ui_sr_scale", "保存超分倍率");
+  segBind("#ownuiRow", "ui_ownui", "保存播放页自有 UI");
+  segBind("#openModeRow", "ui_new_window", "保存打开方式");
+  // 超分 / 增强强度：界面上是一个「档位」，后端存的是「开关 + 档位」两个键。
+  // 档位选「关」= 开关写 0（脚本据此整段不启用），选别的 = 开关写 1 + 档位名。
+  const segBindPair = (sel, onKey, lvlKey, offVal, label) => {
+    const box = $(sel);
+    if (!box) return;
+    box.addEventListener("click", async (e) => {
+      const b = e.target.closest(".seg");
+      if (!b) return;
+      const old = (box.querySelector(".seg.on") || {}).dataset?.v;
+      segPick(sel, b.dataset.v);
+      const off = b.dataset.v === offVal;
+      const r = await save("/api/settings", { [onKey]: off ? "0" : "1", [lvlKey]: b.dataset.v }, label);
+      if (!r) segPick(sel, old); else loadSettings();
+    });
+  };
+  segBindPair("#srLevelRow", "ui_sr", "ui_sr_level", "关", "保存超分档位");
+  segBindPair("#bqLevelRow", "ui_bq", "ui_bq_level", "关闭", "保存增强强度");
+  $("#priceSave").onclick = async () => {
+    const num = (id) => String(Math.max(0, parseFloat(($(id) || {}).value) || 0));
+    const r = await save("/api/settings", { price_in: num("#priceIn"), price_out: num("#priceOut") }, "保存单价");
+    if (r) loadSettings();
+  };
+  // 模型预置（旧版有个 ▾ 下拉；新版用原生 datalist，输入框本身仍是自由输入）
+  const MODEL_PRESETS = [
+    ["DeepSeek", ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp", "deepseek-chat", "deepseek-reasoner"]],
+    ["智谱 GLM", ["glm-4-plus", "glm-4-flash"]],
+    ["通义千问", ["qwen-turbo", "qwen-plus", "qwen-max"]],
+    ["OpenAI 兼容", ["gpt-4o-mini", "gpt-4o"]],
+    ["本地 Ollama", ["qwen3:8b", "qwen3:4b"]],
+  ];
+  $("#modelPresets").innerHTML = MODEL_PRESETS.map(([g, ms]) =>
+    ms.map((m) => '<option value="' + esc(m) + '" label="' + esc(g) + '">').join("")).join("");
+  $("#aiReset").onclick = async () => {
+    if (!confirm("把 AI 推荐模式的设置恢复成默认值？")) return;
+    const r = await save("/api/settings", { ai_full_scan: "0", ai_interest_min: "0", ai_batch: "15", ai_cache_hours: "24" }, "恢复默认设置");
+    if (r) { loadSettings(); restartFeed(); }
+  };
+  /* 屏幕悬浮球（仅 Windows 电脑版；其它平台后端会如实回 supported=false + 原因） */
+  function applyFloatBall(d) {
+    const btn = $("#floatBallToggle"), st = $("#floatBallState");
+    if (!btn) return;
+    btn.classList.toggle("on", !!d.enabled);
+    btn.textContent = d.enabled ? "关闭悬浮窗" : "开启悬浮窗";
+    st.textContent = !d.supported ? ("状态：本机不支持 —— " + (d.reason || "环境不支持"))
+      : (d.enabled ? (d.running ? "状态：已开启，球在屏幕上" : "状态：已开启但进程没起来" + (d.spawn_error ? "（" + d.spawn_error + "）" : ""))
+                   : "状态：未开启");
+  }
+  async function refreshFloatBall() {
+    try { applyFloatBall(await api("/api/floatball")); } catch (e) {}
+  }
+  $("#floatBallToggle").onclick = async () => {
+    const on = $("#floatBallToggle").classList.contains("on");
+    try {
+      const d = await api("/api/floatball", { method: "POST", body: JSON.stringify({ enabled: !on }) });
+      // POST 的回执里没有 enabled（只有 GET 有），开关状态用刚才那次操作的结果补上
+      applyFloatBall(Object.assign({}, d, { enabled: !on }));
+      if (d.supported) toast(!on ? "悬浮球已出现在屏幕上" : "悬浮窗已关闭", !on);
+      else toast("本机无法显示悬浮球：" + (d.reason || "环境不支持"), true);
+      // 拉起后复查一次：进程闪退（例如缺 tkinter）要如实说出来，别让按钮看着像成功了
+      if (!on && d.supported) setTimeout(refreshFloatBall, 1500);
+    } catch (e) { toast("操作失败：" + (e.message || e), true); }
+  };
+  // 「找不到球？」：球可能被拖到屏幕边缘外、被置顶窗口盖住、或位置记在换屏前的坐标上。
+  // 球是独立进程，靠 2.5 秒一次的心跳取信号 —— 发出请求不等于球收到，必须等回执才算数。
+  $("#floatBallFind").onclick = async () => {
+    try {
+      const d = await api("/api/floatball");
+      if (!d.supported) { toast("本机无法显示悬浮球：" + (d.reason || "环境不支持"), true); return; }
+      if (!d.running) { toast("悬浮球当前没在运行，先点「开启悬浮窗」", true); return; }
+      const r = await api("/api/ball_recall_go");
+      const want = (r && r.n) || 0;
+      toast("已发出定位请求，正在等悬浮球响应…");
+      for (let i = 0; i < 9; i++) {
+        await new Promise((ok) => setTimeout(ok, 600));
+        const s = await api("/api/ball_recall");
+        if ((s.ack || 0) >= want) { toast("悬浮球已回到屏幕右侧（闪三下的那个就是它）", true); return; }
+      }
+      toast("悬浮球没有响应，可能已经退出 —— 重新点「开启悬浮窗」试试", true);
+      refreshFloatBall();
+    } catch (e) { toast("定位失败：" + (e.message || e), true); }
+  };
   $("#aiToggle").onclick = async () => {
     const on = !$("#aiToggle").classList.contains("on");
     const r = await save("/api/settings", { ai_enabled: on ? "1" : "0" }, "切换 AI 开关");
@@ -797,7 +1044,10 @@
   const m2el = $("#modeSel2"); if (m2el) m2el.onchange = () => onMode(m2el.value);
 
   SEG_ROWS.forEach(([sel, key]) => $$(sel + " .seg").forEach((b) => (b.onclick = () => {
-    prefs[key] = b.dataset[key]; savePrefs(); applyPrefs();
+    prefs[key] = b.dataset[key];
+    // 换界面模式 = 深度回到「跟随模式」，否则手动拉过的深度会把模式盖回去
+    if (key === "theme") prefs.bgDepth = 0;
+    savePrefs(); applyPrefs();
   })));
   $("#accentRow").addEventListener("click", (e) => {
     const b = e.target.closest(".sw"); if (!b) return;
@@ -811,6 +1061,35 @@
     localStorage.setItem(CUSTOM_ACCENT_KEY, c);
     savePrefs(); applyPrefs();
   };
+  /* 背景颜色 / 颜色深度（旧版有，新版补上）：只动底色那一族变量，不影响强调色与布局 */
+  $("#bgRow").addEventListener("click", (e) => {
+    const b = e.target.closest(".sw");
+    if (!b) return;
+    prefs.bgHex = b.dataset.hex || "";
+    savePrefs(); applyPrefs();
+  });
+  $("#bgColorApply").onclick = () => {
+    const c = ($("#bgColor").value || "").trim().toLowerCase();
+    if (!/^#[0-9a-f]{6}$/i.test(c)) { toast("颜色格式不对", true); return; }
+    let list = [];
+    try { list = JSON.parse(localStorage.getItem(BG_CUSTOM_KEY) || "[]"); } catch (err) {}
+    if (!Array.isArray(list)) list = [];
+    list = Array.from(new Set([c].concat(list))).slice(0, 12);
+    localStorage.setItem(BG_CUSTOM_KEY, JSON.stringify(list));
+    prefs.bgHex = c;
+    savePrefs(); applyPrefs();
+  };
+  $("#bgReset").onclick = () => {
+    prefs.bgHex = ""; prefs.bgDepth = 0;
+    savePrefs(); applyPrefs();
+  };
+  $("#bgDepth").addEventListener("input", (e) => {
+    const d = parseInt(e.target.value, 10);
+    prefs.bgDepth = d;
+    $("#bgDepthVal").textContent = String(d);
+    savePrefs(); applyBg(); renderBgRow(); pushTheme();
+  });
+  $("#bgDepth").addEventListener("change", savePrefs);
 
   /* ================= 机器筛选（纯程序规则，先于 AI 执行）================= */
   // 契约来自旧版：读 /api/machine（settings + source_groups + blocked + account_ok）、
@@ -907,7 +1186,18 @@
       setC("#mDedup", st.m_dedup === "1");
       setC("#mEmotion", st.m_emotion !== "0");
       setC("#mNewsFresh", st.m_news_fresh !== "0");
+      setC("#mPlayRel", st.m_play_related !== "0");
       setC("#mBlockSync", st.m_blocklist_sync === "1");
+      // 评论 / 弹幕筛选（B站播放页内生效）
+      setC("#cfDmOn", st.m_dm_on !== "0");
+      setC("#cfBlkOn", st.cf_blk_on !== "0");
+      setC("#cfBlkMystery", st.m_block_mystery_bio === "1");
+      setC("#cfBlkLottery", st.m_block_lottery === "1");
+      setC("#cfBlkEmpty", st.m_block_empty_space === "1");
+      segPick("#cfLvlRow", st.cf_min_level || "2");
+      segPick("#cfMultiRow", st.m_dm_multicand || "1");
+      segPick("#cfSpeedRow", st.m_filter_speed || "2");
+      ftLoadPanel(st, d.ft);
       setC("#mFollowEmph", st.bili_follow_emph !== "0");
       const fm = $("#mFollowMonths");
       if (fm) { fm.value = st.bili_follow_months || "1"; $("#mFollowMonthsVal").textContent = fm.value; }
@@ -960,11 +1250,30 @@
       m_dedup: $("#mDedup").checked ? "1" : "0",
       m_emotion: $("#mEmotion").checked ? "1" : "0",
       m_news_fresh: $("#mNewsFresh").checked ? "1" : "0",
+      m_play_related: $("#mPlayRel").checked ? "1" : "0",
       bili_follow_emph: $("#mFollowEmph").checked ? "1" : "0",
       bili_follow_months: String(parseInt($("#mFollowMonths").value, 10) || 0),
       m_sources: srcGroups.filter((g) => g.on).map((g) => g.id),
     }, "保存 B站筛选");
     if (r) { loadMachine(); restartFeed(); }
+  };
+  // 评论 / 弹幕筛选单独一个保存按钮（旧版也是分开的：那边管「谁发的」，和上面的规则不共用一次保存）
+  $("#cfSave").onclick = async () => {
+    const pick = (sel, dflt) => {
+      const b = $(sel + " .seg.on");
+      return (b && b.dataset.v) || dflt;
+    };
+    const r = await save("/api/machine", {
+      m_dm_on: $("#cfDmOn").checked ? "1" : "0",
+      cf_blk_on: $("#cfBlkOn").checked ? "1" : "0",
+      m_block_mystery_bio: $("#cfBlkMystery").checked ? "1" : "0",
+      m_block_lottery: $("#cfBlkLottery").checked ? "1" : "0",
+      m_block_empty_space: $("#cfBlkEmpty").checked ? "1" : "0",
+      cf_min_level: pick("#cfLvlRow", "2"),
+      m_dm_multicand: pick("#cfMultiRow", "1"),
+      m_filter_speed: pick("#cfSpeedRow", "2"),
+    }, "保存评论 / 弹幕筛选");
+    if (r) loadMachine();
   };
   $("#mBlSync").onclick = async () => {
     const r = await save("/api/machine/blocklist-sync", {}, "同步拉黑名单");
@@ -996,6 +1305,72 @@
     $("#tbBrowseHint").textContent = r && r.ok ? (r.message || ("已抓取 " + (r.items || 0) + " 条")) : ("抓取失败：" + ((r && r.error) || ""));
     if (r && r.ok) { loadStatus(); restartFeed(); }
   };
+
+  /* ================= 快速文本分析（本地 fastText：管「说了什么」，与身份类规则独立）================= */
+  const FT_LABELS = [["ftLabFlame", "flame"], ["ftLabSpam", "spam"], ["ftLabClickbait", "clickbait"],
+                     ["ftLabYy", "yy"], ["ftLabNeg", "neg"]];
+  function ftStatusText(f) {
+    if (!f) return "模型状态：读取中…";
+    if (f.has_module === false) return "模型状态：本机缺少运行时（desktop/model/ 下应有 ftrt.py）";
+    if (!f.ready && f.on) return "模型状态：加载中…（首次要几秒）" + (f.err ? "；" + f.err : "");
+    if (!f.ready) return "模型状态：待机（" + (f.size_mb || 0) + " MB，开启后加载）";
+    return "模型状态：已加载 " + (f.size_mb || 0) + " MB · 标签 " + (f.labels || []).length +
+      " 个 · 缓存 " + (f.cache || 0) + " 条";
+  }
+  function ftLoadPanel(st, f) {
+    if (st) {
+      const sc = (id, v) => { const e = $(id); if (e) e.checked = !!v; };
+      sc("#ftOn", st.ft_on === "1");
+      sc("#ftVideo", st.ft_video !== "0");
+      sc("#ftDm", st.ft_dm !== "0");
+      sc("#ftCf", st.ft_cf !== "0");
+      const have = String(st.ft_labels || "").split(",").map((x) => x.trim()).filter(Boolean);
+      FT_LABELS.forEach(([id, key]) => sc("#" + id, have.indexOf(key) >= 0));
+      segPick("#ftThreshRow", st.ft_thresh || "70");
+    }
+    const el = $("#ftStatus");
+    if (el) el.textContent = ftStatusText(f);
+  }
+  async function ftRefreshStatus() {
+    try { ftLoadPanel(null, await api("/api/textfilter/status")); } catch (e) {}
+  }
+  $("#ftOn").onclick = async () => {
+    const on = $("#ftOn").checked;
+    const r = await save("/api/machine", { ft_on: on ? "1" : "0" }, "切换文本分析");
+    if (!r) { $("#ftOn").checked = !on; return; }
+    loadMachine();                                  // 模型在后台加载，状态行靠补刷两次跟上
+    setTimeout(ftRefreshStatus, 1200);
+    setTimeout(ftRefreshStatus, 4000);
+  };
+  $("#ftSave").onclick = async () => {
+    const labs = FT_LABELS.filter(([id]) => $("#" + id).checked).map((x) => x[1]);
+    const pick = $("#ftThreshRow .seg.on");
+    const r = await save("/api/machine", {
+      ft_video: $("#ftVideo").checked ? "1" : "0",
+      ft_dm: $("#ftDm").checked ? "1" : "0",
+      ft_cf: $("#ftCf").checked ? "1" : "0",
+      ft_labels: labs.join(","),
+      ft_thresh: (pick && pick.dataset.v) || "70",
+    }, "保存文本分析设置");
+    if (r) { loadMachine(); restartFeed(); }
+  };
+  async function ftProbe() {
+    const t = ($("#ftProbeIn").value || "").trim();
+    const out = $("#ftProbeOut");
+    if (!t) { out.textContent = "先输入一句话。"; return; }
+    out.textContent = "判定中…";
+    let r;
+    try { r = await api("/api/textfilter/probe", { method: "POST", body: JSON.stringify({ text: t }) }); }
+    catch (e) { out.textContent = "判定失败：" + e; return; }
+    if (!r || !r.ok) { out.textContent = "没判出来：" + ((r && r.reason) || "未知原因"); return; }
+    const verdict = r.hit ? " → 会拦"
+      : (r.picked ? " → 不拦（低于阈值 " + Math.round((r.thresh || 0) * 100) + "%）" : " → 不拦（该标签没勾）");
+    const top = (r.top || []).slice(0, 3).map((x) => x.name + " " + Math.round(x.score * 100) + "%").join(" · ");
+    out.textContent = "判成「" + (r.name || r.label) + "」" + Math.round((r.score || 0) * 100) + "%" + verdict +
+      "；前三：" + top;
+  }
+  $("#ftProbeBtn").onclick = ftProbe;
+  $("#ftProbeIn").addEventListener("keydown", (e) => { if (e.key === "Enter") ftProbe(); });
 
   /* 黑白名单 */
   async function loadBlacklist() {
@@ -1248,6 +1623,56 @@
   $("#accBiliQr").onclick = () => mountQr($("#accQrBox"), "bili");
   $("#accXhhQr").onclick = () => mountQr($("#accQrBox"), "xhh");
   $("#accTbCookie").onclick = () => mountTiebaCookie($("#accQrBox"));
+  // 贴吧没有官方二维码接口，走「本机浏览器登录 → 服务端抓 Cookie」：
+  // 有 Chrome/Edge 时弹一个窗口，用户登完轮询拿凭证；没有浏览器时后端回 manual=true，
+  // 那就退回手动粘 Cookie（和旧版同一套行为）。
+  let tbTimer = null;
+  function tbPollStop() { if (tbTimer) { clearInterval(tbTimer); tbTimer = null; } }
+  const tbState = (t) => { const e = $("#tbLoginState"); if (e) e.textContent = t; };
+  $("#accTbQr").onclick = async () => {
+    tbPollStop();
+    $("#tbLoginRow").style.display = "";
+    tbState("正在启动登录窗口…");
+    const r = await api("/api/tieba/login", { method: "POST", body: "{}" });
+    if (!r || !r.ok) { tbState("启动失败：" + ((r && r.error) || "未知原因")); return; }
+    if (r.manual) {
+      tbState("已用默认浏览器打开登录页；登完请用「手动粘 Cookie」保存");
+      mountTiebaCookie($("#accQrBox"));
+      return;
+    }
+    tbState("浏览器窗口已弹出，请在窗口中完成登录…");
+    tbTimer = setInterval(async () => {
+      let p;
+      try { p = await api("/api/tieba/login/poll"); } catch (e) { return; }
+      tbState(p.message || p.status || "等待中…");
+      if (p.status === "ok") {
+        tbPollStop();
+        tbState("登录成功，已保存凭证");
+        toast("贴吧登录成功", true);
+        loadMessages(); loadAccount(); loadStatus(); restartFeed();
+      } else if (p.status === "expired" || p.status === "error" || p.status === "closed") {
+        tbPollStop();
+        if (p.status !== "closed") toast(p.status === "expired" ? "登录超时，请重试" : (p.message || "登录失败"), true);
+      }
+    }, 2500);
+  };
+  $("#accTbLoginStop").onclick = async () => {
+    await api("/api/tieba/login/stop", { method: "POST", body: "{}" });
+    tbPollStop();
+    tbState("窗口已关闭");
+  };
+  $("#tbImport").onclick = async () => {
+    const hint = $("#tbImportHint");
+    hint.textContent = "拉取中…";
+    const r = await api("/api/tieba/mylike");
+    if (!r || !r.ok) { hint.textContent = ""; toast("导入失败：" + ((r && r.error) || ""), true); return; }
+    const cur = ($("#tbBars").value || "").split(/[\n,，、;；]+/).map((x) => x.trim()).filter(Boolean);
+    const merged = Array.from(new Set(cur.concat(r.bars || [])));
+    $("#tbBars").value = merged.join("\n");
+    hint.textContent = "已导入 " + ((r.bars || []).length) + " 个吧";
+    if (!(await save("/api/tieba", { bars: merged }, "保存吧列表"))) return;
+    loadTiebaBars(); loadStatus(); restartFeed();
+  };
   async function loadTiebaBars() {
     try {
       const d = await api("/api/tieba");
@@ -1636,5 +2061,38 @@
   loadChatHistory();      // 打开就把服务端已有的对话读回来（含当前会话标题）
   loadMessages();
   loadAccount();
+  refreshFloatBall();
   setInterval(loadMessages, 60000);
+
+  /* ================= 页面租约 + 前端自动更新 ================= */
+  // 页面租约：服务端据此知道「还有没有界面在跑」。全部离开后（3 秒宽限）才关停服务与悬浮球；
+  // 浏览器崩溃发不出 leaving 时，看门狗按最后心跳超时收尾。
+  const leaseToken = (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+    : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+  function sendLease(action, keepalive) {
+    const text = JSON.stringify({ action: action, token: leaseToken });
+    if (keepalive && navigator.sendBeacon) {
+      navigator.sendBeacon("/api/shutdown", new Blob([text], { type: "application/json" }));
+      return;
+    }
+    fetch("/api/shutdown", { method: "POST", headers: { "Content-Type": "application/json" },
+                             body: text, keepalive: !!keepalive }).catch(function () {});
+  }
+  sendLease("alive");
+  window.addEventListener("pageshow", () => sendLease("alive"));
+  window.addEventListener("pagehide", () => sendLease("leaving", true));
+  // 后台隐藏页的定时器会被节流到约 1 分钟，间隔取 30 秒、服务端宽限 150 秒
+  setInterval(() => sendLease("alive"), 30000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) sendLease("alive"); });
+
+  // 前端文件指纹变了就自动重载（改了 index.html/app.js/style.css 不用手动 Ctrl+F5）
+  let uiVer = null;
+  setInterval(async () => {
+    try {
+      const r = await fetch("/api/ui_version", { cache: "no-store" });
+      const d = await r.json();
+      if (!uiVer) { uiVer = d.version; return; }
+      if (d.version && d.version !== uiVer) location.reload();
+    } catch (e) {}
+  }, 30000);
 })();
