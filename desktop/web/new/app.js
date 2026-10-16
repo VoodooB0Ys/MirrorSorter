@@ -102,7 +102,6 @@
     try {
       localStorage.setItem(STATE_KEY, JSON.stringify({
         view: S.view, lastList: S.lastList, sort: S.sort, src: S.src, q: S.q,
-        search: !!($("#searchRow") && $("#searchRow").classList.contains("show")),
         sec: (typeof currentSec === "function") ? currentSec() : "general",
       }));
     } catch (e) {}
@@ -444,8 +443,11 @@
     try {
       const d = await api("/api/status");
       const sm = d.summary || {};
-      $("#metaText").textContent = "今日收录 " + (sm.received || 0) + " 条 · 剔除 " + (sm.filtered || 0) +
-        " 条 · AI 调用 " + (sm.ai_calls || 0) + " 次 · 成本 ¥" + (sm.cost || 0);
+      // 状态卡（左栏）：一个数一行，比原来挤在顶栏的一长串好读
+      $("#stReceived").textContent = fmt(sm.received || 0) + " 条";
+      $("#stFiltered").textContent = fmt(sm.filtered || 0) + " 条";
+      $("#stCalls").textContent = fmt(sm.ai_calls || 0) + " 次";
+      $("#stCost").textContent = "¥" + (sm.cost || 0);
       const warn = $("#metaWarn");
       warn.hidden = !!d.ai_on;
       warn.textContent = "AI 未配置 · 按热度排序";
@@ -709,12 +711,13 @@
     }
   }
   $("#btnRefresh").onclick = refreshFeed;
+  // 状态卡收放（原来收放的是顶栏那条状态行，现在它成了左栏的卡片）
   $("#metaToggle").onclick = () => {
-    const m = $("#metaLine");
-    const hid = m.style.visibility === "hidden";
-    m.style.visibility = hid ? "" : "hidden";
+    const body = $("#statBody");
+    const hid = body.hidden;
+    body.hidden = !hid;
     $("#metaToggle").classList.toggle("off", !hid);
-    const lbl = hid ? "收起状态行" : "展开状态行";
+    const lbl = hid ? "收起状态卡" : "展开状态卡";
     $("#metaToggle").title = lbl;
     $("#metaToggle").setAttribute("aria-label", lbl);
   };
@@ -757,12 +760,7 @@
     syncTabs();
   });
 
-  $("#btnSearch").onclick = () => {
-    const row = $("#searchRow");
-    row.classList.toggle("show");
-    if (row.classList.contains("show")) $("#searchInput").focus();
-    else { S.q = ""; setView("feed"); saveState(); }
-  };
+  // 搜索常驻顶栏：没有开合动作了，清空输入 = 退出搜索回到信息流
   let searchTimer = null;
   $("#searchInput").oninput = () => {
     clearTimeout(searchTimer);
@@ -2119,11 +2117,9 @@
   const v0 = VIEWS.indexOf(st0.view) >= 0 ? st0.view : "feed";
   if (v0 === "settings" && st0.sec) showSec(st0.sec);
   setView(v0);
-  if (st0.search) $("#searchRow").classList.add("show");
   if (st0.q) {                       // 上次在搜索：接着搜，不把结果丢掉
     S.q = st0.q;
     $("#searchInput").value = st0.q;
-    $("#searchRow").classList.add("show");
     loadFeed(false);
   }
   loadBlacklist();

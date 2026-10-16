@@ -53,46 +53,61 @@
 
 <!-- ============ 顶栏（一条）============ -->
 <header id="topbar">
-  <button id="btnDrawer" class="iconBtn onlyNarrow" aria-label="打开导航" title="打开导航"><svg class="ic"><use href="#i-menu"/></svg></button>
-  <button id="toggleLeft" class="iconBtn" aria-label="收起左栏" title="收起左栏"><svg class="ic"><use href="#i-chevron-left"/></svg></button>
-  <button id="btnBack" class="backBtn" aria-label="返回" style="display:none"><svg class="ic"><use href="#i-arrow-left"/></svg>返回</button>
-  <span class="logo" title="洞鉴虚明 · 采集 / 分拣 / 推送">
-    <!-- 作者本人的 logo（与旧版 desktop/web/index.html 的 .logo-mark 同一份），不自绘替换 -->
-    <svg class="logo-mark" viewBox="0 0 32 32" aria-hidden="true"><g fill="currentColor">
-      <circle cx="7" cy="6.5" r="2.3"/><circle cx="16" cy="4.5" r="2.3"/><circle cx="25" cy="6.5" r="2.3"/>
-    </g><path d="M5 13h22l-8 8v7l-6 2.5v-9.5L5 13z" fill="currentColor"/></svg>
-    <span class="ltxt">Mirror·Sorter</span>
-  </span>
-
-  <div id="listTools">
-    <select id="sortSel" title="排序">
-      <option value="default">综合</option><option value="views">播放</option>
-      <option value="pubdate">最新</option><option value="hot">最新热门</option>
-    </select>
-    <span id="metaLine"><span id="metaText">加载中…</span><em id="metaWarn" hidden></em></span>
-    <button id="metaToggle" class="iconBtn" aria-label="收起状态行" title="收起状态行"><svg class="ic"><use href="#i-chevron-up"/></svg></button>
-    <button id="btnClearPool" class="tb quiet dangerHover">清空信息池</button>
+  <div id="topLeft">
+    <button id="btnDrawer" class="iconBtn onlyNarrow" aria-label="打开导航" title="打开导航"><svg class="ic"><use href="#i-menu"/></svg></button>
+    <button id="toggleLeft" class="iconBtn" aria-label="收起左栏" title="收起左栏"><svg class="ic"><use href="#i-chevron-left"/></svg></button>
+    <button id="btnBack" class="backBtn" aria-label="返回" style="display:none"><svg class="ic"><use href="#i-arrow-left"/></svg>返回</button>
+    <span class="logo" title="洞鉴虚明 · 采集 / 分拣 / 推送">
+      <!-- 作者本人的 logo（与旧版 desktop/web/index.html 的 .logo-mark 同一份），不自绘替换 -->
+      <svg class="logo-mark" viewBox="0 0 32 32" aria-hidden="true"><g fill="currentColor">
+        <circle cx="7" cy="6.5" r="2.3"/><circle cx="16" cy="4.5" r="2.3"/><circle cx="25" cy="6.5" r="2.3"/>
+      </g><path d="M5 13h22l-8 8v7l-6 2.5v-9.5L5 13z" fill="currentColor"/></svg>
+      <span class="ltxt">Mirror·Sorter</span>
+    </span>
   </div>
 
-  <div id="topRight">
-    <select id="modeSel" title="过滤档位">
-      <option>严格</option><option>标准</option><option>宽松</option><option>严肃</option>
-    </select>
-    <button id="btnRefresh" class="tb" title="刷新当前视图（信息流会轮换来源抓新内容）"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button>
-    <button id="toggleRight" class="iconBtn" aria-label="收起右栏" title="收起右栏"><svg class="ic"><use href="#i-chevron-right"/></svg></button>
+  <!-- 搜索常驻顶栏正中：左右两组等宽增长，它才是真正的视觉中心 -->
+  <div id="topSearch">
+    <svg class="ic"><use href="#i-search"/></svg>
+    <input id="searchInput" placeholder="搜标题 / 作者 / 简介…（输入即搜）">
+  </div>
+
+  <div id="topRightWrap">
+    <div id="listTools">
+      <select id="sortSel" title="排序">
+        <option value="default">综合</option><option value="views">播放</option>
+        <option value="pubdate">最新</option><option value="hot">最新热门</option>
+      </select>
+      <button id="btnClearPool" class="tb quiet dangerHover">清空信息池</button>
+    </div>
+
+    <div id="topRight">
+      <select id="modeSel" title="过滤档位">
+        <option>严格</option><option>标准</option><option>宽松</option><option>严肃</option>
+      </select>
+      <button id="btnRefresh" class="tb" title="刷新当前视图（信息流会轮换来源抓新内容）"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button>
+      <button id="toggleRight" class="iconBtn" aria-label="收起右栏" title="收起右栏"><svg class="ic"><use href="#i-chevron-right"/></svg></button>
+    </div>
   </div>
 </header>
 
 <!-- ============ 三栏 ============ -->
 <div id="shell">
   <aside class="side left" id="railLeft">
-    <!-- 平时：导航 + 内容源 + 左下角个人/设置 -->
+    <!-- 原来这里是搜索入口，搜索搬去顶栏正中后，这块放今日状态卡 -->
     <div class="railTop">
-      <button id="btnSearch" class="cmdbar" aria-label="搜索内容">
-        <svg class="ic"><use href="#i-search"/></svg><span>搜索标题 / 作者 / 简介</span>
-      </button>
-      <div id="searchRow" class="searchRow">
-        <input id="searchInput" placeholder="搜标题 / 作者 / 简介…（输入即搜）">
+      <div class="statCard">
+        <div class="scHead">
+          <span>今日状态</span>
+          <button id="metaToggle" class="scToggle" aria-label="收起状态卡" title="收起状态卡"><svg class="ic"><use href="#i-chevron-up"/></svg></button>
+        </div>
+        <div id="statBody">
+          <div class="scRow"><span class="lbl">今日收录</span><b id="stReceived">—</b></div>
+          <div class="scRow"><span class="lbl">规则剔除</span><b id="stFiltered">—</b></div>
+          <div class="scRow"><span class="lbl">AI 调用</span><b id="stCalls">—</b></div>
+          <div class="scRow"><span class="lbl">AI 成本</span><b id="stCost">—</b></div>
+          <em id="metaWarn" hidden>AI 未配置 · 按热度排序</em>
+        </div>
       </div>
     </div>
 
