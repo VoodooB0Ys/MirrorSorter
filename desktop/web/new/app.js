@@ -86,7 +86,7 @@
   /* ================= 界面偏好 ================= */
   const PREF_KEY = "ms-new-prefs";
   const prefs = Object.assign(
-    { theme: "dark", accent: "#fb7299", layout: "single", cover: "m", pv: 2,
+    { theme: "dark", accent: "#fb7299", layout: "single", cover: "m",
       leftW: 238, rightW: 235, le: false, re: false,
       bgHex: "", bgDepth: 0, font: "small", reason: "show", statOpen: true },
     JSON.parse(localStorage.getItem(PREF_KEY) || "{}")
@@ -107,7 +107,7 @@
     } catch (e) {}
   }
   const SEG_ROWS = [["#themeRow", "theme"], ["#layoutRow", "layout"], ["#coverRow", "cover"],
-                    ["#pvRow", "pv"], ["#fontRow", "font"], ["#reasonRow", "reason"]];
+                    ["#fontRow", "font"], ["#reasonRow", "reason"]];
   const CUSTOM_ACCENT_KEY = "ms-new-custom-accent";
   const ACCENTS = ["#fb7299", "#4a9eff", "#67c23a", "#a06bff", "#ff9f43", "#22c3c3", "#8a94a6", "#e8c341"];
   // 背景颜色家族：空串 = 标准（蓝灰底）。选了颜色就整界面底色跟着它走，色相全程保持，深度只推明度。
@@ -425,7 +425,6 @@
       S.waiting = false;
       S.emptyMsg = "";          // 有内容了，清掉"正在重收"之类的说明
       renderItems(items);
-      warmPreviews(items);   // 预热前几张的悬停预览地址（items 是 try 内的 const，只能在这里用）
       S.offset = Number.isInteger(d.next_offset) ? d.next_offset : S.offset + items.length;
       // 到底了没有：信息流是无限的（池子会一直补，绝不置 done，否则预取永久停住）；
       // 历史/收藏一次给全；搜索是一组**有限**结果 —— 后端 has_more 说没有、或这一页已经空，
@@ -1842,70 +1841,10 @@
     } catch (e) {}
   }
 
-  /* ================= 封面悬停预览（放大 + 试播一小段）================= */
-  // 契约：GET /api/preview?bvid= 直接返回代理路径 /api/video-proxy?...&cid=...，
-  // 前端把它塞给一个 <video> 即可，不需要自己拼 cid。触屏没有悬停，直接不做。
-  const pvCache = new Map();
-  let pvOverlay = null;
-  const noHover = () => window.matchMedia("(hover:none)").matches;
-  function stopPreview() {
-    if (!pvOverlay) return;
-    const v = pvOverlay.querySelector("video");
-    if (v) { try { v.pause(); } catch (e) {} }
-    pvOverlay.remove();
-    pvOverlay = null;
-  }
-  async function startPreview(thumb) {
-    if (noHover()) return;
-    const card = thumb.closest(".card");
-    if (!card) return;
-    const bvid = ((card.dataset.url || "").match(/BV[0-9A-Za-z]{8,12}/) || [])[0];
-    if (!bvid) return;
-    let src = pvCache.get(bvid);
-    if (src === undefined) {
-      try { const d = await api("/api/preview?bvid=" + encodeURIComponent(bvid)); src = d.ok ? d.src : null; }
-      catch (e) { src = null; }
-      pvCache.set(bvid, src);
-    }
-    if (!src) return;                       // 取不到就什么都不做（不放大也不报错）
-    stopPreview();
-    const rect = thumb.getBoundingClientRect();
-    const zoom = parseFloat(prefs.pv) || 2;
-    const ovW = Math.round(rect.width * zoom), ovH = Math.round(rect.height * zoom);
-    const feed = $("#list").getBoundingClientRect();
-    let left = Math.round(rect.left + rect.width / 2 - ovW / 2);        // 以封面中心为锚点
-    left = Math.max(feed.left, Math.min(left, Math.round(feed.left + feed.width - ovW)));
-    const ov = document.createElement("div");
-    ov.className = "pvOverlay";
-    ov.style.cssText = "left:" + left + "px;top:" + Math.round(rect.top) + "px;width:" + ovW + "px;height:" + ovH + "px";
-    const img = thumb.querySelector("img");
-    ov.innerHTML = (img && img.src ? '<img src="' + esc(img.src) + '" referrerpolicy="no-referrer" alt="">' : "") +
-      '<video muted loop playsinline preload="auto"></video>';
-    document.body.appendChild(ov);
-    pvOverlay = ov;
-    const v = ov.querySelector("video");
-    v.oncanplay = () => { v.play().catch(function () {}); };   // 封面先显示，能播了再接上
-    v.src = src;
-  }
-  $("#list").addEventListener("mouseover", (e) => {
-    const t = e.target.closest(".thumb");
-    if (t) startPreview(t);
-  });
-  $("#list").addEventListener("mouseout", (e) => {
-    if (e.target.closest(".thumb")) stopPreview();
-  });
-  window.addEventListener("scroll", stopPreview, true);
-  // 顺序预取前几张的预览地址（旧版同做法），悬停时才不用等
-  function warmPreviews(items) {
-    if (noHover()) return;
-    (items || []).slice(0, 6).forEach((it) => {
-      const m = ((it.url || "").match(/BV[0-9A-Za-z]{8,12}/) || [])[0];
-      if (!m || pvCache.has(m)) return;
-      api("/api/preview?bvid=" + encodeURIComponent(m))
-        .then((d) => pvCache.set(m, d.ok ? d.src : null))
-        .catch(() => pvCache.set(m, null));
-    });
-  }
+  /* ================= 封面悬停预览（已按用户要求整块移除）================= */
+  // 原来鼠标停在封面上会放大并试播一小段（走 /api/preview → /api/video-proxy）。
+  // 用户明确说不需要，整块删掉。顺带省掉的是实测每开一次界面就上百次 /api/preview 请求
+  // ——那每一条都要服务端去问一次 B站 接口，只为了一次悬停。
 
   /* ================= AI 聊天 ================= */
   // 对话列表：切换 / 重命名 / 删除（旧版有，新版补上）

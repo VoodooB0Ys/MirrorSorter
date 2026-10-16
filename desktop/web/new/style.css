@@ -236,11 +236,7 @@ html[data-theme="light"] .pb.xhh,html[data-theme="light"] .mark.xhh{color:#8a641
 #ctxBar .t{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #ctxBar .iconBtn{color:var(--accent-ink);width:22px;height:22px}
 
-/* ---------- 悬停预览：封面放大 + 试播一小段（fixed 定位，不被滚动容器裁剪）---------- */
-.pvOverlay{position:fixed;z-index:150;pointer-events:none;border-radius:10px;overflow:hidden;
-  background:var(--panel2);box-shadow:0 14px 40px rgba(0,0,0,.5)}
-.pvOverlay img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
-.pvOverlay video{position:relative;width:100%;height:100%;object-fit:cover}
+/* ---------- 悬停预览已移除（用户不要封面放大预览）---------- */
 
 /* ---------- 站内阅读（弹窗加宽）---------- */
 #modal.wide{max-width:880px}
