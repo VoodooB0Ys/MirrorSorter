@@ -1310,14 +1310,26 @@
   $("#tbBrowseOpen").onclick = async () => {
     const kw = $("#tbBrowseKw").value;
     if (!kw) { toast("请先在「平台账号」里填吧名", true); return; }
-    const r = await save("/api/tieba/browse?kw=" + encodeURIComponent(kw), {}, "打开贴吧窗口");
+    // 这个端点是 GET（旧版也走 GET）。原来误用了 save()，那是 POST ——
+    // 服务端没有 POST 分支，请求直接 404，整条应急通道的第一步根本打不开。
+    let r = null;
+    try { r = await api("/api/tieba/browse?kw=" + encodeURIComponent(kw)); } catch (e) {}
     $("#tbBrowseHint").textContent = r && r.ok ? (r.message || "已打开") : ("打开失败：" + ((r && r.error) || "需要本机有 Chrome/Edge"));
   };
   $("#tbBrowseGrab").onclick = async () => {
     $("#tbBrowseHint").textContent = "抓取中…";
-    const r = await save("/api/tieba/grab", {}, "抓取贴吧页");
-    $("#tbBrowseHint").textContent = r && r.ok ? (r.message || ("已抓取 " + (r.items || 0) + " 条")) : ("抓取失败：" + ((r && r.error) || ""));
-    if (r && r.ok) { loadStatus(); restartFeed(); }
+    // 同样走原始 api()：save() 遇到 {ok:false} 会吞掉响应只回 null，
+    // 结果提示行只剩「抓取失败：」后面空白，后端那句「窗口未打开…」就传不出来。
+    let r = null;
+    try { r = await api("/api/tieba/grab", { method: "POST", body: "{}" }); } catch (e) {}
+    if (r && r.ok) {
+      $("#tbBrowseHint").textContent = r.message || ("已抓取 " + (r.items || 0) + " 条");
+      loadStatus(); restartFeed();
+    } else {
+      const why = (r && r.error) || "未知原因";
+      $("#tbBrowseHint").textContent = "抓取失败：" + why;
+      toast("抓取失败：" + why, true);
+    }
   };
 
   /* ================= 快速文本分析（本地 fastText：管「说了什么」，与身份类规则独立）================= */
