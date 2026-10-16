@@ -880,6 +880,8 @@
   };
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
+    // 弹窗优先：它盖住整屏，而且里面有正在播放的播放器 —— 键盘也得能关掉它
+    if ($("#mask").classList.contains("show")) { closeModal(); return; }
     if (document.body.classList.contains("drawer")) { closeDrawer(); return; }
     if (PANES[S.view]) setView(S.lastList || "feed");
   });
@@ -1652,7 +1654,14 @@
     }
     $("#modal .mbody").innerHTML = h + '<p class="tip">只含首批内容；看全帖点下面的「打开原文」。</p>';
   }
-  function closeModal() { $("#mask").classList.remove("show"); $("#modal").classList.remove("wide"); clearInterval(qrTimer); }
+  // 关闭时必须把内容真的拆掉，不能只是藏起来：站内播放的 iframe 留在 DOM 里会继续出声，
+  // 用户看到的就是"点了 × 还在后台播"。移除节点同时也会释放它的解码资源。
+  function closeModal() {
+    $("#mask").classList.remove("show");
+    $("#modal").classList.remove("wide");
+    $("#modal").innerHTML = "";
+    clearInterval(qrTimer);
+  }
   $("#mask").addEventListener("click", (e) => { if (e.target.id === "mask") closeModal(); });
 
   let qrTimer = null;

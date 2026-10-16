@@ -9357,7 +9357,11 @@ def record_feed_presentations(items, request_id, now=None):
             keys.append(k)
     if not keys:
         return
-    with _db_lock:
+    # 限时拿锁: 后台重建会长时间占着 _db_lock, 一次记账不值得让整页信息流一起等。
+    # 拿不到就直接跳过本次登记(下面的 shown 回写也一样, 在 serve_chunk 里同样限时)。
+    if not _db_lock.acquire(timeout=0.4):
+        return
+    try:
         conn = db()
         # ① 批量登记展示, RETURNING 只把"本次真正新登记"的 key 取回来
         fresh = []
@@ -9394,6 +9398,8 @@ def record_feed_presentations(items, request_id, now=None):
             rows.append((k, run, now, cooldown))
         conn.executemany(_UPSERT_EXPOSURE, rows)
         _commit()
+    finally:
+        _db_lock.release()
 
 
 def _feed_plan(acts, new_session, gen):
@@ -9938,20 +9944,33 @@ def serve_chunk(offset=0, limit=30, q="", request_id="", plat=""):
     # 提交一次 = 4 次 fsync(~5ms)。圈进 _batch_commit() 后只落 1 次磁盘同步。
     #
     # 这一整段都是"读完正文之后的记账", 必须尽力而为: 它失败绝不能让已经取好的这一页
-    # 跟着失败。实测(池子在后台重建时)这里两条写语句都会撞上 SQLite 的写锁, 等满
+    # 跟着失败。实测(池子在后台重建时)这里的写语句会撞上 SQLite 的写锁, 等满
     # busy_timeout 10s 后抛 "database is locked"; 异常一路上抛到 do_GET, 请求线程直接
     # 死掉、连接被掐断 —— 客户端拿不到任何响应, 界面就一直停在「正在准备内容…」,
-    # 也就是用户报的"明明该预加载好, 却还要等"。丢掉一次记账的代价只是这一页的
-    # 曝光/去重少记一次, 下一页就会补上, 比整页取不到内容轻得多。
+    # 也就是用户报的"明明该预加载好, 却还要等"。
+    #
+    # 而且光包住异常还不够: 撞上写锁时请求仍会干等最多 10 秒才算完, 用户看到的就是
+    # "滑到底还是转圈"。所以这一段单独把 busy_timeout 压到 400ms —— 拿不到写锁就
+    # 立刻放弃本次记账, 把这一页原样发出去。丢一次记账只是这一页的曝光/去重少记一笔,
+    # 下一页就会补上; 让用户等十秒去换一次记账, 代价完全不成比例。
     with _batch_commit():
+        _conn = None
         try:
+            _conn = db()
+            _conn.execute("PRAGMA busy_timeout=400")   # 只作用于这条线程的连接, 下面 finally 还原
             if chunk and not q:
                 record_feed_presentations(chunk, request_id or uuid.uuid4().hex, now_ts)
-            with _db_lock:
+            # _db_lock 也要限时拿: 池子重建那一大笔写入会长时间占着它, 而 `with` 是无期限等待 ——
+            # 这就成了"滑到底转圈"的另一半原因。拿不到就当这次记账没做成, 直接往下返回。
+            if not _db_lock.acquire(timeout=0.4):
+                raise RuntimeError("等 _db_lock 超时(后台写入占用中)")
+            try:
                 db().executemany("INSERT OR REPLACE INTO shown(key, ts) VALUES(?,?)",
                                  [(it["key"], now_ts) for it in chunk if it.get("key")])
                 db().execute("DELETE FROM shown WHERE ts < ?", (now_ts - 3 * 86400,))
                 _commit()
+            finally:
+                _db_lock.release()
             if chunk:
                 set_last_feed(chunk[-1])   # “刚才那条”指代目标
                 try:   # 跨会话防重复: 记住本次会话末尾5条的一级分类(下次启动前5条避开)
@@ -9967,6 +9986,12 @@ def serve_chunk(offset=0, limit=30, q="", request_id="", plat=""):
                 pass
             print("[feed] 记账失败已跳过(本页照常返回): %s: %s"
                   % (type(e).__name__, str(e)[:120]), flush=True)
+        finally:
+            if _conn is not None:
+                try:
+                    _conn.execute("PRAGMA busy_timeout=10000")
+                except Exception:
+                    pass
     next_offset = consumed_end
     return {"ok": True, "items": chunk, "building": building, "gen": uni["gen"],
             "source": uni["source"], "offline": uni["offline"],
