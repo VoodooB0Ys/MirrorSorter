@@ -88,7 +88,7 @@
   const prefs = Object.assign(
     { theme: "dark", accent: "#fb7299", layout: "single", cover: "m", pv: 2,
       leftW: 238, rightW: 235, le: false, re: false,
-      bgHex: "", bgDepth: 0, font: "small", reason: "show" },
+      bgHex: "", bgDepth: 0, font: "small", reason: "show", statOpen: true },
     JSON.parse(localStorage.getItem(PREF_KEY) || "{}")
   );
   const savePrefs = () => localStorage.setItem(PREF_KEY, JSON.stringify(prefs));
@@ -230,7 +230,21 @@
     document.body.style.zoom = z === 1 ? "" : String(z);
     html.style.setProperty("--ui-zoom", String(z));
     listEl.classList.toggle("noreason", prefs.reason !== "show");
+    applyStatCard();
     pushTheme();
+  }
+  // 今日状态卡的收放。收起来是「界面偏好」而不是「你现在在哪」，所以跟着 prefs 存，
+  // 并且要由 applyPrefs 统一应用 —— 只写在点击处理里的话，刷新一次就自己展开了，
+  // 用户会觉得上一次收起来白收了。
+  function applyStatCard() {
+    const body = $("#statBody"), btn = $("#metaToggle");
+    if (!body || !btn) return;
+    const open = prefs.statOpen !== false;
+    body.hidden = !open;
+    btn.classList.toggle("off", !open);
+    const lbl = open ? "收起状态卡" : "展开状态卡";
+    btn.title = lbl;
+    btn.setAttribute("aria-label", lbl);
   }
   // 把当前主题/强调色推给服务端：桌面窗口壳与悬浮球读这份，页面重开也能恢复。
   // 拖动分割线会逐帧走 applyPrefs，这里必须合并请求，否则一拖动就是一串 POST。
@@ -719,13 +733,9 @@
   $("#btnRefresh").onclick = refreshFeed;
   // 状态卡收放（原来收放的是顶栏那条状态行，现在它成了左栏的卡片）
   $("#metaToggle").onclick = () => {
-    const body = $("#statBody");
-    const hid = body.hidden;
-    body.hidden = !hid;
-    $("#metaToggle").classList.toggle("off", !hid);
-    const lbl = hid ? "收起状态卡" : "展开状态卡";
-    $("#metaToggle").title = lbl;
-    $("#metaToggle").setAttribute("aria-label", lbl);
+    prefs.statOpen = !(prefs.statOpen !== false);
+    savePrefs();
+    applyStatCard();
   };
   $("#btnClearPool").onclick = async () => {
     if (!confirm("清空信息池：丢弃已收录的全部内容与「已看过」记录，再按当前设置重新抓取。\n\n" +
