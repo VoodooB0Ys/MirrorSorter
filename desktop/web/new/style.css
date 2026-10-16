@@ -8,18 +8,20 @@
   --accent-ink:#fc91af;      /* 强调色当文字用（深色主题下提亮） */
   --accent-strong:#974861;   /* 强调色当实底、托白字用（压暗到白字达标） */
   --bg:#0b0d10; --panel:#13161b; --panel2:#1b1f26; --line:#272d36;
-  --fg:#e9ecf1; --fg2:#98a3b0; --fg3:#7d8794;
+  --fg:#e9ecf1; --fg2:#98a3b0; --fg3:#828d9a;
   --ok:#5fa855; --warn:#d09040; --danger:#e06a6a;
   --card:#161a20; --hover:#1e242c;
   --leftW:238px; --rightW:246px; --thumbW:156px;
   --r-ctl:7px; --r-box:10px;
 }
+/* 浅色主题的 fg3 / ok / warn 是按对比度反解出来的（对 bg/panel/panel2/hover 四种底色都不低于 4.5:1），
+   不要凭眼睛调亮：这三个色原来是 #6b7583 / #3f7f36 / #a26d20，在浅底上只有 4.12 / 4.31 / 3.91。 */
 html[data-theme="light"]{
   --bg:#eef1f6; --panel:#ffffff; --panel2:#f2f4f8; --line:#dfe4ec;
-  --fg:#1b1f24; --fg2:#5d6878; --fg3:#6b7583;
+  --fg:#1b1f24; --fg2:#5d6878; --fg3:#646d7b;
   --card:#ffffff; --hover:#f3f6fb;
   --accent-ink:#3168a8; --accent-strong:#356db8;
-  --ok:#3f7f36; --warn:#a26d20; --danger:#c0392b;
+  --ok:#3d7a34; --warn:#92631d; --danger:#c0392b;
 }
 html[data-theme="dark"]{color-scheme:dark}
 html[data-theme="light"]{color-scheme:light}
@@ -32,7 +34,10 @@ body{margin:0;background:var(--bg);color:var(--fg);overflow:hidden;
   display:flex;flex-direction:column;
   font:13px/1.5 -apple-system,"Segoe UI","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
 button{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);
-  border-radius:var(--r-ctl);padding:4px 10px;cursor:pointer;white-space:nowrap}
+  border-radius:var(--r-ctl);padding:4px 10px;cursor:pointer;white-space:nowrap;
+  /* 卡片一直在 .12s 过渡，控件却瞬间跳色，同一屏里两种手感；这里统一成一样长。
+     prefers-reduced-motion 的全局规则会把它关掉。 */
+  transition:background-color .12s,border-color .12s,color .12s}
 button:hover{border-color:var(--accent-ink)}
 button.on{background:var(--accent-strong);border-color:var(--accent-strong);color:#fff}
 input,textarea,select{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);
@@ -66,7 +71,7 @@ input:focus,textarea:focus,select:focus{border-color:var(--accent-ink)}
 #topLeft{flex:1;display:flex;align-items:center;gap:8px;min-width:0}
 /* 搜索常驻顶栏正中：左右两组等宽增长，它才落在窗口的视觉中心（不是剩余空间的中心） */
 #topSearch{flex:none;width:min(400px,32vw);display:flex;align-items:center;gap:6px;
-  background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:0 9px}
+  background:var(--panel2);border:1px solid var(--line);border-radius:var(--r-ctl);padding:0 9px}
 #topSearch:focus-within{border-color:var(--accent-ink)}
 #topSearch .ic{color:var(--fg3)}
 #topSearch input{flex:1;min-width:0;background:transparent;border:none;padding:5px 0;font-size:12.5px}
@@ -186,7 +191,7 @@ html[data-theme="light"] .pb.xhh,html[data-theme="light"] .mark.xhh{color:#8a641
 .col{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
 .meta{font-size:11.5px;color:var(--fg2);max-width:110ch}
 .meta .au{color:var(--accent-ink)}
-.desc{font-size:12.5px;color:var(--fg2);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
+.desc{font-size:13px;color:var(--fg2);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
   overflow:hidden;line-height:1.6;max-width:96ch;text-wrap:pretty}
 .reason{display:inline-flex;align-items:center;gap:5px;align-self:flex-start;max-width:100%;
   font-size:11.5px;color:var(--accent-ink);background:var(--accent-soft);border-radius:6px;padding:2px 8px}
@@ -203,7 +208,7 @@ html[data-theme="light"] .pb.xhh,html[data-theme="light"] .mark.xhh{color:#8a641
 .acts button.liked{color:var(--accent-ink);border-color:var(--accent-ink);background:var(--accent-soft)}
 /* 次要动作：有指针悬停能力时才收起，且只在卡片悬停/键盘聚焦时出现。
    触屏（hover:none）常显，键盘 Tab 进卡片即出现 —— 入口不丢。 */
-.acts .sec{opacity:1}
+.acts .sec{opacity:1;transition:opacity .12s}
 @media (hover:hover) and (pointer:fine){
   .acts .sec{opacity:0}
   .card:hover .acts .sec,.card:focus-within .acts .sec{opacity:1}
