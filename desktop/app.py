@@ -364,7 +364,9 @@ DEFAULTS = {
     "m_max_age_months": "5",  # 机器筛选: 只显示最近N个月发布的内容(0=不限)
     "ser_max_age_months": "30",  # 严肃模式独立时间窗: 知识/教程内容历史长, 默认30个月(0=不限)
     "m_seen_hours": "6",      # 通用筛选: 已看信息N小时内不重复出现(0=不限)
-    "m_cold_start_n": "10",   # 启动预缓存: 退出时缓存池首未展示条目N条, 下次打开直接展示(0=关闭)
+    "m_cold_start_n": "200",  # 启动预缓存: 退出时缓存池首未展示条目N条, 下次打开直接展示(0=关闭)
+                              # 原来是 10 —— 重启后只有 10 条垫底, 其余全靠重建(10~30 秒), 这与
+                              # "打开就能刷"的目标正相反。缓存是纯本地 JSON, 不联网。
     "m_repeat_limit": "4",    # 通用筛选: 同一信息累计展示N次后进入冷却
     "m_repeat_cooldown_hours": "72",  # 通用筛选: 冷却N小时后再显示
     "m_play_related": "1",    # 机器筛选: 播放页推荐视频按规则筛选并与泛热门7:3混排(默认开)
@@ -3201,25 +3203,40 @@ def get_feed_raw(force=False):
     return _feed_cache["payload"]
 
 
-def backlog_items(exclude_keys, enabled_ids, limit=100):
+def backlog_items(exclude_keys, enabled_ids, limit=300):
     """历史沉淀池: 之前几轮抓过、但当前新鲜页没有的条目(严格按分区开关过滤)。
-    弱化: 只少量回流(100条), 避免历史内容反复占满首页导致信息重复率高。"""
+
+    原来 limit=100、只扫最新 600 行, 注释写的理由是"避免历史内容反复占满首页导致重复率高"。
+    实测(用户真实数据): 本地 items 存量 2.9 万条, 其中 1 万多条**从没推给过该用户**,
+    而当前内存池只有两千条上下 —— 前端要保持 300 条缓冲, 很快见底, 滑到底就得等下一次构建;
+    可源上此刻往往没有新内容(实测一次全量构建只多出 12 条)。也就是说用户等的主要不是网络,
+    是这个被卡在 100 条的本地回流。
+    现在放大到 300 条、扫描窗口 3000 行, 并**优先挑没进过 shown 的**: 回流进来的确实是他没看过的,
+    而不是把刚看过的又端回来。重复率交给 shown 表把关, 不再靠"少回流"来压。
+    本函数只读本地库, 不联网 —— 加深池子不增加任何抓取请求。"""
     seen = set(exclude_keys)
-    out = []
+    try:
+        shown = {r[0] for r in db().execute("SELECT key FROM shown").fetchall()}
+    except Exception:
+        shown = set()
+    fresh, stale = [], []
     for (j,) in db().execute(
-            "SELECT json FROM items ORDER BY fetched_at DESC LIMIT 600").fetchall():
-        if len(out) >= limit:
+            "SELECT json FROM items ORDER BY fetched_at DESC LIMIT 3000").fetchall():
+        if len(fresh) >= limit:
             break
         try:
             it = json.loads(j)
         except Exception:
             continue
-        if it.get("key") in seen:
+        k = it.get("key")
+        if not k or k in seen:
             continue
         if not item_domain_ok(it, enabled_ids):
             continue   # 统一分区校验: 旧池里不属于当前分区的全部不会回流
-        seen.add(it["key"])
-        out.append(it)
+        seen.add(k)
+        (stale if k in shown else fresh).append(it)
+    # 没看过的排前面; 不够 limit 才用看过的补满(总回流上限仍是 limit)
+    return (fresh + stale)[:limit]
     return out
 
 
@@ -9506,8 +9523,15 @@ def build_universe(quick=False):
                 db().execute("DELETE FROM items WHERE fetched_at < ?", (now - 7 * 86400,))
                 db().commit()
             bump_stats(received=new_n)   # 今日收录只累计新增
-            payload["items"] = payload["items"] + backlog_items(
-                {it["key"] for it in payload["items"]}, enabled_source_ids())
+            # 回流时把**当前池子里已有的**也排除掉, 不能只排这一轮抓回来的。
+            # 否则每次构建都从"最新的 3000 行"里挑同样的前 300 条, 池子就卡在同一个深度
+            # 不再增长 —— 实测连做 5 轮补池, 池深一直是 482, 本地一万多条没推过的存货
+            # 一条都没被端上来。排掉池内已有的之后, 每一轮都往更旧的那批走, 池子才会
+            # 真的随着构建逐轮加深(仍然是纯本地读, 不联网)。
+            with _uni_lock:
+                _in_pool = {it.get("key") for it in _universe["items"]}
+            exclude = {it["key"] for it in payload["items"]} | {k for k in _in_pool if k}
+            payload["items"] = payload["items"] + backlog_items(exclude, enabled_source_ids())
         kept = bake_universe(payload, quick=quick)
         threading.Thread(target=ensure_tags, kwargs={"items": kept}, daemon=True).start()   # 后台补标签(厌恶匹配用)
         offline, source = payload["offline"], payload["source"]
