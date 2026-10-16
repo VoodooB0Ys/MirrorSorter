@@ -9936,21 +9936,37 @@ def serve_chunk(offset=0, limit=30, q="", request_id="", plat=""):
     now_ts = int(time.time())
     # v0.3.1.31: 尾部这一整段(展示登记 + shown 回写 + 刚才那条 + 会话分类)原本各自
     # 提交一次 = 4 次 fsync(~5ms)。圈进 _batch_commit() 后只落 1 次磁盘同步。
+    #
+    # 这一整段都是"读完正文之后的记账", 必须尽力而为: 它失败绝不能让已经取好的这一页
+    # 跟着失败。实测(池子在后台重建时)这里两条写语句都会撞上 SQLite 的写锁, 等满
+    # busy_timeout 10s 后抛 "database is locked"; 异常一路上抛到 do_GET, 请求线程直接
+    # 死掉、连接被掐断 —— 客户端拿不到任何响应, 界面就一直停在「正在准备内容…」,
+    # 也就是用户报的"明明该预加载好, 却还要等"。丢掉一次记账的代价只是这一页的
+    # 曝光/去重少记一次, 下一页就会补上, 比整页取不到内容轻得多。
     with _batch_commit():
-        if chunk and not q:
-            record_feed_presentations(chunk, request_id or uuid.uuid4().hex, now_ts)
-        with _db_lock:
-            db().executemany("INSERT OR REPLACE INTO shown(key, ts) VALUES(?,?)",
-                             [(it["key"], now_ts) for it in chunk if it.get("key")])
-            db().execute("DELETE FROM shown WHERE ts < ?", (now_ts - 3 * 86400,))
-            _commit()
-        if chunk:
-            set_last_feed(chunk[-1])   # “刚才那条”指代目标
-            try:   # 跨会话防重复: 记住本次会话末尾5条的一级分类(下次启动前5条避开)
-                cats = [_cat_key(it) for it in chunk[-5:]]
-                sset("last_types", json.dumps(cats, ensure_ascii=False))
+        try:
+            if chunk and not q:
+                record_feed_presentations(chunk, request_id or uuid.uuid4().hex, now_ts)
+            with _db_lock:
+                db().executemany("INSERT OR REPLACE INTO shown(key, ts) VALUES(?,?)",
+                                 [(it["key"], now_ts) for it in chunk if it.get("key")])
+                db().execute("DELETE FROM shown WHERE ts < ?", (now_ts - 3 * 86400,))
+                _commit()
+            if chunk:
+                set_last_feed(chunk[-1])   # “刚才那条”指代目标
+                try:   # 跨会话防重复: 记住本次会话末尾5条的一级分类(下次启动前5条避开)
+                    cats = [_cat_key(it) for it in chunk[-5:]]
+                    sset("last_types", json.dumps(cats, ensure_ascii=False))
+                except Exception:
+                    pass
+        except Exception as e:
+            # 回滚掉半截事务, 否则这条线程的连接会把写锁一直攥着, 拖垮后面的请求
+            try:
+                db().rollback()
             except Exception:
                 pass
+            print("[feed] 记账失败已跳过(本页照常返回): %s: %s"
+                  % (type(e).__name__, str(e)[:120]), flush=True)
     next_offset = consumed_end
     return {"ok": True, "items": chunk, "building": building, "gen": uni["gen"],
             "source": uni["source"], "offline": uni["offline"],
