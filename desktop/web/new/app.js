@@ -392,13 +392,19 @@
         S.loading = false;
         S.waiting = true;      // 等下一轮再取，期间预取不重复触发
         loadStatus();          // 这里也要刷状态行，否则顶栏/内容源会停在「加载中…」
-        // 退避：前几轮 1.8s，之后放宽到 5s；不设"放弃"，后台补到货就自动接上
+        // 重试间隔必须跟得上后端的补池节奏。池子补充期间服务端游标会间歇性吐空页
+        // （实测连翻 14 页里有 9 页是空的，池子从 303 慢慢涨到 549），旧版靠 300~700ms
+        // 的快速轮询把这些空档抹平，用户感觉不到。这里原来退避到 1.8s、连丢几次后放到 5s，
+        // 同一个空档就变成用户眼里的"卡住" ——「不用等待」就是这么没的。
+        // 现在与旧版同量级：构建中 700ms，其它 300ms；只在长时间仍无内容时才放宽，
+        // 依然不设"放弃"，后台补到货就自动接上。
         if (S.refillTries === 3) {
           // 连续几次都取不到 = 池子尾部被"同作者配额"压住了（那批要等新的构建才分批放出）。
           // 只靠重试是不够的，得踢后端立刻去补一批新内容 —— 只踢一次，不刷屏。
           api("/api/feed?refresh=1&limit=1&rid=" + S.session).catch(function () {});
         }
-        setTimeout(() => { S.waiting = false; loadFeed(false); }, S.refillTries <= 6 ? 1800 : 5000);
+        const waitMs = S.refillTries > 12 ? 1500 : (d.building ? 700 : 300);
+        setTimeout(() => { S.waiting = false; loadFeed(false); }, waitMs);
         return;
       }
       S.refillTries = 0;
